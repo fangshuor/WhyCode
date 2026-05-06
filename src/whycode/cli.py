@@ -4,6 +4,8 @@ Commands
 --------
 - ``whycode why <path>``        — print the Risk Card for a single file.
 - ``whycode why <path> --at SHA`` — risk card as of a past commit.
+- ``whycode why <path> --mute KIND`` — locally suppress a noisy signal kind.
+- ``whycode highlights``        — repo-wide treasure map of decisions and incidents.
 - ``whycode diff [--base REF]`` — risk-rank files changed against a base ref.
 - ``whycode show <sha>``        — risk-flavored summary for one commit.
 - ``whycode timeline <path>``   — risk score evolution across the file's history.
@@ -29,6 +31,7 @@ from whycode import __version__
 from whycode import git_facts as gf
 from whycode import risk_card as rc
 from whycode import signals as sig
+from whycode import suppressions as supp
 
 app = typer.Typer(
     add_completion=False,
@@ -119,6 +122,20 @@ def why(
         "--at",
         help="Show the Risk Card as of this commit / ref (postmortem queries).",
     ),
+    mute: list[str] = typer.Option(
+        [],
+        "--mute",
+        help=(
+            "Suppress a signal kind for this path going forward "
+            "(stored in .whycode/suppressed.json). Accepts kind name or "
+            "unique prefix: incident, revert, ghost, coupling, silence, …"
+        ),
+    ),
+    no_mutes: bool = typer.Option(
+        False,
+        "--no-mutes",
+        help="Bypass the local suppression list — show all signals.",
+    ),
     max_commits: int | None = typer.Option(
         None, "--max-commits", help="Cap the number of commits scanned (debug)."
     ),
@@ -140,7 +157,31 @@ def why(
         except gf.GitError:
             err.print(f"[red]error:[/red] unknown commit / ref: {at!r}")
             raise typer.Exit(2) from None
-    card = rc.build(repo_root, rel, max_commits=max_commits, ref=resolved_ref)
+    if mute:
+        sl = supp.load(repo_root)
+        added: list[str] = []
+        for token in mute:
+            try:
+                kind = supp.resolve_kind(token)
+            except ValueError as exc:
+                err.print(f"[red]error:[/red] {exc}")
+                raise typer.Exit(2) from None
+            if sl.add(rel, kind):
+                added.append(kind.value)
+        if added:
+            supp.save(repo_root, sl)
+            if not json_out:
+                err.print(
+                    f"[dim]muted on {rel}: {', '.join(added)}  "
+                    f"(stored in .whycode/suppressed.json — edit to undo)[/dim]"
+                )
+    card = rc.build(
+        repo_root,
+        rel,
+        max_commits=max_commits,
+        ref=resolved_ref,
+        apply_suppressions=not no_mutes,
+    )
     if json_out:
         console.print_json(json.dumps(card.to_dict()))
         return
@@ -284,6 +325,136 @@ def diff(
                 f"[bold]{fail_on}[/bold] (≥{threshold})."
             )
             raise typer.Exit(1)
+
+
+@app.command()
+def highlights(
+    invariants: int = typer.Option(
+        5, "--invariants", help="How many invariant lines to surface."
+    ),
+    incidents: int = typer.Option(
+        5, "--incidents", help="How many incident commits to surface."
+    ),
+    max_commits: int | None = typer.Option(
+        None,
+        "--max-commits",
+        help="Cap on commits scanned (defaults to no cap; tune for very large repos).",
+    ),
+    repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a card."
+    ),
+) -> None:
+    """The first-run treasure map: top decisions and incidents across the repo.
+
+    Surfaces the highest-value commit-message lines (invariants stated by past
+    authors) and the most recent incident-flavoured commits — the things a
+    reader most wants to know about the codebase before touching anything.
+    """
+    try:
+        repo_root = gf.discover_repo_root(repo.resolve())
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    with console.status("Reading repo history…", spinner="dots"):
+        commits = gf.all_commits(repo_root, max_count=max_commits)
+    if not commits:
+        console.print("[yellow]no commits in this repo[/yellow]")
+        return
+
+    inv_pairs = gf.extract_invariant_quotes(commits)
+    sha_to_commit = {c.sha: c for c in commits}
+    seen_lines: dict[str, str] = {}
+    for sha, line in inv_pairs:
+        seen_lines.setdefault(line, sha)
+    inv_records: list[tuple[str, str, gf.Commit]] = []
+    for line, sha in seen_lines.items():
+        commit = sha_to_commit.get(sha)
+        if commit is None:
+            continue
+        inv_records.append((line, sha, commit))
+    inv_records.sort(key=lambda t: t[2].authored_at, reverse=True)
+    inv_records = inv_records[:invariants]
+
+    incident_records = gf.find_incidents(commits)[:incidents]
+
+    if json_out:
+        console.print_json(
+            json.dumps(
+                {
+                    "repo": str(repo_root),
+                    "scanned_commits": len(commits),
+                    "invariants": [
+                        {
+                            "sha": c.sha[:12],
+                            "subject": c.subject,
+                            "author": c.author_name,
+                            "authored_at": c.authored_at.isoformat(),
+                            "line": line,
+                        }
+                        for line, _, c in inv_records
+                    ],
+                    "incidents": [
+                        {
+                            "sha": c.sha[:12],
+                            "subject": c.subject,
+                            "author": c.author_name,
+                            "authored_at": c.authored_at.isoformat(),
+                        }
+                        for c in incident_records
+                    ],
+                }
+            )
+        )
+        return
+
+    console.print(
+        f"[bold]WhyCode highlights[/bold]   "
+        f"[dim]{len(commits)} commits scanned in this repo[/dim]\n"
+    )
+    if inv_records:
+        console.print(
+            f"[bold yellow]INVARIANTS[/bold yellow] "
+            f"[dim]({len(inv_records)} most recent stated by past authors)[/dim]"
+        )
+        for i, (line, sha, commit) in enumerate(inv_records, 1):
+            short = sha[:7]
+            date = str(commit.authored_at.date())
+            console.print(
+                f"  {i}. [dim]{short}  {date}  {commit.author_name}[/dim]"
+            )
+            console.print(f"     [italic]{line}[/italic]")
+        console.print()
+    else:
+        console.print(
+            "[dim]INVARIANTS: none found. The repo's commit bodies don't use "
+            "cautionary language like 'do not', 'must not', 'warning:', etc.[/dim]\n"
+        )
+
+    if incident_records:
+        console.print(
+            f"[bold red]INCIDENTS[/bold red] "
+            f"[dim]({len(incident_records)} most recent incident-flavoured commits)[/dim]"
+        )
+        for i, c in enumerate(incident_records, 1):
+            short = c.sha[:7]
+            date = str(c.authored_at.date())
+            subj = c.subject if len(c.subject) <= 70 else c.subject[:69] + "…"
+            console.print(
+                f"  {i}. [dim]{short}  {date}  {c.author_name}[/dim]\n"
+                f"     {subj}"
+            )
+        console.print()
+    else:
+        console.print(
+            "[dim]INCIDENTS: none found. No commit subject contains 'hotfix', "
+            "'incident', 'regression', etc.[/dim]\n"
+        )
+
+    console.print(
+        "[dim]→ whycode why <path>   to dig into the file behind any of these.[/dim]"
+    )
 
 
 def _sample_indices(total: int, max_samples: int) -> list[int]:

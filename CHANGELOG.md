@@ -4,6 +4,28 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-05-06
+
+### Added
+- `whycode highlights` — the first-run "treasure map". Scans the whole
+  repo and surfaces the most recent invariant lines (verbatim, from
+  commit bodies) and the most recent incident-flavoured commits.
+  This is what a new contributor wants to read on day one — concrete
+  decisions, not aggregate risk scores. Use `--invariants N`, `--incidents
+  N`, or `--max-commits N` to tune scope; `--json` for tooling.
+- `whycode why <path> --mute <kind>` — local feedback loop: mark a
+  signal as "this is wrong, hide it" and never see it on this file
+  again. The suppression list lives at `.whycode/suppressed.json`
+  (gitignored, per-developer; no telemetry, no cloud, no cross-team
+  sharing). Kind names accept unique prefixes (`incident`, `revert`,
+  `ghost`, …). `--no-mutes` temporarily bypasses the list.
+- `whycode why` (and every other surface) now applies the suppression
+  list automatically.
+
+### Changed
+- `risk_card.build()` gains an `apply_suppressions=True` keyword
+  argument. The MCP server inherits this for free — no changes there.
+
 ## [0.2.1] — 2026-05-06
 
 ### Changed

@@ -18,6 +18,7 @@ from rich.text import Text
 
 from whycode import git_facts as gf
 from whycode import signals as sig
+from whycode import suppressions as supp
 from whycode.scorer import Band, Score, score
 
 if TYPE_CHECKING:
@@ -73,9 +74,20 @@ def build(
     *,
     max_commits: int | None = None,
     ref: str | None = None,
+    apply_suppressions: bool = True,
 ) -> RiskCard:
+    """Build a Risk Card.
+
+    By default, signals matching the local ``.whycode/suppressed.json`` list
+    are dropped — that file is the user's "this signal is wrong, hide it"
+    feedback. Pass ``apply_suppressions=False`` to bypass it (useful for
+    debug or auditing what was hidden).
+    """
     facts = gf.gather(repo_root, path, max_commits=max_commits, ref=ref)
     signals = sig.all_signals(facts)
+    if apply_suppressions:
+        suppressions = supp.load(repo_root)
+        signals = supp.filter_signals(signals, suppressions, path)
     s = score(signals)
     head = facts.commits[0] if facts.commits else None
     return RiskCard(
