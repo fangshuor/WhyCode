@@ -110,6 +110,11 @@ def why(
     brief: bool = typer.Option(
         False, "--brief", "-b", help="One-line summary (for triage and scripts)."
     ),
+    at: str | None = typer.Option(
+        None,
+        "--at",
+        help="Show the Risk Card as of this commit / ref (postmortem queries).",
+    ),
     max_commits: int | None = typer.Option(
         None, "--max-commits", help="Cap the number of commits scanned (debug)."
     ),
@@ -122,7 +127,16 @@ def why(
             f"and has no history in this repo. Nothing to learn from."
         )
         raise typer.Exit(1)
-    card = rc.build(repo_root, rel, max_commits=max_commits)
+    resolved_ref: str | None = None
+    if at is not None:
+        try:
+            resolved_ref = gf._run_git(
+                repo_root, "rev-parse", "--verify", f"{at}^{{commit}}"
+            ).strip()
+        except gf.GitError:
+            err.print(f"[red]error:[/red] unknown commit / ref: {at!r}")
+            raise typer.Exit(2) from None
+    card = rc.build(repo_root, rel, max_commits=max_commits, ref=resolved_ref)
     if json_out:
         console.print_json(json.dumps(card.to_dict()))
         return

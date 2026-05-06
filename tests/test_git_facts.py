@@ -81,6 +81,34 @@ def test_find_incidents_matches_regression_keyword(repo) -> None:  # type: ignor
     assert len(gf.find_incidents(commits)) == 1
 
 
+def test_find_incidents_ignores_passing_body_mentions(repo) -> None:  # type: ignore[no-untyped-def]
+    """A body that mentions 'incident' as part of a feature description, with
+    no issue id nearby, is not an incident commit."""
+    repo.commit(
+        "feat: add structured logging",
+        {"a.txt": "1"},
+        body=(
+            "WhyCode reads commit messages, including incident-tagged commits.\n"
+            "This change adds structured fields so downstream tooling can index them."
+        ),
+    )
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    assert gf.find_incidents(commits) == []
+
+
+def test_find_incidents_fires_when_body_has_keyword_and_issue_id(repo) -> None:  # type: ignore[no-untyped-def]
+    """A body keyword corroborated by an issue id IS an incident commit."""
+    for issue_marker in ("#1234", "INC-447", "JIRA-123", "SEV-1", "P0"):
+        repo.commit(
+            "fix: small change",
+            {"a.txt": issue_marker},
+            body=f"Resolved an incident — see {issue_marker} for context.",
+        )
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert len(incidents) == 5
+
+
 def test_extract_invariant_quotes_pulls_warning_lines(repo) -> None:  # type: ignore[no-untyped-def]
     body = (
         "We must keep the synchronous call here.\n"

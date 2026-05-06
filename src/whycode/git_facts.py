@@ -37,18 +37,30 @@ INCIDENT_TOKENS: tuple[str, ...] = (
     "production down",
     "rollback",
     "regression",
-    "breaking change",
 )
 _INCIDENT_RE = re.compile(
     r"|".join(rf"\b{re.escape(tok)}\b" for tok in INCIDENT_TOKENS),
     re.IGNORECASE,
 )
+# A Conventional Commits structured marker. Unlike free-form keywords above,
+# this is a deliberate, anchored footer — high enough confidence to fire on
+# body alone with no need for a corroborating issue ID.
+_BREAKING_FOOTER_RE = re.compile(r"\bBREAKING[- ]CHANGE:", re.IGNORECASE)
 # Conventional Commits "breaking" indicator: ``feat!:``, ``fix!:``, ``refactor!:``…
 # Anchored to the start of the subject line (or after whitespace) and limited
 # to known type tokens so we don't match URL fragments like ``foo!:bar``.
 _BREAKING_CC_RE = re.compile(
     r"(?:^|\s)(?:feat|fix|chore|refactor|perf|build|ci|docs|test|style|revert)!:",
     re.IGNORECASE,
+)
+
+# Issue / incident identifiers that corroborate a body-only incident keyword:
+# - GitHub-style: #1234
+# - Jira-style:   ABC-123
+# - Severity:     SEV-1, sev1, P0, P1
+# Used to raise body matches above the "passing mention in prose" floor.
+_ISSUE_ID_RE = re.compile(
+    r"(?:#\d+|\b[A-Z][A-Z0-9_]+-\d+|\bSEV[- ]?\d\b|\bP[01]\b)",
 )
 INVARIANT_TOKENS: tuple[str, ...] = (
     "do not",
@@ -197,8 +209,13 @@ def commits_for_path(
     path: str,
     *,
     max_count: int | None = None,
+    ref: str | None = None,
 ) -> list[Commit]:
-    """Return commits that touched ``path`` (rename-aware), newest first."""
+    """Return commits that touched ``path`` (rename-aware), newest first.
+
+    When ``ref`` is given, only commits reachable from that revision are
+    returned — i.e., the file's history *as of* that point in time.
+    """
     args = [
         "log",
         "--follow",
@@ -207,6 +224,8 @@ def commits_for_path(
     ]
     if max_count is not None:
         args.append(f"--max-count={max_count}")
+    if ref is not None:
+        args.append(ref)
     args.extend(["--", path])
     raw = _run_git(repo_root, *args)
     return _parse_log_records(raw)
@@ -288,16 +307,31 @@ def find_revert_pairs(commits: Sequence[Commit]) -> list[tuple[str, str]]:
 
 
 def find_incidents(commits: Sequence[Commit]) -> list[Commit]:
-    """Return commits with an incident keyword OR a Conventional Commits breaking marker.
+    """Return commits whose evidence-level signals incident-flavored intent.
 
-    Both signals justify treating the change as incident-flavored:
-      - keyword match in subject/body (``hotfix:``, ``incident``, ``regression``, …)
-      - Conventional Commits breaking-change indicator (``feat!: …``, ``fix!: …``)
+    Acceptance ladder (highest to lowest confidence):
+      1. Subject contains an incident keyword.  A commit's subject is its
+         declared purpose, so a subject hit is treated as ground truth.
+      2. Subject carries the Conventional Commits breaking marker
+         (``feat!:`` / ``fix!:`` / …).
+      3. Body carries the structured ``BREAKING CHANGE:`` footer.  This is a
+         deliberate, anchored marker, not free-form prose.
+      4. Body contains an incident keyword AND an issue / incident
+         identifier nearby (``#1234``, ``INC-447``, ``SEV-1``, ``P0``).
+         This filters out passing mentions in prose like "feat: add
+         incident-aware logging" where the keyword describes a *feature*.
+
+    A bare body keyword with no corroborating ID does NOT fire.
     """
     out: list[Commit] = []
     for c in commits:
-        text = c.subject + "\n" + c.body
-        if _INCIDENT_RE.search(text) or _BREAKING_CC_RE.search(c.subject):
+        if _INCIDENT_RE.search(c.subject) or _BREAKING_CC_RE.search(c.subject):
+            out.append(c)
+            continue
+        if _BREAKING_FOOTER_RE.search(c.body):
+            out.append(c)
+            continue
+        if _INCIDENT_RE.search(c.body) and _ISSUE_ID_RE.search(c.body):
             out.append(c)
     return out
 
@@ -397,9 +431,14 @@ def gather(
     path: str,
     *,
     max_commits: int | None = None,
+    ref: str | None = None,
 ) -> RepoFacts:
-    """Top-level convenience: build a RepoFacts snapshot for ``path``."""
-    commits = commits_for_path(repo_root, path, max_count=max_commits)
+    """Top-level convenience: build a RepoFacts snapshot for ``path``.
+
+    Pass ``ref`` to compute facts as of a past commit (e.g., for postmortem
+    "what did this file's risk look like at the time of the outage" queries).
+    """
+    commits = commits_for_path(repo_root, path, max_count=max_commits, ref=ref)
     return RepoFacts(
         repo_root=repo_root,
         path=path,

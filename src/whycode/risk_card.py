@@ -34,6 +34,8 @@ class RiskCard:
     most_recent_subject: str | None
     most_recent_author: str | None
     most_recent_at: str | None
+    as_of_sha: str | None = None
+    """When set, the card was computed *as of* this commit (historical view)."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -41,6 +43,7 @@ class RiskCard:
             "score": self.score.value,
             "band": self.score.band.value,
             "commit_count": self.commit_count,
+            "as_of": self.as_of_sha,
             "most_recent": (
                 {
                     "sha": self.most_recent_sha,
@@ -64,8 +67,14 @@ class RiskCard:
         }
 
 
-def build(repo_root: Path, path: str, *, max_commits: int | None = None) -> RiskCard:
-    facts = gf.gather(repo_root, path, max_commits=max_commits)
+def build(
+    repo_root: Path,
+    path: str,
+    *,
+    max_commits: int | None = None,
+    ref: str | None = None,
+) -> RiskCard:
+    facts = gf.gather(repo_root, path, max_commits=max_commits, ref=ref)
     signals = sig.all_signals(facts)
     s = score(signals)
     head = facts.commits[0] if facts.commits else None
@@ -78,6 +87,7 @@ def build(repo_root: Path, path: str, *, max_commits: int | None = None) -> Risk
         most_recent_subject=head.subject if head else None,
         most_recent_author=head.author_name if head else None,
         most_recent_at=head.authored_at.isoformat() if head else None,
+        as_of_sha=ref[:12] if ref else None,
     )
 
 
@@ -107,6 +117,8 @@ def _header(card: RiskCard) -> Panel:
     title.append(card.score.band.value, style=style)
     title.append("  ")
     title.append(f"score {card.score.value}/100", style="bold")
+    if card.as_of_sha:
+        title.append(f"   as of {card.as_of_sha}", style="dim")
     body = Text()
     body.append(card.path, style="bold")
     body.append(f"   ({card.commit_count} commits)\n", style="dim")

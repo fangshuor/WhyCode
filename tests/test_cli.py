@@ -260,6 +260,36 @@ def test_init_outside_repo_errors(tmp_path) -> None:  # type: ignore[no-untyped-
     assert result.exit_code != 0
 
 
+def test_why_at_excludes_later_commits(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`whycode why X --at <sha>` reflects history as of <sha>, not HEAD."""
+    sha_old = repo.commit("init", {"refund.py": "1"}, when=days_ago(60))
+    repo.commit(
+        "hotfix: refund regression",
+        {"refund.py": "2"},
+        body="See #INC-447",
+        when=days_ago(10),
+    )
+    # Asking "as of the init commit" must not see the later hotfix.
+    result_old = _invoke(repo.root, "why", "refund.py", "--at", sha_old, "--json")
+    assert result_old.exit_code == 0
+    data_old = json.loads(result_old.output)
+    assert data_old["commit_count"] == 1
+    assert data_old["as_of"] is not None
+    assert all(s["kind"] != "incident_history" for s in data_old["signals"])
+
+    # And the current view DOES see it.
+    result_now = _invoke(repo.root, "why", "refund.py", "--json")
+    data_now = json.loads(result_now.output)
+    assert data_now["commit_count"] == 2
+    assert any(s["kind"] == "incident_history" for s in data_now["signals"])
+
+
+def test_why_at_unknown_ref_errors(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "why", "a.py", "--at", "deadbeefdeadbeef")
+    assert result.exit_code != 0
+
+
 def test_mcp_summary_field_present_in_json(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """Verify the MCP server includes a quotable summary string in get_risk_profile."""
     sha = repo.commit("feat: A", {"a.py": "1"}, when=days_ago(40))

@@ -53,6 +53,7 @@ cd /path/to/your/repo
 whycode init                        # one-command setup: CI workflow + pre-commit gate
 whycode why src/some/file.py        # the Risk Card for one file
 whycode why src/some/file.py -b     # one-line summary (for triage / scripts)
+whycode why src/some/file.py --at <sha>  # what did this file's risk look like as of <sha>?
 whycode diff                        # rank everything you changed vs origin/main
 whycode diff --staged               # ditto, for files staged for commit
 whycode diff --fail-on history      # CI gate: exit 1 if any file is ≥ READ HISTORY FIRST
