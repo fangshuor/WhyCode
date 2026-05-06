@@ -370,6 +370,28 @@ def author_last_activity(repo_root: Path, email: str) -> datetime | None:
         return None
 
 
+def line_ownership(repo_root: Path, path: str) -> dict[str, int]:
+    """Return ``{author_email: line_count}`` from ``git blame`` of HEAD's ``path``.
+
+    Empty dict if blame is unavailable (file deleted, binary, etc.). Used by
+    Layer 2 to refine ghost-keeper detection: line ownership is a stronger
+    signal than commit count, which can be skewed by a single big initial
+    commit followed by many tiny fixes.
+    """
+    try:
+        raw = _run_git(repo_root, "blame", "--line-porcelain", "HEAD", "--", path)
+    except GitError:
+        return {}
+    counts: dict[str, int] = {}
+    current_email: str | None = None
+    for line in raw.splitlines():
+        if line.startswith("author-mail "):
+            current_email = line[len("author-mail "):].strip().strip("<>")
+        elif line.startswith("\t") and current_email:
+            counts[current_email] = counts.get(current_email, 0) + 1
+    return counts
+
+
 def gather(
     repo_root: Path,
     path: str,

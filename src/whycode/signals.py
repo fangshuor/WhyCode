@@ -201,36 +201,66 @@ def detect_newborn(facts: RepoFacts) -> Signal | None:
 
 
 def detect_ghost_keeper(facts: RepoFacts) -> Signal | None:
-    """Is the file's primary author still active in the repo?
+    """Has the file's primary author left the project?
 
-    The "primary author" is the email that wrote the most commits we have for
-    this file. If their last activity anywhere in the repo is older than
-    ``GHOST_KEEPER_DAYS``, the file has lost its keeper.
+    Ownership is measured by ``git blame`` lines on HEAD (so a single big
+    initial commit by Alice still names Alice as primary even if Bob has 20
+    small fixes after). When blame is unavailable, fall back to commit count.
+
+    The signal fires only if the primary owner's last commit anywhere in the
+    repo is older than ``GHOST_KEEPER_DAYS``. Severity scales with both how
+    long they have been gone and how much of the current file they own.
     """
     if not facts.commits:
         return None
-    counts: dict[str, int] = {}
-    sample: dict[str, gf.Commit] = {}
+
+    blame = gf.line_ownership(facts.repo_root, facts.path)
+    ownership_share: float | None = None
+    if blame:
+        total_lines = sum(blame.values())
+        if total_lines == 0:
+            return None
+        primary_email = max(blame, key=lambda e: blame[e])
+        ownership_share = blame[primary_email] / total_lines
+    else:
+        counts: dict[str, int] = {}
+        for commit in facts.commits:
+            counts[commit.author_email] = counts.get(commit.author_email, 0) + 1
+        primary_email = max(counts, key=lambda e: counts[e])
+
+    primary_last_seen = gf.author_last_activity(facts.repo_root, primary_email)
+    if primary_last_seen is None or _days_since(primary_last_seen) < GHOST_KEEPER_DAYS:
+        return None
+    days_since_seen = _days_since(primary_last_seen)
+
+    primary_commit: gf.Commit | None = None
     for commit in facts.commits:
-        counts[commit.author_email] = counts.get(commit.author_email, 0) + 1
-        sample.setdefault(commit.author_email, commit)
-    primary_email = max(counts, key=lambda e: counts[e])
-    primary_commit = sample[primary_email]
-    last_seen = gf.author_last_activity(facts.repo_root, primary_email)
-    if last_seen is None:
-        return None
-    days_since_seen = _days_since(last_seen)
-    if days_since_seen < GHOST_KEEPER_DAYS:
-        return None
-    severity = 4 if days_since_seen > 730 else 3
+        if commit.author_email == primary_email:
+            primary_commit = commit
+            break
+    if primary_commit is None:
+        primary_commit = facts.commits[0]
+
+    severity = 3
+    if days_since_seen > 730 or (ownership_share is not None and ownership_share >= 0.7):
+        severity = 4
+    if days_since_seen > 1825 and (ownership_share is None or ownership_share >= 0.5):
+        severity = 5
+
+    if ownership_share is not None:
+        ownership_phrase = f"wrote {ownership_share:.0%} of current lines"
+    else:
+        share = sum(1 for c in facts.commits if c.author_email == primary_email)
+        ownership_phrase = f"wrote {share} of {len(facts.commits)} commits here"
+
     return Signal(
         kind=SignalKind.GHOST_KEEPER,
         severity=severity,
         headline=f"Primary author last active {days_since_seen} days ago",
         detail=(
-            f"{primary_commit.author_name} wrote {counts[primary_email]} of "
-            f"{len(facts.commits)} commits here, but has not committed anywhere in "
-            f"this repo for {days_since_seen} days. Knowledge may have left the team."
+            f"{primary_commit.author_name} {ownership_phrase}, but has not "
+            f"committed anywhere in this repo for {days_since_seen} days. "
+            f"Knowledge may have left the team."
         ),
         evidence=(_short(primary_commit.sha),),
     )

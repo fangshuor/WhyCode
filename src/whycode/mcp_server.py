@@ -124,6 +124,25 @@ def _build_server(verbose: bool = False) -> Server:
     return server
 
 
+def _summary_text(card: rc.RiskCard) -> str:
+    """One-paragraph prose summary of the card. Designed to be quotable verbatim
+    by an LLM consumer without further processing."""
+    if not card.signals:
+        return (
+            f"{card.path}: {card.score.band.value} ({card.score.value}/100). "
+            f"No flagged signals across {card.commit_count} commits — but read "
+            f"the diff anyway."
+        )
+    top = card.signals[0]
+    extras = ""
+    if len(card.signals) > 1:
+        extras = f" Plus {len(card.signals) - 1} more signal(s) in the full card."
+    return (
+        f"{card.path}: {card.score.band.value} ({card.score.value}/100). "
+        f"Top concern: {top.headline}.{extras}"
+    )
+
+
 def _handle_risk_profile(arguments: dict[str, Any]) -> list[TextContent]:
     path = str(arguments["path"])
     max_commits = arguments.get("max_commits")
@@ -132,7 +151,9 @@ def _handle_risk_profile(arguments: dict[str, Any]) -> list[TextContent]:
         card = rc.build(repo_root, rel, max_commits=max_commits)
     except gf.GitError as exc:
         return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
-    return [TextContent(type="text", text=json.dumps(card.to_dict(), indent=2))]
+    payload = card.to_dict()
+    payload["summary"] = _summary_text(card)
+    return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
 
 def _handle_file_decisions(arguments: dict[str, Any]) -> list[TextContent]:
@@ -148,6 +169,7 @@ def _handle_file_decisions(arguments: dict[str, Any]) -> list[TextContent]:
         "path": card.path,
         "score": card.score.value,
         "band": card.score.band.value,
+        "summary": _summary_text(card),
         "decisions": [
             {
                 "kind": s.kind.value,

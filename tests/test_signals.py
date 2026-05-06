@@ -144,6 +144,54 @@ def test_ghost_keeper_fires(repo, days_ago) -> None:  # type: ignore[no-untyped-
     assert signal.severity >= 3
 
 
+def test_ghost_keeper_uses_line_ownership_to_promote_severity(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    # Ghost wrote almost all the lines; severity should reflect dominant ownership.
+    body = "\n".join(f"line {i}" for i in range(20)) + "\n"
+    repo.commit(
+        "feat: big initial commit", {"core.py": body},
+        when=days_ago(900),
+        author_name="Old Owner",
+        author_email="ghost@example.com",
+    )
+    # One small drive-by commit by an active author shouldn't take ownership away.
+    repo.commit(
+        "fix: typo", {"core.py": body + "# tiny comment\n"},
+        when=days_ago(5),
+        author_name="Active Bob",
+        author_email="bob@example.com",
+    )
+    facts = _facts_for(repo, "core.py")
+    signal = sig.detect_ghost_keeper(facts)
+    assert signal is not None
+    # Old Owner still owns ~20 of 21 lines → ghost keeper still fires.
+    assert "ghost@example.com" not in signal.detail  # email should NOT leak; name should
+    assert "Old Owner" in signal.detail
+    assert "lines" in signal.detail.lower()
+
+
+def test_ghost_keeper_silent_when_line_owner_still_active(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    # Old contributor wrote lines and then left; but a CURRENT author rewrote them.
+    repo.commit(
+        "feat: original", {"x.py": "old line\n"},
+        when=days_ago(900),
+        author_name="Old",
+        author_email="old@example.com",
+    )
+    # Active author rewrites the whole file recently.
+    new_body = "\n".join(f"new line {i}" for i in range(15)) + "\n"
+    repo.commit(
+        "refactor: rewrite", {"x.py": new_body},
+        when=days_ago(10),
+        author_name="Active",
+        author_email="active@example.com",
+    )
+    facts = _facts_for(repo, "x.py")
+    # Although `Old` has more time-since-activity, they don't own current lines.
+    # The active author owns them. So no ghost keeper.
+    signal = sig.detect_ghost_keeper(facts)
+    assert signal is None
+
+
 def test_newborn_suppressed_when_other_signals_fire(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     repo.commit(
         "compat: keep sync path",

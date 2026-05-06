@@ -135,3 +135,26 @@ def test_author_last_activity_returns_recent_for_known(repo, now, days_ago) -> N
     assert seen is not None
     # Within a day of the configured commit time.
     assert abs((seen - days_ago(2)).total_seconds()) < 86400
+
+
+def test_line_ownership_returns_email_to_line_count(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "init",
+        {"shared.py": "alice line 1\nalice line 2\nalice line 3\n"},
+        author_name="Alice",
+        author_email="alice@example.com",
+    )
+    repo.commit(
+        "tweak",
+        {"shared.py": "alice line 1\nalice line 2\nalice line 3\nbob line 4\n"},
+        author_name="Bob",
+        author_email="bob@example.com",
+    )
+    counts = gf.line_ownership(repo.root, "shared.py")
+    assert counts.get("alice@example.com", 0) == 3
+    assert counts.get("bob@example.com", 0) == 1
+
+
+def test_line_ownership_empty_for_missing_file(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.txt": "1"})
+    assert gf.line_ownership(repo.root, "no-such-file.py") == {}

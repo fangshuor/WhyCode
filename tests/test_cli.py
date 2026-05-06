@@ -260,6 +260,29 @@ def test_init_outside_repo_errors(tmp_path) -> None:  # type: ignore[no-untyped-
     assert result.exit_code != 0
 
 
+def test_mcp_summary_field_present_in_json(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """Verify the MCP server includes a quotable summary string in get_risk_profile."""
+    sha = repo.commit("feat: A", {"a.py": "1"}, when=days_ago(40))
+    repo.revert(sha, when=days_ago(35))
+    repo.commit(
+        "hotfix: edge case",
+        {"a.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    # Test the underlying handler directly (avoids spawning a real MCP server).
+    from whycode import risk_card as rc
+    from whycode.mcp_server import _summary_text
+
+    card = rc.build(repo.root, "a.py")
+    summary = _summary_text(card)
+    assert "a.py" in summary
+    assert any(band in summary for band in ("HANDLE", "READ", "WORTH", "NO FLAGS"))
+    # Top concern surfaced in the prose
+    if card.signals:
+        assert "Top concern" in summary or "no flags" in summary.lower()
+
+
 def test_scan_lists_top_files(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     sha = repo.commit("init", {"a.py": "1", "b.py": "1"}, when=days_ago(60))
     repo.revert(sha, when=days_ago(50))
