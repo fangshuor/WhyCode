@@ -71,10 +71,27 @@ def _path_is_known_to_git(repo_root: Path, rel: str) -> bool:
     if gf.is_tracked(repo_root, rel):
         return True
     try:
-        out = gf._run_git(repo_root, "log", "--oneline", "-1", "--all", "--", rel)
+        out = gf.run_git(repo_root, "log", "--oneline", "-1", "--all", "--", rel)
     except gf.GitError:
         return False
     return bool(out.strip())
+
+
+def _require_tracked(path_arg: str) -> tuple[Path, str]:
+    """Resolve ``path_arg`` to ``(repo_root, rel)`` or exit with a friendly warning.
+
+    Used by every command that takes a path argument and needs git history
+    to be useful (``why``, ``timeline``, ``honest``). Combines the two earlier
+    helpers so callers don't repeat the warn-and-exit boilerplate.
+    """
+    repo_root, rel = _resolve_repo_and_path(path_arg)
+    if not _path_is_known_to_git(repo_root, rel):
+        err.print(
+            f"[yellow]warning:[/yellow] [bold]{rel}[/bold] is not tracked by git "
+            f"and has no history in this repo. Nothing to learn from."
+        )
+        raise typer.Exit(1)
+    return repo_root, rel
 
 
 # --- shared: band threshold parsing ----------------------------------------
@@ -142,17 +159,11 @@ def why(
     ),
 ) -> None:
     """Print the Risk Card for ``path``."""
-    repo_root, rel = _resolve_repo_and_path(path)
-    if not _path_is_known_to_git(repo_root, rel):
-        err.print(
-            f"[yellow]warning:[/yellow] [bold]{rel}[/bold] is not tracked by git "
-            f"and has no history in this repo. Nothing to learn from."
-        )
-        raise typer.Exit(1)
+    repo_root, rel = _require_tracked(path)
     resolved_ref: str | None = None
     if at is not None:
         try:
-            resolved_ref = gf._run_git(
+            resolved_ref = gf.run_git(
                 repo_root, "rev-parse", "--verify", f"{at}^{{commit}}"
             ).strip()
         except gf.GitError:
@@ -202,7 +213,7 @@ def _resolve_base_ref(repo_root: Path, requested: str | None) -> str:
     candidates = ("origin/main", "origin/master", "main", "master", "HEAD~1")
     for ref in candidates:
         try:
-            gf._run_git(repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+            gf.run_git(repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
             return ref
         except gf.GitError:
             continue
@@ -241,13 +252,13 @@ def diff(
     try:
         repo_root = gf.discover_repo_root(repo.resolve())
         if staged:
-            raw = gf._run_git(
+            raw = gf.run_git(
                 repo_root, "diff", "--cached", "--name-only", "--diff-filter=ACMR"
             )
             actual_base = "(staged changes)"
         else:
             actual_base = _resolve_base_ref(repo_root, base)
-            raw = gf._run_git(repo_root, "diff", "--name-only", f"{actual_base}...HEAD")
+            raw = gf.run_git(repo_root, "diff", "--name-only", f"{actual_base}...HEAD")
     except gf.GitError as exc:
         err.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(2) from exc
@@ -483,13 +494,7 @@ def timeline(
     ),
 ) -> None:
     """Show how this file's risk score evolved over its history."""
-    repo_root, rel = _resolve_repo_and_path(path)
-    if not _path_is_known_to_git(repo_root, rel):
-        err.print(
-            f"[yellow]warning:[/yellow] [bold]{rel}[/bold] is not tracked by git "
-            f"and has no history in this repo."
-        )
-        raise typer.Exit(1)
+    repo_root, rel = _require_tracked(path)
 
     commits = gf.commits_for_path(repo_root, rel)
     if not commits:
@@ -588,7 +593,7 @@ def scan(
         err.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
-    raw = gf._run_git(repo_root, "ls-files")
+    raw = gf.run_git(repo_root, "ls-files")
     all_paths = [line for line in raw.splitlines() if line.strip()]
     patterns = () if no_ignore else ign.effective_patterns(repo_root)
     paths = [p for p in all_paths if not ign.is_ignored(p, patterns)][:sample]
@@ -648,13 +653,7 @@ def honest(
     Use when the Risk Card's first-sentence truncation is hiding important
     context — e.g., a commit whose constraint is stated across two lines.
     """
-    repo_root, rel = _resolve_repo_and_path(path)
-    if not _path_is_known_to_git(repo_root, rel):
-        err.print(
-            f"[yellow]warning:[/yellow] [bold]{rel}[/bold] is not tracked by git "
-            f"and has no history in this repo."
-        )
-        raise typer.Exit(1)
+    repo_root, rel = _require_tracked(path)
     facts = gf.gather(repo_root, rel)
     if not facts.invariant_quotes:
         if json_out:
@@ -716,24 +715,18 @@ def show(
     """Risk-flavored summary for a single commit: classification + per-file risk."""
     try:
         repo_root = gf.discover_repo_root(repo.resolve())
-        full_sha = gf._run_git(repo_root, "rev-parse", "--verify", f"{sha}^{{commit}}").strip()
     except gf.GitError as exc:
         err.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
-    raw = gf._run_git(
-        repo_root, "log", "-1", "--no-merges", f"--pretty=format:{gf._log_format()}", full_sha
-    )
-    commits = gf._parse_log_records(raw)
-    if not commits:
-        err.print(f"[red]error:[/red] could not read commit {full_sha}")
+    commit = gf.read_commit(repo_root, sha)
+    if commit is None:
+        err.print(f"[red]error:[/red] could not read commit {sha!r}")
         raise typer.Exit(2)
-    commit = commits[0]
+    full_sha = commit.sha
 
-    is_incident = bool(
-        gf._INCIDENT_RE.search(commit.subject + "\n" + commit.body)
-        or gf._BREAKING_CC_RE.search(commit.subject)
-    )
+    classification = gf.classify_commit(commit)
+    is_incident = classification.incident_flavoured
     invariants = gf.extract_invariant_quotes([commit])
     file_changes = gf.files_changed_in(repo_root, full_sha)
 
@@ -768,14 +761,14 @@ def show(
     )
     console.print(f"  {commit.subject}")
     console.print()
-    classification = []
+    badges: list[str] = []
     if is_incident:
-        classification.append("[bold red]incident-flavored[/bold red]")
+        badges.append("[bold red]incident-flavored[/bold red]")
     if invariants:
-        classification.append(f"[yellow]states {len(invariants)} invariant(s)[/yellow]")
-    if not classification:
-        classification.append("[dim]no special classification[/dim]")
-    console.print("  " + "   ".join(classification))
+        badges.append(f"[yellow]states {len(invariants)} invariant(s)[/yellow]")
+    if not badges:
+        badges.append("[dim]no special classification[/dim]")
+    console.print("  " + "   ".join(badges))
     console.print(f"  [dim]{len(file_changes)} files changed[/dim]")
 
     if not cards:

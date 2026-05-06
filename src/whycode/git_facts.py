@@ -129,8 +129,13 @@ class GitError(RuntimeError):
     """Raised when a git invocation fails or produces unexpected output."""
 
 
-def _run_git(repo_root: Path, *args: str) -> str:
-    """Invoke git, return stdout. Raises GitError on non-zero exit."""
+def run_git(repo_root: Path, *args: str) -> str:
+    """Invoke ``git -C <repo_root> <args>`` and return stdout.
+
+    Public API: callers (CLI, MCP server) use this to run git commands
+    that aren't already wrapped in a higher-level helper here. Raises
+    :class:`GitError` on non-zero exit or when ``git`` itself is missing.
+    """
     cmd = ["git", "-C", str(repo_root), *args]
     try:
         proc = subprocess.run(
@@ -148,6 +153,10 @@ def _run_git(repo_root: Path, *args: str) -> str:
             f"git {' '.join(args)} failed (exit {proc.returncode}): {proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+# Back-compat alias. Prefer ``run_git`` in new code.
+_run_git = run_git
 
 
 def discover_repo_root(start: Path) -> Path:
@@ -238,6 +247,25 @@ def all_commits(repo_root: Path, *, max_count: int | None = None) -> list[Commit
         args.append(f"--max-count={max_count}")
     raw = _run_git(repo_root, *args)
     return _parse_log_records(raw)
+
+
+def read_commit(repo_root: Path, ref: str) -> Commit | None:
+    """Resolve ``ref`` (SHA, tag, branch, ``HEAD~3`` …) to a single ``Commit``.
+
+    Returns ``None`` when the ref doesn't exist or doesn't resolve to a
+    commit. Used by ``whycode show <sha>`` and similar single-commit views.
+    """
+    try:
+        full_sha = run_git(
+            repo_root, "rev-parse", "--verify", f"{ref}^{{commit}}"
+        ).strip()
+    except GitError:
+        return None
+    raw = run_git(
+        repo_root, "log", "-1", "--no-merges", f"--pretty=format:{_log_format()}", full_sha
+    )
+    parsed = _parse_log_records(raw)
+    return parsed[0] if parsed else None
 
 
 def files_changed_in(repo_root: Path, sha: str) -> list[FileChange]:
@@ -357,6 +385,26 @@ def find_incidents(commits: Sequence[Commit]) -> list[Commit]:
         if _INCIDENT_RE.search(c.body) and _ISSUE_ID_RE.search(c.body):
             out.append(c)
     return out
+
+
+@dataclass(frozen=True)
+class CommitClassification:
+    """Light-weight summary of what kind of work a single commit represents."""
+
+    incident_flavoured: bool
+    invariant_count: int
+
+
+def classify_commit(commit: Commit) -> CommitClassification:
+    """Classify a single commit by reusing the same rules ``find_incidents`` and
+    ``extract_invariant_quotes`` apply to a list. Public API for ``whycode show``
+    and any other surface that wants a single-commit verdict without
+    re-implementing the regex ladder.
+    """
+    return CommitClassification(
+        incident_flavoured=bool(find_incidents([commit])),
+        invariant_count=len(extract_invariant_quotes([commit])),
+    )
 
 
 # Straight, backtick, and the four common Unicode "smart" quote code points.
