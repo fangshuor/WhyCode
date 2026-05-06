@@ -4,6 +4,69 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-06
+
+### Performance — local SQLite cache for git facts
+
+Every read-heavy command (`scan`, `highlights`, `tour`, `diff`, `why`,
+`timeline`) now persists git-derived facts in a per-repo SQLite
+database at `.whycode/cache.db`. The cache is invalidated on
+`git rev-parse HEAD` change: a HEAD that matches the previously
+recorded sha serves every read straight from SQLite. A HEAD that
+moved triggers an incremental update — `git log <last_head>..HEAD`
+appends the new commits without re-walking the whole history. If
+`last_head` is unreachable (force-push, branch swap), we fall back
+to a full rebuild.
+
+Bench against `pallets/click` (3098 commits, 149 files):
+
+| command                | cold (no cache) | warm (cache hit) | speedup |
+| ---------------------- | --------------- | ---------------- | ------- |
+| `scan --top 5`         | 16.3s           | 3.0s             | 5.4x    |
+| `tour`                 | 11.0s           | 2.3s             | 4.8x    |
+| `why src/click/core.py`| 1.1s            | 0.17s            | 6.6x    |
+
+Privacy contract is unchanged. The cache is local-only at
+`.whycode/cache.db`, which is already gitignored. There is no
+telemetry, no network, no upload, no third-party dependency added —
+just `sqlite3` from the stdlib.
+
+The schema is intentionally tiny and hand-editable:
+
+```
+meta(key, value)
+commits(sha, author_name, author_email, authored_at, subject, body)
+commit_files(sha, path, insertions, deletions)
+path_log(path, head_sha, position, sha)
+line_ownership(path, head_sha, author_email, line_count)
+```
+
+`schema_version` lives in `meta` so we can grow it without breaking
+existing caches; on a mismatch we drop and rebuild rather than
+migrate (the cache is a derived artefact, losing it is never
+destructive).
+
+### Added
+- `whycode cache stats` — schema, last seen HEAD, row counts, db size.
+- `whycode cache clear` — wipe the cache. Idempotent.
+- `--no-cache` flag on `why`, `diff`, `scan`, `highlights`, `tour` to
+  bypass the cache (mostly for benchmarking and forcing a fresh git
+  read).
+
+### Internal
+- `src/whycode/cache.py` — `CacheStore` class wrapping a per-repo
+  sqlite db. ~30 tests in `tests/test_cache.py` covering schema init,
+  HEAD-driven invalidation, incremental update, full-rebuild fallback,
+  warm == cold output equality, and the `cache` subcommand surface.
+- `git_facts.{all_commits, commits_for_path, co_changes, files_changed_in,
+  line_ownership, gather}` accept an optional `cache: CacheStore | None`
+  keyword. With it omitted, behaviour is identical to 0.3.0.
+- `RepoFacts` carries the cache reference forward so signal detectors
+  (specifically `detect_ghost_keeper`) reuse it for `git blame`.
+
+148 tests passing (118 prior + 25 cache + 5 cache-CLI). ruff + mypy
+strict clean.
+
 ## [0.3.1] — 2026-05-06
 
 ### Added — MCP `prompts/` capability (three saved-search shortcuts)

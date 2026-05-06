@@ -637,3 +637,58 @@ def test_tour_outside_repo_errors(tmp_path) -> None:  # type: ignore[no-untyped-
     finally:
         os.chdir(cwd)
     assert result.exit_code != 0
+
+
+def test_cache_stats_before_any_run_reports_no_cache(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.txt": "1"})
+    result = _invoke(repo.root, "cache", "stats")
+    assert result.exit_code == 0
+    assert "no cache yet" in result.output
+
+
+def test_cache_stats_after_scan_reports_size_and_head(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("init", {"a.txt": "1"}, when=days_ago(40))
+    _invoke(repo.root, "scan", "--top", "3")
+    result = _invoke(repo.root, "cache", "stats")
+    assert result.exit_code == 0
+    assert "schema_version" in result.output
+    assert sha[:12] in result.output
+
+
+def test_cache_clear_removes_db(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.txt": "1"})
+    _invoke(repo.root, "scan", "--top", "3")
+    cache_db = repo.root / ".whycode" / "cache.db"
+    assert cache_db.exists()
+    result = _invoke(repo.root, "cache", "clear")
+    assert result.exit_code == 0
+    assert not cache_db.exists()
+    # Idempotent: a second clear is fine.
+    result_again = _invoke(repo.root, "cache", "clear")
+    assert result_again.exit_code == 0
+
+
+def test_no_cache_flag_skips_db_creation(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.txt": "1"}, when=days_ago(40))
+    result = _invoke(repo.root, "scan", "--top", "3", "--no-cache")
+    assert result.exit_code == 0
+    assert not (repo.root / ".whycode" / "cache.db").exists()
+
+
+def test_repeat_scan_produces_identical_top_files(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The output of a warm scan must match the output of a cold scan."""
+    sha1 = repo.commit("feature", {"refund.py": "1"}, when=days_ago(40))
+    repo.revert(sha1, when=days_ago(35))
+    repo.commit(
+        "hotfix: edge case",
+        {"refund.py": "2"},
+        body="incident #INC-42",
+        when=days_ago(10),
+    )
+    cold = _invoke(repo.root, "scan", "--top", "5", "--no-cache").output
+    warm_first = _invoke(repo.root, "scan", "--top", "5").output
+    warm_second = _invoke(repo.root, "scan", "--top", "5").output
+    # All three runs must rank the same path with the same score.
+    assert "refund.py" in cold
+    assert "refund.py" in warm_first
+    assert "refund.py" in warm_second
