@@ -39,13 +39,14 @@ decide what to do.
 
 ## Install
 
-Once published to PyPI:
-
 ```bash
-pip install whycode
+pip install whycode-cli
 ```
 
-From source (current canonical path):
+The PyPI distribution is `whycode-cli` (the bare name `whycode` was already
+taken by an unrelated project); the installed command is still `whycode`.
+
+From source, if you want to track `main`:
 
 ```bash
 pip install git+https://github.com/fangshuor/WhyCode.git

@@ -6,6 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.2.0] — 2026-05-06
 
+Published to PyPI as **`whycode-cli`** (the bare name `whycode` was already
+taken by an unrelated project; the installed command is still `whycode`).
+
 ### Added
 - `whycode timeline <path>` — show the file's risk score evolution sampled
   across its history; useful for spotting "when did this become a load-bearing
