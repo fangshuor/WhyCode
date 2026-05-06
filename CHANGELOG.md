@@ -4,6 +4,21 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] — 2026-05-06
+
+### Added
+- `whycode tour` — first-run walkthrough that runs in seconds: surfaces
+  the most-recent invariants and incident commits, slim-scans the repo
+  for top-3 risky files, and prints the one MCP-config snippet you'll
+  need to wire WhyCode into an MCP-aware editor. The single command to
+  run after `pip install whycode-cli` to find out what this tool can
+  see in your repo. Quiet repos get an honest empty-state explanation
+  ("commit messages may be too terse — describing 'why' in commit bodies
+  makes WhyCode much more useful").
+
+### Changed
+- The CLI module docstring lists `tour` as the first command.
+
 ## [0.2.5] — 2026-05-06
 
 ### Added

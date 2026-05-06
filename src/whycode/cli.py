@@ -2,6 +2,7 @@
 
 Commands
 --------
+- ``whycode tour``              — first-run walkthrough: highlights + top risk + MCP setup.
 - ``whycode why <path>``        — print the Risk Card for a single file.
 - ``whycode why <path> --at SHA`` — risk card as of a past commit.
 - ``whycode why <path> --mute KIND`` — locally suppress a noisy signal kind.
@@ -843,6 +844,131 @@ def _install_template(
     if executable:
         dst.chmod(0o755)
     return f"[green]wrote:[/green]   {rel_label}"
+
+
+_MCP_SNIPPET = '''    {
+      "mcpServers": {
+        "whycode": {"command": "whycode", "args": ["mcp"]}
+      }
+    }'''
+
+
+@app.command()
+def tour(
+    repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
+) -> None:
+    """First-run walkthrough: highlights + top risky files + MCP setup snippet.
+
+    The single command to run after installing WhyCode. Skips straight to
+    the most concrete things in the repo (verbatim invariants and
+    incident-flagged commits) and ends with the one snippet you'll need to
+    wire WhyCode into an MCP-aware editor.
+    """
+    try:
+        repo_root = gf.discover_repo_root(repo.resolve())
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    console.print("[bold]Welcome to WhyCode.[/bold]")
+    console.print(f"[dim]Reading the history of {repo_root.name}…[/dim]\n")
+
+    # Section 1 — invariants and incidents (cheap; one git log call).
+    with console.status("Looking for stated decisions…", spinner="dots"):
+        commits = gf.all_commits(repo_root, max_count=2000)
+    if not commits:
+        console.print("[yellow]This repo has no commits yet — nothing to learn from.[/yellow]")
+        return
+
+    inv_pairs = gf.extract_invariant_quotes(commits)
+    sha_to_commit = {c.sha: c for c in commits}
+    seen_lines: dict[str, str] = {}
+    for sha, line in inv_pairs:
+        seen_lines.setdefault(line, sha)
+    invariants_top = [
+        (line, sha_to_commit[sha])
+        for line, sha in seen_lines.items()
+        if sha in sha_to_commit
+    ][:3]
+    incidents_top = gf.find_incidents(commits)[:3]
+
+    if invariants_top or incidents_top:
+        console.print("[bold yellow]Decisions and incidents[/bold yellow]")
+        for line, c in invariants_top:
+            console.print(f"  [italic]{line}[/italic]")
+            console.print(
+                f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+            )
+        for c in incidents_top:
+            subj = c.subject if len(c.subject) <= 70 else c.subject[:69] + "…"
+            console.print(f"  [red]{subj}[/red]")
+            console.print(
+                f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+            )
+    else:
+        console.print(
+            "[dim]No headline decisions or incidents in recent history.[/dim]"
+        )
+        console.print(
+            "[dim]Commit messages may be too terse — describing 'why' in commit "
+            "bodies (or using `hotfix:` / `BREAKING CHANGE:` prefixes) makes WhyCode "
+            "much more useful.[/dim]\n"
+        )
+
+    # Section 2 — top risky files. Slimmer scan: 100 files, depth 50 commits.
+    raw = gf.run_git(repo_root, "ls-files")
+    patterns = ign.effective_patterns(repo_root)
+    paths = [p for p in raw.splitlines() if p.strip() and not ign.is_ignored(p, patterns)][
+        :100
+    ]
+    cards: list[rc.RiskCard] = []
+    if paths:
+        with console.status(
+            f"Risk-ranking {len(paths)} files (slim scan)…", spinner="dots"
+        ):
+            for p in paths:
+                try:
+                    card = rc.build(repo_root, p, max_commits=50)
+                except gf.GitError:
+                    continue
+                useful = [s for s in card.signals if s.kind is not sig.SignalKind.NEWBORN]
+                if useful:
+                    cards.append(card)
+        cards.sort(key=lambda c: -c.score.value)
+
+    if cards:
+        console.print("[bold red]Top 3 risky files[/bold red]")
+        for top in cards[:3]:
+            console.print(
+                f"  [bold]{top.score.value:>3}[/bold]  "
+                f"{top.score.band.value:<20}  [cyan]{top.path}[/cyan]"
+            )
+            console.print(f"       [dim]{top.signals[0].headline}[/dim]")
+        console.print()
+
+    # Section 3 — MCP setup snippet (vendor-neutral phrasing).
+    console.print("[bold magenta]Wire WhyCode into your AI editor[/bold magenta]")
+    console.print(
+        "  WhyCode ships an MCP server. Any MCP-aware editor or assistant\n"
+        "  can call it — just add this snippet to your editor's MCP config:\n"
+    )
+    console.print(_MCP_SNIPPET)
+    console.print(
+        "\n  [dim](See your editor's docs for the exact config-file location.)[/dim]\n"
+    )
+
+    # Section 4 — what to do next.
+    console.print("[bold]Next:[/bold]")
+    if cards:
+        console.print(
+            f"  [dim]·[/dim] [bold]whycode why {cards[0].path}[/bold]   the full Risk Card"
+        )
+    console.print(
+        "  [dim]·[/dim] [bold]whycode init[/bold]                     install CI + pre-commit"
+    )
+    console.print(
+        "  [dim]·[/dim] [bold]whycode highlights[/bold]                more invariants and incidents"
+    )
 
 
 @app.command()

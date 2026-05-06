@@ -589,3 +589,51 @@ def test_scan_lists_top_files(repo, days_ago) -> None:  # type: ignore[no-untype
     result = _invoke(repo.root, "scan", "--top", "3")
     assert result.exit_code == 0
     assert "a.py" in result.output
+
+
+def test_tour_runs_and_emits_all_sections(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "compat: keep sync path",
+        {"a.py": "1"},
+        body="Do not switch to async — v1 clients break.",
+        when=days_ago(60),
+    )
+    repo.commit(
+        "hotfix: refund regression",
+        {"b.py": "1"},
+        body="See INC-447.",
+        when=days_ago(20),
+    )
+    sha = repo.commit("feat: A", {"a.py": "2"}, when=days_ago(40))
+    repo.revert(sha, when=days_ago(15))
+    result = _invoke(repo.root, "tour")
+    assert result.exit_code == 0
+    out = result.output
+    assert "Welcome to WhyCode" in out
+    assert "Decisions and incidents" in out
+    assert "Do not switch to async" in out
+    assert "hotfix: refund regression" in out
+    assert "Wire WhyCode into your AI editor" in out
+    # MCP snippet appears verbatim so users can copy-paste.
+    assert '"command": "whycode"' in out
+
+
+def test_tour_quiet_repo_explains_why(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "tour")
+    assert result.exit_code == 0
+    out = result.output
+    # MCP section appears regardless — most useful next step.
+    assert "Wire WhyCode into your AI editor" in out
+    # And the empty-state explanation should mention why nothing fires.
+    assert "terse" in out.lower() or "no headline" in out.lower()
+
+
+def test_tour_outside_repo_errors(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        result = runner.invoke(app, ["tour"], catch_exceptions=False)
+    finally:
+        os.chdir(cwd)
+    assert result.exit_code != 0
