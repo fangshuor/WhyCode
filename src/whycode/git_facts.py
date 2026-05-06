@@ -337,17 +337,17 @@ def all_commits(
     last-seen head. If unchanged, every row is read from SQLite.
     Otherwise we ask git only for ``<last_head>..HEAD`` and append the
     new rows; if ``last_head`` is unreachable we rebuild from scratch.
+    A ``max_count`` is always applied as a Python slice on the way out so
+    the cache stays seeded with the full log regardless of caller depth.
     """
-    if cache is not None and max_count is None:
-        return _all_commits_via_cache(repo_root, cache)
+    if cache is not None:
+        full = _all_commits_via_cache(repo_root, cache)
+        return full if max_count is None else full[:max_count]
     args = ["log", "--no-merges", f"--pretty=format:{_log_format()}"]
     if max_count is not None:
         args.append(f"--max-count={max_count}")
     raw = _run_git(repo_root, *args)
-    commits = _parse_log_records(raw)
-    if cache is not None and commits:
-        _store_commits(cache, commits)
-    return commits
+    return _parse_log_records(raw)
 
 
 def _store_commits(cache: CacheStore, commits: Sequence[Commit]) -> None:

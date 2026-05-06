@@ -192,6 +192,11 @@ def why(
     max_commits: int | None = typer.Option(
         None, "--max-commits", help="Cap the number of commits scanned (debug)."
     ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Bypass the local SQLite cache at .whycode/cache.db.",
+    ),
 ) -> None:
     """Print the Risk Card for ``path``."""
     repo_root, rel = _require_tracked(path)
@@ -204,6 +209,7 @@ def why(
         except gf.GitError:
             err.print(f"[red]error:[/red] unknown commit / ref: {at!r}")
             raise typer.Exit(2) from None
+    cache = _open_cache(repo_root, no_cache)
     if mute:
         sl = supp.load(repo_root)
         added: list[str] = []
@@ -222,65 +228,72 @@ def why(
                     f"[dim]muted on {rel}: {', '.join(added)}  "
                     f"(stored in .whycode/suppressed.json — edit to undo)[/dim]"
                 )
-    card = rc.build(
-        repo_root,
-        rel,
-        max_commits=max_commits,
-        ref=resolved_ref,
-        apply_suppressions=not no_mutes,
-    )
+    try:
+        card = rc.build(
+            repo_root,
+            rel,
+            max_commits=max_commits,
+            ref=resolved_ref,
+            apply_suppressions=not no_mutes,
+            cache=cache,
+        )
 
-    if llm or llm_dry_run:
-        from whycode import decisions as dec
+        if llm or llm_dry_run:
+            from whycode import decisions as dec
 
-        # Pick high-signal commits for L3: incidents take priority, plus
-        # any commit with a substantial body. Cap to keep the prompt small.
-        facts = gf.gather(repo_root, rel, max_commits=max_commits, ref=resolved_ref)
-        candidates = list(facts.incident_commits)
-        for c in facts.commits:
-            if c not in candidates and len(c.body) >= 100:
-                candidates.append(c)
-            if len(candidates) >= dec.DEFAULT_MAX_COMMITS:
-                break
-        candidates = candidates[: dec.DEFAULT_MAX_COMMITS]
-        n_commits, prompt_chars = dec.estimate_payload(candidates)
-
-        if llm_dry_run:
-            err.print(
-                f"[bold]LLM dry-run:[/bold] would send "
-                f"[bold]{n_commits}[/bold] commit(s), "
-                f"[bold]~{prompt_chars}[/bold] chars to the configured LLM provider.\n"
-                f"  [dim]Provider, model, and key all read from "
-                f"WHYCODE_LLM_* environment variables.[/dim]"
+            # Pick high-signal commits for L3: incidents take priority, plus
+            # any commit with a substantial body. Cap to keep the prompt small.
+            facts = gf.gather(
+                repo_root, rel, max_commits=max_commits, ref=resolved_ref, cache=cache
             )
-            if not json_out:
-                console.print(rc.render_text(card))
+            candidates = list(facts.incident_commits)
+            for c in facts.commits:
+                if c not in candidates and len(c.body) >= 100:
+                    candidates.append(c)
+                if len(candidates) >= dec.DEFAULT_MAX_COMMITS:
+                    break
+            candidates = candidates[: dec.DEFAULT_MAX_COMMITS]
+            n_commits, prompt_chars = dec.estimate_payload(candidates)
+
+            if llm_dry_run:
+                err.print(
+                    f"[bold]LLM dry-run:[/bold] would send "
+                    f"[bold]{n_commits}[/bold] commit(s), "
+                    f"[bold]~{prompt_chars}[/bold] chars to the configured LLM provider.\n"
+                    f"  [dim]Provider, model, and key all read from "
+                    f"WHYCODE_LLM_* environment variables.[/dim]"
+                )
+                if not json_out:
+                    console.print(rc.render_text(card))
+                else:
+                    console.print_json(json.dumps(card.to_dict()))
+                return
+
+            if n_commits == 0:
+                err.print(
+                    "[yellow]--llm:[/yellow] no high-signal commits to enrich on this file."
+                )
             else:
-                console.print_json(json.dumps(card.to_dict()))
+                try:
+                    decisions = dec.extract_decisions(candidates)
+                except dec.LLMConfigError as exc:
+                    err.print(f"[red]--llm config error:[/red] {exc}")
+                    raise typer.Exit(2) from exc
+                except dec.LLMCallError as exc:
+                    err.print(f"[red]--llm call failed:[/red] {exc}")
+                    raise typer.Exit(2) from exc
+                card = card.with_decisions(tuple(decisions))
+
+        if json_out:
+            console.print_json(json.dumps(card.to_dict()))
             return
-
-        if n_commits == 0:
-            err.print(
-                "[yellow]--llm:[/yellow] no high-signal commits to enrich on this file."
-            )
-        else:
-            try:
-                decisions = dec.extract_decisions(candidates)
-            except dec.LLMConfigError as exc:
-                err.print(f"[red]--llm config error:[/red] {exc}")
-                raise typer.Exit(2) from exc
-            except dec.LLMCallError as exc:
-                err.print(f"[red]--llm call failed:[/red] {exc}")
-                raise typer.Exit(2) from exc
-            card = card.with_decisions(tuple(decisions))
-
-    if json_out:
-        console.print_json(json.dumps(card.to_dict()))
-        return
-    if brief:
-        _print_brief(card)
-        return
-    console.print(rc.render_text(card))
+        if brief:
+            _print_brief(card)
+            return
+        console.print(rc.render_text(card))
+    finally:
+        if cache is not None:
+            cache.close()
 
 
 def _resolve_base_ref(repo_root: Path, requested: str | None) -> str:
@@ -335,6 +348,11 @@ def diff(
             "Use in CI: `whycode diff --fail-on history`."
         ),
     ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Bypass the local SQLite cache at .whycode/cache.db.",
+    ),
 ) -> None:
     """Risk-rank files that changed against a base ref. The 'pre-PR' command."""
     try:
@@ -364,14 +382,19 @@ def diff(
             console.print(f"[green]no changes {scope}[/green]")
         return
 
-    cards: list[rc.RiskCard] = []
-    for f in files:
-        try:
-            cards.append(rc.build(repo_root, f))
-        except gf.GitError:
-            continue
-    cards.sort(key=lambda c: -c.score.value)
-    cards = cards[:top]
+    cache = _open_cache(repo_root, no_cache)
+    try:
+        cards: list[rc.RiskCard] = []
+        for f in files:
+            try:
+                cards.append(rc.build(repo_root, f, cache=cache))
+            except gf.GitError:
+                continue
+        cards.sort(key=lambda c: -c.score.value)
+        cards = cards[:top]
+    finally:
+        if cache is not None:
+            cache.close()
 
     if json_out:
         console.print_json(
@@ -475,6 +498,11 @@ def highlights(
     json_out: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a card."
     ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Bypass the local SQLite cache at .whycode/cache.db.",
+    ),
 ) -> None:
     """The first-run treasure map: top decisions and incidents across the repo.
 
@@ -488,8 +516,13 @@ def highlights(
         err.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
-    with console.status("Reading repo history…", spinner="dots"):
-        commits = gf.all_commits(repo_root, max_count=max_commits)
+    cache = _open_cache(repo_root, no_cache)
+    try:
+        with console.status("Reading repo history…", spinner="dots"):
+            commits = gf.all_commits(repo_root, max_count=max_commits, cache=cache)
+    finally:
+        if cache is not None:
+            cache.close()
     if not commits:
         console.print("[yellow]no commits in this repo[/yellow]")
         return
@@ -950,6 +983,11 @@ _MCP_SNIPPET = '''    {
 @app.command()
 def tour(
     repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Bypass the local SQLite cache at .whycode/cache.db.",
+    ),
 ) -> None:
     """First-run walkthrough: highlights + top risky files + MCP setup snippet.
 
@@ -967,102 +1005,111 @@ def tour(
     console.print("[bold]Welcome to WhyCode.[/bold]")
     console.print(f"[dim]Reading the history of {repo_root.name}…[/dim]\n")
 
-    # Section 1 — invariants and incidents (cheap; one git log call).
-    with console.status("Looking for stated decisions…", spinner="dots"):
-        commits = gf.all_commits(repo_root, max_count=2000)
-    if not commits:
-        console.print("[yellow]This repo has no commits yet — nothing to learn from.[/yellow]")
-        return
-
-    inv_pairs = gf.extract_invariant_quotes(commits)
-    sha_to_commit = {c.sha: c for c in commits}
-    seen_lines: dict[str, str] = {}
-    for sha, line in inv_pairs:
-        seen_lines.setdefault(line, sha)
-    invariants_top = [
-        (line, sha_to_commit[sha])
-        for line, sha in seen_lines.items()
-        if sha in sha_to_commit
-    ][:3]
-    incidents_top = gf.find_incidents(commits)[:3]
-
-    if invariants_top or incidents_top:
-        console.print("[bold yellow]Decisions and incidents[/bold yellow]")
-        for line, c in invariants_top:
-            console.print(f"  [italic]{line}[/italic]")
+    cache = _open_cache(repo_root, no_cache)
+    try:
+        # Section 1 — invariants and incidents (cheap; one git log call).
+        with console.status("Looking for stated decisions…", spinner="dots"):
+            commits = gf.all_commits(repo_root, max_count=2000, cache=cache)
+        if not commits:
             console.print(
-                f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+                "[yellow]This repo has no commits yet — nothing to learn from.[/yellow]"
             )
-        for c in incidents_top:
-            subj = c.subject if len(c.subject) <= 70 else c.subject[:69] + "…"
-            console.print(f"  [red]{subj}[/red]")
+            return
+
+        inv_pairs = gf.extract_invariant_quotes(commits)
+        sha_to_commit = {c.sha: c for c in commits}
+        seen_lines: dict[str, str] = {}
+        for sha, line in inv_pairs:
+            seen_lines.setdefault(line, sha)
+        invariants_top = [
+            (line, sha_to_commit[sha])
+            for line, sha in seen_lines.items()
+            if sha in sha_to_commit
+        ][:3]
+        incidents_top = gf.find_incidents(commits)[:3]
+
+        if invariants_top or incidents_top:
+            console.print("[bold yellow]Decisions and incidents[/bold yellow]")
+            for line, c in invariants_top:
+                console.print(f"  [italic]{line}[/italic]")
+                console.print(
+                    f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+                )
+            for c in incidents_top:
+                subj = c.subject if len(c.subject) <= 70 else c.subject[:69] + "…"
+                console.print(f"  [red]{subj}[/red]")
+                console.print(
+                    f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+                )
+        else:
             console.print(
-                f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+                "[dim]No headline decisions or incidents in recent history.[/dim]"
             )
-    else:
+            console.print(
+                "[dim]Commit messages may be too terse — describing 'why' in commit "
+                "bodies (or using `hotfix:` / `BREAKING CHANGE:` prefixes) makes WhyCode "
+                "much more useful.[/dim]\n"
+            )
+
+        # Section 2 — top risky files. Slimmer scan: 100 files, depth 50 commits.
+        raw = gf.run_git(repo_root, "ls-files")
+        patterns = ign.effective_patterns(repo_root)
+        paths = [
+            p for p in raw.splitlines() if p.strip() and not ign.is_ignored(p, patterns)
+        ][:100]
+        cards: list[rc.RiskCard] = []
+        if paths:
+            with console.status(
+                f"Risk-ranking {len(paths)} files (slim scan)…", spinner="dots"
+            ):
+                for p in paths:
+                    try:
+                        card = rc.build(repo_root, p, max_commits=50, cache=cache)
+                    except gf.GitError:
+                        continue
+                    useful = [
+                        s for s in card.signals if s.kind is not sig.SignalKind.NEWBORN
+                    ]
+                    if useful:
+                        cards.append(card)
+            cards.sort(key=lambda c: -c.score.value)
+
+        if cards:
+            console.print("[bold red]Top 3 risky files[/bold red]")
+            for top in cards[:3]:
+                console.print(
+                    f"  [bold]{top.score.value:>3}[/bold]  "
+                    f"{top.score.band.value:<20}  [cyan]{top.path}[/cyan]"
+                )
+                console.print(f"       [dim]{top.signals[0].headline}[/dim]")
+            console.print()
+
+        # Section 3 — MCP setup snippet (vendor-neutral phrasing).
+        console.print("[bold magenta]Wire WhyCode into your AI editor[/bold magenta]")
         console.print(
-            "[dim]No headline decisions or incidents in recent history.[/dim]"
+            "  WhyCode ships an MCP server. Any MCP-aware editor or assistant\n"
+            "  can call it — just add this snippet to your editor's MCP config:\n"
+        )
+        console.print(_MCP_SNIPPET)
+        console.print(
+            "\n  [dim](See your editor's docs for the exact config-file location.)[/dim]\n"
+        )
+
+        # Section 4 — what to do next.
+        console.print("[bold]Next:[/bold]")
+        if cards:
+            console.print(
+                f"  [dim]·[/dim] [bold]whycode why {cards[0].path}[/bold]   the full Risk Card"
+            )
+        console.print(
+            "  [dim]·[/dim] [bold]whycode init[/bold]                     install CI + pre-commit"
         )
         console.print(
-            "[dim]Commit messages may be too terse — describing 'why' in commit "
-            "bodies (or using `hotfix:` / `BREAKING CHANGE:` prefixes) makes WhyCode "
-            "much more useful.[/dim]\n"
+            "  [dim]·[/dim] [bold]whycode highlights[/bold]                more invariants and incidents"
         )
-
-    # Section 2 — top risky files. Slimmer scan: 100 files, depth 50 commits.
-    raw = gf.run_git(repo_root, "ls-files")
-    patterns = ign.effective_patterns(repo_root)
-    paths = [p for p in raw.splitlines() if p.strip() and not ign.is_ignored(p, patterns)][
-        :100
-    ]
-    cards: list[rc.RiskCard] = []
-    if paths:
-        with console.status(
-            f"Risk-ranking {len(paths)} files (slim scan)…", spinner="dots"
-        ):
-            for p in paths:
-                try:
-                    card = rc.build(repo_root, p, max_commits=50)
-                except gf.GitError:
-                    continue
-                useful = [s for s in card.signals if s.kind is not sig.SignalKind.NEWBORN]
-                if useful:
-                    cards.append(card)
-        cards.sort(key=lambda c: -c.score.value)
-
-    if cards:
-        console.print("[bold red]Top 3 risky files[/bold red]")
-        for top in cards[:3]:
-            console.print(
-                f"  [bold]{top.score.value:>3}[/bold]  "
-                f"{top.score.band.value:<20}  [cyan]{top.path}[/cyan]"
-            )
-            console.print(f"       [dim]{top.signals[0].headline}[/dim]")
-        console.print()
-
-    # Section 3 — MCP setup snippet (vendor-neutral phrasing).
-    console.print("[bold magenta]Wire WhyCode into your AI editor[/bold magenta]")
-    console.print(
-        "  WhyCode ships an MCP server. Any MCP-aware editor or assistant\n"
-        "  can call it — just add this snippet to your editor's MCP config:\n"
-    )
-    console.print(_MCP_SNIPPET)
-    console.print(
-        "\n  [dim](See your editor's docs for the exact config-file location.)[/dim]\n"
-    )
-
-    # Section 4 — what to do next.
-    console.print("[bold]Next:[/bold]")
-    if cards:
-        console.print(
-            f"  [dim]·[/dim] [bold]whycode why {cards[0].path}[/bold]   the full Risk Card"
-        )
-    console.print(
-        "  [dim]·[/dim] [bold]whycode init[/bold]                     install CI + pre-commit"
-    )
-    console.print(
-        "  [dim]·[/dim] [bold]whycode highlights[/bold]                more invariants and incidents"
-    )
+    finally:
+        if cache is not None:
+            cache.close()
 
 
 @app.command()
@@ -1129,6 +1176,70 @@ def mcp(
         )
         raise typer.Exit(2) from exc
     serve(verbose=verbose)
+
+
+cache_app = typer.Typer(
+    add_completion=False,
+    help="Inspect and clear the local WhyCode cache.",
+    no_args_is_help=True,
+)
+app.add_typer(cache_app, name="cache")
+
+
+def _format_size(n: int) -> str:
+    """Render a byte count for human eyeballs (KB / MB)."""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+@cache_app.command("stats")
+def cache_stats(
+    repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
+) -> None:
+    """Print the size, last seen HEAD, and commit count of the local cache."""
+    try:
+        repo_root = gf.discover_repo_root(repo.resolve())
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    db_path = ch.cache_path_for(repo_root)
+    if not db_path.exists():
+        console.print(
+            f"[dim]no cache yet at {db_path}.[/dim] "
+            f"Run [bold]whycode scan[/bold] or [bold]highlights[/bold] to populate one."
+        )
+        return
+    with ch.open_for(repo_root) as store:
+        s = store.stats()
+    console.print(f"[bold]cache:[/bold] {s.path}")
+    console.print(f"  schema_version  {s.schema_version}")
+    head = s.head_sha[:12] if s.head_sha else "[dim]not set[/dim]"
+    console.print(f"  last seen HEAD  {head}")
+    console.print(f"  commit rows     {s.commit_count}")
+    console.print(f"  diffstat rows   {s.file_row_count}")
+    console.print(f"  size on disk    {_format_size(s.size_bytes)}")
+
+
+@cache_app.command("clear")
+def cache_clear(
+    repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
+) -> None:
+    """Delete the local cache database. Next run rebuilds it from scratch."""
+    try:
+        repo_root = gf.discover_repo_root(repo.resolve())
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    if ch.remove(repo_root):
+        console.print(f"[green]cleared:[/green] {ch.cache_path_for(repo_root)}")
+    else:
+        console.print(
+            f"[dim]nothing to clear — no cache at {ch.cache_path_for(repo_root)}[/dim]"
+        )
 
 
 @app.command()
