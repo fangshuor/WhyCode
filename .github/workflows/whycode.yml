@@ -1,11 +1,13 @@
 # Risk-rank pull requests with WhyCode.
 #
 # Drop this file into your repo's `.github/workflows/` directory. On every PR
-# it computes the Risk Card for each changed file (vs the PR base) and prints
-# a risk-ranked table to the job log. Advisory by default — humans decide.
+# it:
+#   1. Computes the Risk Card for each changed file (vs the PR base)
+#   2. Prints a risk-ranked table to the job log
+#   3. Posts (or updates) a single PR comment with the same table
 #
-# To turn it into a hard gate that blocks merging, append `--fail-on <band>`
-# to the `whycode diff` line below:
+# Advisory by default — humans decide. To turn it into a hard gate that
+# blocks merging, append `--fail-on <band>` to the diff line:
 #   handle    block at HANDLE WITH CARE   (score >= 75)
 #   history   block at READ HISTORY FIRST (score >= 50)
 #   look      stricter — block at >= 25
@@ -17,7 +19,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write  # required to post / update the PR comment
 
 jobs:
   whycode:
@@ -36,5 +38,26 @@ jobs:
       - name: Install WhyCode
         run: pip install whycode-cli
 
-      - name: Risk-rank files in this PR
+      - name: Risk-rank files in this PR (job log)
         run: whycode diff --base origin/${{ github.base_ref }}
+
+      - name: Build PR comment body
+        run: whycode diff --base origin/${{ github.base_ref }} --markdown > whycode-comment.md
+
+      - name: Post or update the PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BODY=$(cat whycode-comment.md)
+          EXISTING=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq 'map(select(.body | contains("<!-- whycode-comment -->"))) | .[0].id // empty')
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" \
+              -f body="$BODY" > /dev/null
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -f body="$BODY" > /dev/null
+          fi
