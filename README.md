@@ -39,11 +39,19 @@ decide what to do.
 
 ## Install
 
+Once published to PyPI:
+
+```bash
+pip install whycode
+```
+
+From source (current canonical path):
+
 ```bash
 pip install git+https://github.com/fangshuor/WhyCode.git
 ```
 
-(Until WhyCode lands on PyPI. Requires Python 3.11+.)
+Requires Python 3.11+.
 
 ## 60-second tour
 
@@ -58,6 +66,8 @@ whycode diff                        # rank everything you changed vs origin/main
 whycode diff --staged               # ditto, for files staged for commit
 whycode diff --fail-on history      # CI gate: exit 1 if any file is ≥ READ HISTORY FIRST
 whycode show <sha>                  # classification + per-file risk for one commit
+whycode timeline src/some/file.py   # risk score evolution across the file's history
+whycode honest src/some/file.py     # every invariant line, verbatim, untruncated
 whycode scan --top 10               # the riskiest files in the whole repo
 whycode mcp -v                      # MCP server with tool-call logging
 ```

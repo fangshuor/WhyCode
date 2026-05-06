@@ -3,8 +3,11 @@
 Commands
 --------
 - ``whycode why <path>``        — print the Risk Card for a single file.
+- ``whycode why <path> --at SHA`` — risk card as of a past commit.
 - ``whycode diff [--base REF]`` — risk-rank files changed against a base ref.
 - ``whycode show <sha>``        — risk-flavored summary for one commit.
+- ``whycode timeline <path>``   — risk score evolution across the file's history.
+- ``whycode honest <path>``     — every invariant line, verbatim, untruncated.
 - ``whycode scan [--top N]``    — print the top-N riskiest files in the repo.
 - ``whycode init``              — install CI workflow + pre-commit risk gate.
 - ``whycode mcp``               — start the MCP stdio server.
@@ -16,6 +19,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -282,6 +286,104 @@ def diff(
             raise typer.Exit(1)
 
 
+def _sample_indices(total: int, max_samples: int) -> list[int]:
+    """Pick at most ``max_samples`` indices spread across [0, total).
+
+    Always includes both endpoints when there are at least two items, so the
+    timeline shows the file's first and most recent state.
+    """
+    if total <= max_samples:
+        return list(range(total))
+    if max_samples < 2:
+        return [total - 1]
+    step = (total - 1) / (max_samples - 1)
+    return sorted({round(i * step) for i in range(max_samples)})
+
+
+@app.command()
+def timeline(
+    path: str = typer.Argument(..., help="File path to inspect."),
+    samples: int = typer.Option(
+        15, "--samples", help="Maximum number of points sampled across history."
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table."
+    ),
+) -> None:
+    """Show how this file's risk score evolved over its history."""
+    repo_root, rel = _resolve_repo_and_path(path)
+    if not _path_is_known_to_git(repo_root, rel):
+        err.print(
+            f"[yellow]warning:[/yellow] [bold]{rel}[/bold] is not tracked by git "
+            f"and has no history in this repo."
+        )
+        raise typer.Exit(1)
+
+    commits = gf.commits_for_path(repo_root, rel)
+    if not commits:
+        console.print(f"[yellow]no history for {rel}[/yellow]")
+        return
+
+    # Order chronologically (oldest first) so the table reads left-to-right.
+    chronological = list(reversed(commits))
+    indices = _sample_indices(len(chronological), samples)
+    sampled = [chronological[i] for i in indices]
+
+    rows: list[tuple[str, str, int, str, str]] = []
+    with console.status(
+        f"Computing risk at {len(sampled)} points…", spinner="dots"
+    ):
+        for c in sampled:
+            try:
+                card = rc.build(repo_root, rel, ref=c.sha)
+            except gf.GitError:
+                continue
+            top = card.signals[0].headline if card.signals else "—"
+            rows.append(
+                (
+                    str(c.authored_at.date()),
+                    c.sha[:7],
+                    card.score.value,
+                    card.score.band.value,
+                    top,
+                )
+            )
+
+    if json_out:
+        console.print_json(
+            json.dumps(
+                {
+                    "path": rel,
+                    "samples": [
+                        {
+                            "date": r[0],
+                            "sha": r[1],
+                            "score": r[2],
+                            "band": r[3],
+                            "top_signal": r[4],
+                        }
+                        for r in rows
+                    ],
+                }
+            )
+        )
+        return
+
+    table = Table(title=f"Risk timeline for {rel}")
+    table.add_column("date")
+    table.add_column("sha")
+    table.add_column("score", justify="right", style="bold")
+    table.add_column("band")
+    table.add_column("top signal")
+    for date_s, sha_s, score_v, band_s, top_s in rows:
+        table.add_row(date_s, sha_s, str(score_v), band_s, top_s)
+    console.print(table)
+    console.print(
+        f"[dim]{len(commits)} commit(s) total; sampled {len(rows)}. "
+        f"Use --samples N to change.[/dim]"
+    )
+
+
 @app.command()
 def scan(
     top: int = typer.Option(10, "--top", help="How many files to list."),
@@ -346,6 +448,75 @@ def scan(
         top_signal = c.signals[0].headline if c.signals else "—"
         table.add_row(str(c.score.value), c.score.band.value, c.path, top_signal)
     console.print(table)
+
+
+@app.command()
+def honest(
+    path: str = typer.Argument(..., help="File path to inspect."),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of prose."),
+) -> None:
+    """Print every invariant line in this file's history, verbatim and untruncated.
+
+    Use when the Risk Card's first-sentence truncation is hiding important
+    context — e.g., a commit whose constraint is stated across two lines.
+    """
+    repo_root, rel = _resolve_repo_and_path(path)
+    if not _path_is_known_to_git(repo_root, rel):
+        err.print(
+            f"[yellow]warning:[/yellow] [bold]{rel}[/bold] is not tracked by git "
+            f"and has no history in this repo."
+        )
+        raise typer.Exit(1)
+    facts = gf.gather(repo_root, rel)
+    if not facts.invariant_quotes:
+        if json_out:
+            console.print_json(json.dumps({"path": rel, "invariants": []}))
+        else:
+            console.print(
+                f"[dim]No invariants found in the history of {rel}.[/dim]"
+            )
+        return
+
+    sha_to_commit: dict[str, gf.Commit] = {c.sha: c for c in facts.commits}
+    grouped: dict[str, list[str]] = {}
+    sha_order: list[str] = []
+    for sha, line in facts.invariant_quotes:
+        if sha not in grouped:
+            grouped[sha] = []
+            sha_order.append(sha)
+        grouped[sha].append(line)
+
+    if json_out:
+        invariants = []
+        for sha in sha_order:
+            entry: dict[str, Any] = {"sha": sha[:12], "lines": grouped[sha]}
+            commit = sha_to_commit.get(sha)
+            if commit is not None:
+                entry["subject"] = commit.subject
+                entry["author"] = commit.author_name
+                entry["authored_at"] = commit.authored_at.isoformat()
+            invariants.append(entry)
+        console.print_json(json.dumps({"path": rel, "invariants": invariants}))
+        return
+
+    total = sum(len(v) for v in grouped.values())
+    console.print(
+        f"[bold]{total} invariant line(s) across {len(sha_order)} commit(s) "
+        f"in {rel}:[/bold]\n"
+    )
+    for sha in sha_order:
+        commit = sha_to_commit.get(sha)
+        if commit is not None:
+            header = (
+                f"[bold]{sha[:7]}[/bold]  {commit.authored_at.date()}  "
+                f"{commit.author_name}  ·  {commit.subject}"
+            )
+        else:
+            header = f"[bold]{sha[:7]}[/bold]"
+        console.print(header)
+        for line in grouped[sha]:
+            console.print(f"  > {line}")
+        console.print()
 
 
 @app.command()

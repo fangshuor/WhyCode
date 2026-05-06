@@ -290,6 +290,93 @@ def test_why_at_unknown_ref_errors(repo) -> None:  # type: ignore[no-untyped-def
     assert result.exit_code != 0
 
 
+def test_timeline_lists_sample_points(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha1 = repo.commit("init", {"refund.py": "1"}, when=days_ago(120))
+    repo.commit("feat: stuff", {"refund.py": "2"}, when=days_ago(80))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "3"},
+        body="incident #INC-42",
+        when=days_ago(40),
+    )
+    result = _invoke(repo.root, "timeline", "refund.py", "--samples", "10")
+    assert result.exit_code == 0
+    out = result.output
+    assert "refund.py" in out
+    # The first commit's short sha should be a sample point.
+    assert sha1[:7] in out
+    # And the table mentions the top signal of the most recent state, which
+    # must include the hotfix's incident-flagged classification.
+    assert "incident" in out.lower()
+
+
+def test_timeline_json_output(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(60))
+    repo.commit("update", {"a.py": "2"}, when=days_ago(30))
+    result = _invoke(repo.root, "timeline", "a.py", "--samples", "5", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["path"] == "a.py"
+    assert isinstance(data["samples"], list)
+    assert len(data["samples"]) >= 2
+    for sample in data["samples"]:
+        assert {"date", "sha", "score", "band", "top_signal"} <= set(sample.keys())
+
+
+def test_timeline_warns_on_untracked(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "timeline", "phantom.py")
+    assert result.exit_code != 0
+
+
+def test_honest_prints_full_invariants(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    long_line = (
+        "Important: do not call this from threads. "
+        "There is a global lock above that gets confused; we tried "
+        "switching to async in 2023 and rolled it back the same week."
+    )
+    repo.commit(
+        "compat: thread safety",
+        {"x.py": "1"},
+        body=long_line,
+        when=days_ago(40),
+    )
+    result = _invoke(repo.root, "honest", "x.py")
+    assert result.exit_code == 0
+    out = result.output
+    # Full sentence must appear (no first-sentence truncation).
+    assert "we tried switching to async in 2023" in out
+
+
+def test_honest_json_output(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "compat: keep sync",
+        {"x.py": "1"},
+        body="Do not switch to async. Important: legacy header must stay.",
+        when=days_ago(20),
+    )
+    result = _invoke(repo.root, "honest", "x.py", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["path"] == "x.py"
+    assert len(data["invariants"]) >= 1
+    first = data["invariants"][0]
+    assert "lines" in first
+    assert any("Do not switch to async" in line for line in first["lines"])
+
+
+def test_honest_silent_when_no_invariants(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "feat: add feature",
+        {"x.py": "1"},
+        body="Just a normal feature. No constraints.",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "honest", "x.py")
+    assert result.exit_code == 0
+    assert "no invariants" in result.output.lower()
+
+
 def test_mcp_summary_field_present_in_json(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """Verify the MCP server includes a quotable summary string in get_risk_profile."""
     sha = repo.commit("feat: A", {"a.py": "1"}, when=days_ago(40))
