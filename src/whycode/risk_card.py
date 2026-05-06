@@ -24,6 +24,7 @@ from whycode.scorer import Band, Score, score
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from whycode.cache import CacheStore
     from whycode.decisions import Decision
 
 
@@ -87,6 +88,7 @@ def build(
     max_commits: int | None = None,
     ref: str | None = None,
     apply_suppressions: bool = True,
+    cache: CacheStore | None = None,
 ) -> RiskCard:
     """Build a Risk Card.
 
@@ -94,8 +96,11 @@ def build(
     are dropped — that file is the user's "this signal is wrong, hide it"
     feedback. Pass ``apply_suppressions=False`` to bypass it (useful for
     debug or auditing what was hidden).
+
+    A ``cache`` may be supplied so repeat invocations of this function on
+    the same repo (e.g. inside ``scan`` or ``diff``) share a warm cache.
     """
-    facts = gf.gather(repo_root, path, max_commits=max_commits, ref=ref)
+    facts = gf.gather(repo_root, path, max_commits=max_commits, ref=ref, cache=cache)
     signals = sig.all_signals(facts)
     if apply_suppressions:
         suppressions = supp.load(repo_root)

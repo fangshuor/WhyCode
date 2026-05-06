@@ -61,8 +61,32 @@ CREATE TABLE IF NOT EXISTS commit_files (
     PRIMARY KEY (sha, path)
 );
 
+-- Per-path rename-resolved sha lists, populated by the first git log --follow
+-- call for that path. The (path, head_sha) pair is the validity key: if the
+-- HEAD a row was resolved against differs from the current HEAD, the row is
+-- ignored. Position preserves git's newest-first ordering.
+CREATE TABLE IF NOT EXISTS path_log (
+    path     TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    sha      TEXT NOT NULL,
+    PRIMARY KEY (path, head_sha, position)
+);
+
+-- Per-path blame ownership: author_email -> line count, scoped to a HEAD.
+-- Cached so the ghost-keeper detector does not re-shell-out to git blame
+-- on every scan of the same repo.
+CREATE TABLE IF NOT EXISTS line_ownership (
+    path         TEXT NOT NULL,
+    head_sha     TEXT NOT NULL,
+    author_email TEXT NOT NULL,
+    line_count   INTEGER NOT NULL,
+    PRIMARY KEY (path, head_sha, author_email)
+);
+
 CREATE INDEX IF NOT EXISTS idx_commit_files_path ON commit_files(path);
 CREATE INDEX IF NOT EXISTS idx_commits_authored_at ON commits(authored_at);
+CREATE INDEX IF NOT EXISTS idx_path_log_path_head ON path_log(path, head_sha);
 """
 
 
@@ -211,7 +235,79 @@ class CacheStore:
         with self._conn:
             self._conn.execute("DELETE FROM commit_files")
             self._conn.execute("DELETE FROM commits")
+            self._conn.execute("DELETE FROM path_log")
+            self._conn.execute("DELETE FROM line_ownership")
             self._conn.execute("DELETE FROM meta WHERE key != 'schema_version'")
+
+    # ---- path log (rename-resolved per-path SHA list) --------------------
+
+    def fetch_path_log(self, path: str, head_sha: str) -> list[str] | None:
+        """Return the cached rename-resolved sha list for ``path`` at ``head_sha``.
+
+        Returns ``None`` if no row was stored at that HEAD; an empty list
+        means we know there is no history (e.g. the path was never touched).
+        """
+        cur = self._conn.execute(
+            "SELECT sha FROM path_log WHERE path = ? AND head_sha = ? "
+            "ORDER BY position ASC",
+            (path, head_sha),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            # Distinguish "absent" from "empty": check the meta marker.
+            sentinel = self._get_meta(f"path_log_known:{head_sha}:{path}")
+            if sentinel == "1":
+                return []
+            return None
+        return [str(r["sha"]) for r in rows]
+
+    def store_path_log(self, path: str, head_sha: str, shas: Sequence[str]) -> None:
+        """Persist the rename-resolved sha list for ``path`` at ``head_sha``."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM path_log WHERE path = ? AND head_sha = ?",
+                (path, head_sha),
+            )
+            self._conn.executemany(
+                "INSERT INTO path_log(path, head_sha, position, sha) "
+                "VALUES(?, ?, ?, ?)",
+                [(path, head_sha, i, sha) for i, sha in enumerate(shas)],
+            )
+        # Mark the (path, head) as resolved even if shas is empty.
+        self._set_meta(f"path_log_known:{head_sha}:{path}", "1")
+
+    def fetch_line_ownership(
+        self, path: str, head_sha: str
+    ) -> dict[str, int] | None:
+        """Return cached line-ownership counts for ``path`` at ``head_sha``."""
+        cur = self._conn.execute(
+            "SELECT author_email, line_count FROM line_ownership "
+            "WHERE path = ? AND head_sha = ?",
+            (path, head_sha),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            sentinel = self._get_meta(f"blame_known:{head_sha}:{path}")
+            if sentinel == "1":
+                return {}
+            return None
+        return {str(r["author_email"]): int(r["line_count"]) for r in rows}
+
+    def store_line_ownership(
+        self, path: str, head_sha: str, counts: dict[str, int]
+    ) -> None:
+        """Persist line-ownership counts for ``path`` at ``head_sha``."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM line_ownership WHERE path = ? AND head_sha = ?",
+                (path, head_sha),
+            )
+            self._conn.executemany(
+                "INSERT INTO line_ownership(path, head_sha, author_email, line_count) "
+                "VALUES(?, ?, ?, ?)",
+                [(path, head_sha, email, count) for email, count in counts.items()],
+            )
+        self._set_meta(f"blame_known:{head_sha}:{path}", "1")
 
     # ---- reads ------------------------------------------------------------
 

@@ -30,6 +30,7 @@ from rich.console import Console
 from rich.table import Table
 
 from whycode import __version__
+from whycode import cache as ch
 from whycode import git_facts as gf
 from whycode import ignore as ign
 from whycode import risk_card as rc
@@ -44,6 +45,24 @@ app = typer.Typer(
 
 console = Console()
 err = Console(stderr=True)
+
+
+def _open_cache(repo_root: Path, no_cache: bool) -> ch.CacheStore | None:
+    """Open the on-disk cache for ``repo_root`` unless suppressed.
+
+    A None return means "do not pass a cache through git_facts" — every
+    git-side helper falls back to its original network-free, cache-free
+    implementation. This is the escape hatch behind ``--no-cache`` and
+    is also the default when the cache cannot be initialised at all
+    (read-only filesystem, etc.); we never want a cache failure to
+    block the main read path.
+    """
+    if no_cache:
+        return None
+    try:
+        return ch.open_for(repo_root)
+    except OSError:
+        return None
 
 
 def _resolve_repo_and_path(path_arg: str) -> tuple[Path, str]:
@@ -682,6 +701,14 @@ def scan(
         "--no-ignore",
         help="Bypass the default-ignore list and scan everything (CHANGELOGs, lockfiles, vendored).",
     ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help=(
+            "Bypass the local SQLite cache at .whycode/cache.db. Mostly "
+            "useful for benchmarking and for forcing a fresh git read."
+        ),
+    ),
     repo: Path = typer.Option(
         Path("."), "--repo", help="Path inside the repo (defaults to cwd)."
     ),
@@ -703,18 +730,25 @@ def scan(
 
     depth_cap = scan_depth if scan_depth > 0 else None
     cards: list[rc.RiskCard] = []
-    with console.status(f"Scanning {len(paths)} files…", spinner="dots"):
-        for p in paths:
-            try:
-                card = rc.build(repo_root, p, max_commits=depth_cap)
-            except gf.GitError:
-                continue
-            # Skip files whose only signal is NEWBORN — that's "not enough
-            # history yet", not real risk. `scan` is for surfacing risk;
-            # informational signals don't belong here.
-            useful = [s for s in card.signals if s.kind is not sig.SignalKind.NEWBORN]
-            if useful:
-                cards.append(card)
+    cache = _open_cache(repo_root, no_cache)
+    try:
+        with console.status(f"Scanning {len(paths)} files…", spinner="dots"):
+            for p in paths:
+                try:
+                    card = rc.build(repo_root, p, max_commits=depth_cap, cache=cache)
+                except gf.GitError:
+                    continue
+                # Skip files whose only signal is NEWBORN — that's "not enough
+                # history yet", not real risk. `scan` is for surfacing risk;
+                # informational signals don't belong here.
+                useful = [
+                    s for s in card.signals if s.kind is not sig.SignalKind.NEWBORN
+                ]
+                if useful:
+                    cards.append(card)
+    finally:
+        if cache is not None:
+            cache.close()
 
     cards.sort(key=lambda c: -c.score.value)
     top_cards = cards[:top]

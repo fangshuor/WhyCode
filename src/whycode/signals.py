@@ -214,7 +214,7 @@ def detect_ghost_keeper(facts: RepoFacts) -> Signal | None:
     if not facts.commits:
         return None
 
-    blame = gf.line_ownership(facts.repo_root, facts.path)
+    blame = gf.line_ownership(facts.repo_root, facts.path, cache=facts.cache)
     ownership_share: float | None = None
     if blame:
         total_lines = sum(blame.values())

@@ -131,6 +131,10 @@ class RepoFacts:
     invariant_quotes: list[tuple[str, str]] = field(default_factory=list)
     """Pairs of (commit_sha, line containing an invariant token)."""
 
+    cache: CacheStore | None = None
+    """Optional cache, threaded through so signal detectors can reuse it
+    for follow-up queries (e.g. ``git blame`` for ghost-keeper detection)."""
+
 
 class GitError(RuntimeError):
     """Raised when a git invocation fails or produces unexpected output."""
@@ -235,28 +239,90 @@ def commits_for_path(
 
     A :class:`whycode.cache.CacheStore` may be passed to serve repeat queries
     from SQLite. The cache path is bypassed when ``ref`` is set (history
-    queries operate on a different sha-set), and on first call for an
-    unseen path: rename-following is a git-native feature we cannot mirror
-    deterministically in SQL. After git provides the rename-resolved list
-    once, every subsequent commit is upserted so future calls hit the
-    cache directly.
+    queries operate on a different sha-set). On first call for an unseen
+    path we let git resolve the rename history once, persist the resulting
+    sha-ordered list under the current HEAD, then serve every subsequent
+    call directly out of SQLite.
     """
+    if cache is not None and ref is None:
+        # Make sure the cache has a HEAD pinned; we need it to seal the
+        # rename-resolved log against the right snapshot. Do this via
+        # all_commits with a cache, which records head_sha as a side effect.
+        if cache.head_sha is None:
+            all_commits(repo_root, cache=cache)
+        cached = _commits_for_path_via_cache(repo_root, path, cache, max_count)
+        if cached is not None:
+            return cached
+    fetch_max = (
+        None if (cache is not None and ref is None) else max_count
+    )
     args = [
         "log",
         "--follow",
         "--no-merges",
         f"--pretty=format:{_log_format()}",
     ]
-    if max_count is not None:
-        args.append(f"--max-count={max_count}")
+    if fetch_max is not None:
+        args.append(f"--max-count={fetch_max}")
     if ref is not None:
         args.append(ref)
     args.extend(["--", path])
     raw = _run_git(repo_root, *args)
     commits = _parse_log_records(raw)
-    if cache is not None and ref is None and commits:
-        _store_commits(cache, commits)
+    if cache is not None and ref is None:
+        if commits:
+            _store_commits(cache, commits)
+        # Persist the full rename-resolved sha order for this path so that
+        # a later scan with a different --scan-depth hits the cache too.
+        # Only seal under the live HEAD; if the cache hasn't recorded a
+        # head_sha yet we skip the seal and rely on the next all_commits()
+        # call to set it.
+        try:
+            head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+        except GitError:
+            head_sha = ""
+        if head_sha and head_sha == cache.head_sha:
+            cache.store_path_log(path, head_sha, [c.sha for c in commits])
+    if max_count is not None and len(commits) > max_count:
+        commits = commits[:max_count]
     return commits
+
+
+def _commits_for_path_via_cache(
+    repo_root: Path,
+    path: str,
+    cache: CacheStore,
+    max_count: int | None,
+) -> list[Commit] | None:
+    """Return cached rename-resolved commits for ``path``, or None on miss.
+
+    When the cache holds a path_log entry sealed at the current HEAD, the
+    full sha list (and its commit metadata) is read straight from SQLite.
+    Any miss — unknown HEAD, no path_log row, missing commit row —
+    returns None and the caller falls through to the git path.
+    """
+    head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+    if cache.head_sha != head_sha:
+        return None
+    cached_shas = cache.fetch_path_log(path, head_sha)
+    if cached_shas is None:
+        return None
+    if max_count is not None:
+        cached_shas = cached_shas[:max_count]
+    if not cached_shas:
+        return []
+    rows: list[Commit] = []
+    rows_by_sha = {
+        str(r["sha"]): r for r in cache.fetch_all_commit_rows()
+    }
+    for sha in cached_shas:
+        row = rows_by_sha.get(sha)
+        if row is None:
+            # The path_log references a sha we don't have a metadata row for.
+            # Fall back to git rather than returning a partial answer.
+            return None
+        rows.append(_commit_from_row(row))
+    return rows
 
 
 def all_commits(
@@ -676,17 +742,34 @@ def author_last_activity(repo_root: Path, email: str) -> datetime | None:
         return None
 
 
-def line_ownership(repo_root: Path, path: str) -> dict[str, int]:
+def line_ownership(
+    repo_root: Path, path: str, *, cache: CacheStore | None = None
+) -> dict[str, int]:
     """Return ``{author_email: line_count}`` from ``git blame`` of HEAD's ``path``.
 
     Empty dict if blame is unavailable (file deleted, binary, etc.). Used by
     Layer 2 to refine ghost-keeper detection: line ownership is a stronger
     signal than commit count, which can be skewed by a single big initial
     commit followed by many tiny fixes.
+
+    With a cache supplied, the result is keyed by ``(path, head_sha)`` so a
+    repo-wide scan only invokes ``git blame`` once per file per HEAD.
     """
+    head_sha: str | None = None
+    if cache is not None:
+        try:
+            head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+        except GitError:
+            head_sha = None
+        if head_sha:
+            cached = cache.fetch_line_ownership(path, head_sha)
+            if cached is not None:
+                return cached
     try:
         raw = _run_git(repo_root, "blame", "--line-porcelain", "HEAD", "--", path)
     except GitError:
+        if cache is not None and head_sha:
+            cache.store_line_ownership(path, head_sha, {})
         return {}
     counts: dict[str, int] = {}
     current_email: str | None = None
@@ -695,6 +778,8 @@ def line_ownership(repo_root: Path, path: str) -> dict[str, int]:
             current_email = line[len("author-mail "):].strip().strip("<>")
         elif line.startswith("\t") and current_email:
             counts[current_email] = counts.get(current_email, 0) + 1
+    if cache is not None and head_sha:
+        cache.store_line_ownership(path, head_sha, counts)
     return counts
 
 
@@ -729,4 +814,5 @@ def gather(
         revert_pairs=find_revert_pairs(commits),
         incident_commits=find_incidents(commits),
         invariant_quotes=extract_invariant_quotes(commits),
+        cache=use_cache,
     )
