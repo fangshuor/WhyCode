@@ -4,6 +4,23 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] — 2026-05-06
+
+### Added
+- `whycode diff --markdown` emits a GitHub-flavoured markdown table
+  designed for posting as a PR comment. Includes a hidden HTML marker
+  (`<!-- whycode-comment -->`) so subsequent runs find and update the
+  same comment instead of stacking new ones.
+- The packaged GitHub Action workflow (and this repo's dogfood copy)
+  now post the risk briefing as a sticky PR comment in addition to
+  printing it to the job log. Most PR reviewers never read CI logs;
+  inline comments are read every time.
+
+### Changed
+- The workflow now requires `pull-requests: write` permission so the
+  comment-posting step works. CI logs alone still work for read-only
+  setups — just remove the comment steps.
+
 ## [0.2.4] — 2026-05-06
 
 ### Internal — tighter public API boundary

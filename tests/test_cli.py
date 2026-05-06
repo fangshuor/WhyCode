@@ -508,6 +508,39 @@ def test_scan_no_ignore_brings_them_back(repo, days_ago) -> None:  # type: ignor
     assert "CHANGELOG" in permissive_run.output or "src/app.py" in permissive_run.output
 
 
+def test_diff_markdown_output(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"refund.py": "0"}, when=days_ago(120))
+    sha = repo.commit("feat: refund flow", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #INC-42",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "diff", "--base", "HEAD~3", "--markdown")
+    assert result.exit_code == 0
+    out = result.output
+    # Hidden marker so the workflow can find-and-update its prior comment.
+    assert "<!-- whycode-comment -->" in out
+    # Markdown table syntax.
+    assert "| Score | Band |" in out
+    assert "| ----: |" in out
+    # File path appears as inline code.
+    assert "`refund.py`" in out
+
+
+def test_diff_markdown_quiet_repo(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(40))
+    repo.commit("docs: tweak", {"a.py": "2"}, when=days_ago(20))
+    result = _invoke(repo.root, "diff", "--base", "HEAD~1", "--markdown")
+    assert result.exit_code == 0
+    out = result.output
+    assert "<!-- whycode-comment -->" in out
+    # No flagged files → friendly note instead of an empty table.
+    assert "Nothing flagged" in out
+
+
 def test_scan_respects_user_whycodeignore(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     (repo.root / ".whycodeignore").write_text("internal/legacy.py\n")
     sha = repo.commit(

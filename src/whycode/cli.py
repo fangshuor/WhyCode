@@ -238,6 +238,14 @@ def diff(
     json_out: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a table."
     ),
+    markdown: bool = typer.Option(
+        False,
+        "--markdown",
+        help=(
+            "Emit GitHub-flavoured markdown suitable for posting as a PR comment. "
+            "Pipe into a workflow step that calls `gh pr comment`."
+        ),
+    ),
     fail_on: str | None = typer.Option(
         None,
         "--fail-on",
@@ -305,6 +313,37 @@ def diff(
 
     flagged = [c for c in cards if _is_actionable(c)]
     quiet_n = len(cards) - len(flagged)
+    scope_md = "files staged for commit" if staged else f"files changed vs `{actual_base}`"
+    if markdown:
+        # Stable marker so a follow-up workflow step can find-and-update the
+        # same comment on subsequent pushes instead of stacking new ones.
+        print("<!-- whycode-comment -->")
+        print("## WhyCode risk briefing")
+        print()
+        print(f"**{len(files)} {scope_md}**")
+        print()
+        if not flagged:
+            print("Nothing flagged. Read the diff anyway.")
+        else:
+            print("| Score | Band | File | Top signal |")
+            print("| ----: | ---- | ---- | ---------- |")
+            for c in flagged:
+                top_signal = c.signals[0].headline.replace("|", "\\|")
+                print(
+                    f"| {c.score.value} | {c.score.band.value} | "
+                    f"`{c.path}` | {top_signal} |"
+                )
+            if quiet_n:
+                print()
+                print(f"_+ {quiet_n} file(s) changed with no flags._")
+            print()
+            print(
+                "_Run `whycode why <path>` for the full Risk Card on any of the above._"
+            )
+        if threshold is not None and any(c.score.value >= threshold for c in cards):
+            raise typer.Exit(1)
+        return
+
     scope = "staged for commit" if staged else f"changed vs {actual_base}"
     console.print(f"[bold]{len(files)} file(s) {scope}[/bold]")
     if not flagged:
