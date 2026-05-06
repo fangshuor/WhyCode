@@ -1,7 +1,12 @@
-# Risk-rank pull requests with WhyCode.
+# Risk-rank pull requests with WhyCode (this repo's own dogfood).
 #
-# Drop this file into your repo's `.github/workflows/` directory. On every PR
-# it:
+# This file deliberately installs WhyCode from the PR's source tree
+# (`pip install .`) instead of PyPI, so CI always exercises whatever is
+# about to ship — never the lagged published version. End-user repos
+# should use the package template (`whycode init` writes that one),
+# which installs `pip install whycode-cli` from PyPI.
+#
+# On every PR this workflow:
 #   1. Computes the Risk Card for each changed file (vs the PR base)
 #   2. Prints a risk-ranked table to the job log
 #   3. Posts (or updates) a single PR comment with the same table
@@ -35,8 +40,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install WhyCode
-        run: pip install whycode-cli
+      - name: Install WhyCode (from this PR's source)
+        run: pip install .
 
       - name: Risk-rank files in this PR (job log)
         run: whycode diff --base origin/${{ github.base_ref }}
