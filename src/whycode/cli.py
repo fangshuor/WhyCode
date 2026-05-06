@@ -6,6 +6,7 @@ Commands
 - ``whycode why <path>``        — print the Risk Card for a single file.
 - ``whycode why <path> --at SHA`` — risk card as of a past commit.
 - ``whycode why <path> --mute KIND`` — locally suppress a noisy signal kind.
+- ``whycode why <path> --llm`` — opt-in L3: LLM-extracted structured decisions.
 - ``whycode highlights``        — repo-wide treasure map of decisions and incidents.
 - ``whycode diff [--base REF]`` — risk-rank files changed against a base ref.
 - ``whycode show <sha>``        — risk-flavored summary for one commit.
@@ -155,6 +156,20 @@ def why(
         "--no-mutes",
         help="Bypass the local suppression list — show all signals.",
     ),
+    llm: bool = typer.Option(
+        False,
+        "--llm",
+        help=(
+            "Enrich the card with LLM-extracted structured decisions "
+            "(L3, opt-in, requires WHYCODE_LLM_API_KEY + WHYCODE_LLM_MODEL). "
+            "Sends only commits already filtered by L2 — see --llm-dry-run."
+        ),
+    ),
+    llm_dry_run: bool = typer.Option(
+        False,
+        "--llm-dry-run",
+        help="Show exactly what would be sent to the LLM without making the call.",
+    ),
     max_commits: int | None = typer.Option(
         None, "--max-commits", help="Cap the number of commits scanned (debug)."
     ),
@@ -195,6 +210,51 @@ def why(
         ref=resolved_ref,
         apply_suppressions=not no_mutes,
     )
+
+    if llm or llm_dry_run:
+        from whycode import decisions as dec
+
+        # Pick high-signal commits for L3: incidents take priority, plus
+        # any commit with a substantial body. Cap to keep the prompt small.
+        facts = gf.gather(repo_root, rel, max_commits=max_commits, ref=resolved_ref)
+        candidates = list(facts.incident_commits)
+        for c in facts.commits:
+            if c not in candidates and len(c.body) >= 100:
+                candidates.append(c)
+            if len(candidates) >= dec.DEFAULT_MAX_COMMITS:
+                break
+        candidates = candidates[: dec.DEFAULT_MAX_COMMITS]
+        n_commits, prompt_chars = dec.estimate_payload(candidates)
+
+        if llm_dry_run:
+            err.print(
+                f"[bold]LLM dry-run:[/bold] would send "
+                f"[bold]{n_commits}[/bold] commit(s), "
+                f"[bold]~{prompt_chars}[/bold] chars to the configured LLM provider.\n"
+                f"  [dim]Provider, model, and key all read from "
+                f"WHYCODE_LLM_* environment variables.[/dim]"
+            )
+            if not json_out:
+                console.print(rc.render_text(card))
+            else:
+                console.print_json(json.dumps(card.to_dict()))
+            return
+
+        if n_commits == 0:
+            err.print(
+                "[yellow]--llm:[/yellow] no high-signal commits to enrich on this file."
+            )
+        else:
+            try:
+                decisions = dec.extract_decisions(candidates)
+            except dec.LLMConfigError as exc:
+                err.print(f"[red]--llm config error:[/red] {exc}")
+                raise typer.Exit(2) from exc
+            except dec.LLMCallError as exc:
+                err.print(f"[red]--llm call failed:[/red] {exc}")
+                raise typer.Exit(2) from exc
+            card = card.with_decisions(tuple(decisions))
+
     if json_out:
         console.print_json(json.dumps(card.to_dict()))
         return

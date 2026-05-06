@@ -169,11 +169,32 @@ Tune the thresholds inside those two files for your repo. Re-run with
 | ----- | ------------------------------------------------------------------------ | -------- | -------- |
 | 1     | Deterministic git facts (log, diffstat, revert pairs, author activity)   | no       | no       |
 | 2     | Heuristic signals (reverts, incidents, silence, ghost keeper, coupling, invariants, churn, newborn) | no | no |
-| 3     | LLM polish (optional, opt-in, never on by default)                       | yes      | yes      |
+| 3     | LLM-extracted structured decisions (optional, opt-in, never on by default) | yes      | yes      |
 
-**Layer 1 + Layer 2 produce the Risk Card you saw above. No model calls, no
-data leaving your machine.** Layer 3 is reserved for natural-language
-summarisation of decisions and is strictly opt-in.
+**Layer 1 + Layer 2 produce the Risk Card by default. No model calls, no
+data leaving your machine.** Layer 3 lifts the keyword fragments L1 + L2
+extract ("do not switch to async") into structured decisions with the
+*why* drawn from the surrounding commit body — but only when you ask for
+it with `--llm`.
+
+### Optional L3 — LLM-enriched decisions
+
+Install the optional extras and configure the env vars:
+
+```bash
+pip install 'whycode-cli[llm]'
+export WHYCODE_LLM_API_KEY="…"
+export WHYCODE_LLM_MODEL="<your-provider's-model-identifier>"
+
+whycode why src/some/file.py --llm        # full card + structured decisions
+whycode why src/some/file.py --llm-dry-run  # see exactly what would be sent
+```
+
+Privacy contract: configuration is entirely environment-driven (no
+hardcoded provider in the source tree); the SDK is lazy-imported (no
+import cost unless you opt in); only L2-filtered high-signal commits
+are sent (capped at 10 per call); a malformed model response degrades
+to "no decisions" rather than crashing.
 
 ## What this is NOT
 
