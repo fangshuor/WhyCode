@@ -377,6 +377,94 @@ def test_honest_silent_when_no_invariants(repo, days_ago) -> None:  # type: igno
     assert "no invariants" in result.output.lower()
 
 
+def test_highlights_surfaces_invariants_and_incidents(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "compat: keep sync path",
+        {"a.py": "1"},
+        body="Do not switch to async — v1 clients break.",
+        when=days_ago(60),
+    )
+    repo.commit(
+        "hotfix: refund regression",
+        {"b.py": "1"},
+        body="See INC-447 for context.",
+        when=days_ago(20),
+    )
+    result = _invoke(repo.root, "highlights")
+    assert result.exit_code == 0
+    out = result.output
+    assert "INVARIANTS" in out
+    assert "Do not switch to async" in out
+    assert "INCIDENTS" in out
+    assert "hotfix: refund regression" in out
+
+
+def test_highlights_json_output(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "compat: keep sync",
+        {"a.py": "1"},
+        body="Important: legacy header must stay.",
+        when=days_ago(30),
+    )
+    result = _invoke(repo.root, "highlights", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "invariants" in data
+    assert "incidents" in data
+    assert any("legacy header" in inv["line"] for inv in data["invariants"])
+
+
+def test_highlights_quiet_repo_does_not_error(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init: nothing here", {"a.py": "1"})
+    result = _invoke(repo.root, "highlights")
+    assert result.exit_code == 0
+    out = result.output.lower()
+    assert "none found" in out
+
+
+def test_why_mute_writes_suppression_and_hides_signal(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "init",
+        {"refund.py": "1"},
+        when=days_ago(60),
+    )
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="See #INC-42",
+        when=days_ago(10),
+    )
+    # First call: incident_history fires.
+    before = _invoke(repo.root, "why", "refund.py", "--json")
+    data_before = json.loads(before.output)
+    assert any(s["kind"] == "incident_history" for s in data_before["signals"])
+
+    # Mute it.
+    muted = _invoke(repo.root, "why", "refund.py", "--mute", "incident", "--json")
+    assert muted.exit_code == 0
+    data_muted = json.loads(muted.output)
+    assert all(s["kind"] != "incident_history" for s in data_muted["signals"])
+    # File now exists on disk.
+    assert (repo.root / ".whycode" / "suppressed.json").exists()
+
+    # Subsequent run: still hidden (persistence).
+    again = _invoke(repo.root, "why", "refund.py", "--json")
+    data_again = json.loads(again.output)
+    assert all(s["kind"] != "incident_history" for s in data_again["signals"])
+
+    # --no-mutes brings it back without removing from the file.
+    bypass = _invoke(repo.root, "why", "refund.py", "--no-mutes", "--json")
+    data_bypass = json.loads(bypass.output)
+    assert any(s["kind"] == "incident_history" for s in data_bypass["signals"])
+
+
+def test_why_mute_unknown_kind_errors(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "why", "a.py", "--mute", "nonsense")
+    assert result.exit_code != 0
+    assert "unknown signal kind" in result.output.lower()
+
+
 def test_mcp_summary_field_present_in_json(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """Verify the MCP server includes a quotable summary string in get_risk_profile."""
     sha = repo.commit("feat: A", {"a.py": "1"}, when=days_ago(40))
