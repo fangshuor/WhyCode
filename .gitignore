@@ -20,6 +20,13 @@ venv/
 .coverage.*
 htmlcov/
 
+# Secrets — never commit any of these
+.pypirc
+.env
+.env.*
+*.pem
+*.key
+
 # Editors
 .vscode/
 .idea/

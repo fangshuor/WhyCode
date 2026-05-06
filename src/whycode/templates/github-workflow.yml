@@ -36,7 +36,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install WhyCode
-        run: pip install git+https://github.com/fangshuor/WhyCode.git
+        run: pip install whycode-cli
 
       - name: Risk-rank files in this PR
         run: whycode diff --base origin/${{ github.base_ref }} --fail-on history
