@@ -4,6 +4,31 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] — 2026-05-06
+
+### Internal — tighter public API boundary
+
+A code-audit pass found 12 sites where ``cli.py`` reached into ``git_facts``
+private members (``_run_git``, ``_log_format``, ``_parse_log_records``,
+``_INCIDENT_RE``, ``_BREAKING_CC_RE``). Three commands also repeated the
+same five-line "resolve path + verify it's tracked" boilerplate.
+
+- Promoted ``run_git()`` to public API (``_run_git`` kept as a back-compat
+  alias). Callers that need to invoke an arbitrary git command go through
+  this rather than the underscore name.
+- Added ``read_commit(repo_root, ref) -> Commit | None`` — single-commit
+  resolver that wraps the log-format dance in one place. ``whycode show``
+  now uses it instead of the three-line `_log_format` + `_parse_log_records`
+  sequence.
+- Added ``classify_commit(commit) -> CommitClassification`` — public
+  re-use of the same ladder ``find_incidents`` and ``extract_invariant_quotes``
+  apply, so callers don't reach for the underscore regex constants.
+- Combined the resolve-and-verify-path boilerplate into a single
+  ``_require_tracked()`` helper inside ``cli.py``; ``why``, ``timeline``,
+  and ``honest`` each lost five lines of duplication.
+
+No user-visible behaviour change; no perf change. 99 tests still passing.
+
 ## [0.2.3] — 2026-05-06
 
 This release is the result of running WhyCode against a real moderately-sized
