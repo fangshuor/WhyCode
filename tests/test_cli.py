@@ -1,0 +1,227 @@
+"""Tests for the CLI: covers `why`, `scan`, `version`, and the JSON path."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+from whycode.cli import app
+
+runner = CliRunner()
+
+
+def _invoke(repo_root: Path, *args: str):  # type: ignore[no-untyped-def]
+    cwd = os.getcwd()
+    os.chdir(repo_root)
+    try:
+        return runner.invoke(app, list(args), catch_exceptions=False)
+    finally:
+        os.chdir(cwd)
+
+
+def test_version_prints(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.txt": "1"})
+    result = _invoke(repo.root, "version")
+    assert result.exit_code == 0
+    assert result.output.strip()
+
+
+def test_why_emits_card(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("feature", {"refund.py": "1"}, when=days_ago(40))
+    repo.revert(sha, when=days_ago(35))
+    repo.commit(
+        "hotfix: edge case",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "why", "refund.py")
+    assert result.exit_code == 0
+    out = result.output
+    assert "refund.py" in out
+    assert any(band in out for band in ("HANDLE WITH CARE", "READ HISTORY", "WORTH A LOOK"))
+
+
+def test_why_json_output_is_valid_json(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(40))
+    result = _invoke(repo.root, "why", "a.py", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["path"] == "a.py"
+    assert "score" in data
+    assert "signals" in data
+    assert isinstance(data["signals"], list)
+
+
+def test_why_handles_path_outside_repo(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # No git repo here.
+    target = tmp_path / "nope.txt"
+    target.write_text("x")
+    result = runner.invoke(app, ["why", str(target)], catch_exceptions=False)
+    assert result.exit_code != 0
+
+
+def test_why_warns_on_untracked_path(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.txt": "1"})
+    result = _invoke(repo.root, "why", "phantom.txt")
+    assert result.exit_code == 1
+    assert "warning" in result.output.lower()
+    assert "phantom.txt" in result.output
+
+
+def test_diff_lists_changed_files_in_risk_order(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    # Base commit: two files exist.
+    repo.commit("init", {"a.py": "1", "b.py": "1"}, when=days_ago(60))
+    sha = repo.commit("feature: A", {"a.py": "2"}, when=days_ago(40))
+    repo.revert(sha, when=days_ago(35))
+    # Now make a.py "changed against HEAD~3".
+    repo.commit(
+        "hotfix: regression in a",
+        {"a.py": "3"},
+        body="incident #42",
+        when=days_ago(5),
+    )
+    repo.commit("docs: tweak b", {"b.py": "2"}, when=days_ago(2))
+    result = _invoke(repo.root, "diff", "--base", "HEAD~3")
+    assert result.exit_code == 0
+    assert "a.py" in result.output
+
+
+def test_diff_clean_when_no_changes(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "diff", "--base", "HEAD")
+    assert result.exit_code == 0
+    assert "no changes" in result.output.lower()
+
+
+def test_diff_json_output(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(40))
+    repo.commit("feat: A", {"a.py": "2"}, when=days_ago(20))
+    result = _invoke(repo.root, "diff", "--base", "HEAD~1", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "base" in data
+    assert "files" in data
+    assert isinstance(data["files"], list)
+
+
+def test_why_brief_one_line_format(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(40))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2"},
+        body="incident #1",
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "why", "a.py", "--brief")
+    assert result.exit_code == 0
+    out = result.output.strip()
+    assert "\n" not in out  # one line, no rich panels
+    assert "a.py" in out
+    assert any(band in out for band in ("HANDLE", "READ", "WORTH", "NO FLAGS"))
+
+
+def test_diff_fail_on_triggers_when_threshold_breached(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("init", {"a.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2"},
+        body="incident #1",
+        when=days_ago(20),
+    )
+    repo.commit("docs: tweak", {"a.py": "3"}, when=days_ago(2))
+    result = _invoke(repo.root, "diff", "--base", "HEAD~3", "--fail-on", "history")
+    # a.py should reach READ HISTORY FIRST or higher → exit 1.
+    assert result.exit_code == 1
+
+
+def test_diff_fail_on_passes_below_threshold(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(20))
+    repo.commit("docs: tweak", {"a.py": "2"}, when=days_ago(2))
+    result = _invoke(repo.root, "diff", "--base", "HEAD~1", "--fail-on", "handle")
+    # No high-severity signals here → score below 75 → exit 0.
+    assert result.exit_code == 0
+
+
+def test_diff_fail_on_unknown_band_errors(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "diff", "--base", "HEAD", "--fail-on", "bogus")
+    assert result.exit_code != 0
+
+
+def test_diff_staged_uses_index(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    # Stage a new change without committing.
+    (repo.root / "a.py").write_text("v2")
+    import subprocess
+
+    subprocess.run(["git", "-C", str(repo.root), "add", "a.py"], check=True)
+    result = _invoke(repo.root, "diff", "--staged")
+    assert result.exit_code == 0
+    assert "staged" in result.output.lower() or "a.py" in result.output
+
+
+def test_scan_empty_state_explains_itself(repo) -> None:  # type: ignore[no-untyped-def]
+    # A single trivial commit produces no flagged files (NEWBORN-only).
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "scan")
+    assert result.exit_code == 0
+    out = result.output.lower()
+    # Must mention "no flagged" AND give the user a reason.
+    assert "no flagged" in out
+    assert "commit messages" in out or "terse" in out
+
+
+def test_show_renders_for_a_real_commit(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit(
+        "hotfix: refund regression",
+        {"a.py": "1", "b.py": "1"},
+        body="incident #INC-42",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "show", sha)
+    assert result.exit_code == 0
+    out = result.output
+    assert sha[:12] in out
+    assert "hotfix" in out.lower()
+    assert "incident-flavored" in out.lower()
+    assert "a.py" in out
+
+
+def test_show_json_output(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit(
+        "feat!: drop legacy api",
+        {"a.py": "1"},
+        body="BREAKING CHANGE: clients must migrate.",
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "show", sha[:7], "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["sha"].startswith(sha[:7])
+    assert data["incident_flavored"] is True
+    assert data["files_changed"] == 1
+
+
+def test_show_unknown_sha_errors(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "show", "deadbeefdeadbeef")
+    assert result.exit_code != 0
+
+
+def test_scan_lists_top_files(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("init", {"a.py": "1", "b.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2"},
+        body="incident",
+        when=days_ago(20),
+    )
+    result = _invoke(repo.root, "scan", "--top", "3")
+    assert result.exit_code == 0
+    assert "a.py" in result.output

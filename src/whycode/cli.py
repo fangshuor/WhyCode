@@ -1,0 +1,455 @@
+"""The ``whycode`` CLI.
+
+Commands
+--------
+- ``whycode why <path>``        — print the Risk Card for a single file.
+- ``whycode diff [--base REF]`` — risk-rank files changed against a base ref.
+- ``whycode scan [--top N]``    — print the top-N riskiest files in the repo.
+- ``whycode mcp``               — start the MCP stdio server.
+- ``whycode version``           — print version.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from whycode import __version__
+from whycode import git_facts as gf
+from whycode import risk_card as rc
+from whycode import signals as sig
+
+app = typer.Typer(
+    add_completion=False,
+    help="WhyCode — tells you what to be afraid of before touching a file.",
+    no_args_is_help=True,
+)
+
+console = Console()
+err = Console(stderr=True)
+
+
+def _resolve_repo_and_path(path_arg: str) -> tuple[Path, str]:
+    """Translate a user-provided path into (repo_root, repo-relative path)."""
+    p = Path(path_arg).resolve()
+    start = p if p.is_dir() else p.parent if p.exists() else Path.cwd()
+    try:
+        repo_root = gf.discover_repo_root(start)
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    if not p.exists():
+        # Allow the user to pass a path that was deleted in HEAD but lived in
+        # history — we still want to report on it.
+        rel = path_arg
+    else:
+        try:
+            rel = str(p.relative_to(repo_root))
+        except ValueError:
+            err.print(f"[red]error:[/red] {p} is not inside {repo_root}")
+            raise typer.Exit(2) from None
+    return repo_root, rel
+
+
+def _path_is_known_to_git(repo_root: Path, rel: str) -> bool:
+    """Has git ever seen this path? (tracked OR appears in history)"""
+    if gf.is_tracked(repo_root, rel):
+        return True
+    try:
+        out = gf._run_git(repo_root, "log", "--oneline", "-1", "--all", "--", rel)
+    except gf.GitError:
+        return False
+    return bool(out.strip())
+
+
+# --- shared: band threshold parsing ----------------------------------------
+
+_BAND_THRESHOLDS_BY_KEY: dict[str, int] = {
+    "handle": 75,
+    "handle-with-care": 75,
+    "history": 50,
+    "read": 50,
+    "read-history-first": 50,
+    "look": 25,
+    "worth-a-look": 25,
+}
+
+
+def _parse_fail_on(value: str) -> int:
+    threshold = _BAND_THRESHOLDS_BY_KEY.get(value.lower().strip())
+    if threshold is None:
+        raise typer.BadParameter(
+            f"unknown band: {value!r}. "
+            f"Use one of: handle | history | look (or full names with hyphens)."
+        )
+    return threshold
+
+
+def _print_brief(card: rc.RiskCard) -> None:
+    """Print a one-line summary suitable for grep/awk and 3am triage."""
+    top = card.signals[0].headline if card.signals else "no flags"
+    console.print(
+        f"{card.path}: [bold]{card.score.band.value}[/bold] "
+        f"({card.score.value}/100) — {top}"
+    )
+
+
+@app.command()
+def why(
+    path: str = typer.Argument(..., help="File path to inspect."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a card."
+    ),
+    brief: bool = typer.Option(
+        False, "--brief", "-b", help="One-line summary (for triage and scripts)."
+    ),
+    max_commits: int | None = typer.Option(
+        None, "--max-commits", help="Cap the number of commits scanned (debug)."
+    ),
+) -> None:
+    """Print the Risk Card for ``path``."""
+    repo_root, rel = _resolve_repo_and_path(path)
+    if not _path_is_known_to_git(repo_root, rel):
+        err.print(
+            f"[yellow]warning:[/yellow] [bold]{rel}[/bold] is not tracked by git "
+            f"and has no history in this repo. Nothing to learn from."
+        )
+        raise typer.Exit(1)
+    card = rc.build(repo_root, rel, max_commits=max_commits)
+    if json_out:
+        console.print_json(json.dumps(card.to_dict()))
+        return
+    if brief:
+        _print_brief(card)
+        return
+    console.print(rc.render_text(card))
+
+
+def _resolve_base_ref(repo_root: Path, requested: str | None) -> str:
+    """Pick a base ref for ``whycode diff``.
+
+    Order: explicit --base, origin/main, origin/master, main, master, HEAD~1.
+    """
+    if requested:
+        return requested
+    candidates = ("origin/main", "origin/master", "main", "master", "HEAD~1")
+    for ref in candidates:
+        try:
+            gf._run_git(repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+            return ref
+        except gf.GitError:
+            continue
+    raise gf.GitError(
+        "could not pick a base ref (tried origin/main, main, HEAD~1). "
+        "Use --base <ref> to specify one."
+    )
+
+
+@app.command()
+def diff(
+    base: str | None = typer.Option(
+        None, "--base", help="Base ref (default: origin/main → main → HEAD~1)."
+    ),
+    staged: bool = typer.Option(
+        False,
+        "--staged",
+        help="Score files staged for commit instead (for pre-commit hooks).",
+    ),
+    repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
+    top: int = typer.Option(20, "--top", help="Show at most this many files."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table."
+    ),
+    fail_on: str | None = typer.Option(
+        None,
+        "--fail-on",
+        help=(
+            "Exit non-zero if any file reaches this band: "
+            "handle (≥75) / history (≥50) / look (≥25). "
+            "Use in CI: `whycode diff --fail-on history`."
+        ),
+    ),
+) -> None:
+    """Risk-rank files that changed against a base ref. The 'pre-PR' command."""
+    try:
+        repo_root = gf.discover_repo_root(repo.resolve())
+        if staged:
+            raw = gf._run_git(
+                repo_root, "diff", "--cached", "--name-only", "--diff-filter=ACMR"
+            )
+            actual_base = "(staged changes)"
+        else:
+            actual_base = _resolve_base_ref(repo_root, base)
+            raw = gf._run_git(repo_root, "diff", "--name-only", f"{actual_base}...HEAD")
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    threshold: int | None = None
+    if fail_on is not None:
+        threshold = _parse_fail_on(fail_on)
+
+    files = [line for line in raw.splitlines() if line.strip()]
+    if not files:
+        if json_out:
+            console.print_json(json.dumps({"base": actual_base, "files": []}))
+        else:
+            scope = "staged" if staged else f"vs {actual_base}"
+            console.print(f"[green]no changes {scope}[/green]")
+        return
+
+    cards: list[rc.RiskCard] = []
+    for f in files:
+        try:
+            cards.append(rc.build(repo_root, f))
+        except gf.GitError:
+            continue
+    cards.sort(key=lambda c: -c.score.value)
+    cards = cards[:top]
+
+    if json_out:
+        console.print_json(
+            json.dumps(
+                {
+                    "base": actual_base,
+                    "files": [c.to_dict() for c in cards],
+                }
+            )
+        )
+        if threshold is not None and any(c.score.value >= threshold for c in cards):
+            raise typer.Exit(1)
+        return
+
+    # NEWBORN-only files have no real risk signal — they're "we don't know yet".
+    # Push them into the quiet bucket so the table only shows actionable risk.
+    def _is_actionable(c: rc.RiskCard) -> bool:
+        return any(s.kind is not sig.SignalKind.NEWBORN for s in c.signals)
+
+    flagged = [c for c in cards if _is_actionable(c)]
+    quiet_n = len(cards) - len(flagged)
+    scope = "staged for commit" if staged else f"changed vs {actual_base}"
+    console.print(f"[bold]{len(files)} file(s) {scope}[/bold]")
+    if not flagged:
+        console.print("[green]nothing flagged[/green] — but read the diff anyway.")
+        return
+    table = Table(title="Risk-ranked changes")
+    table.add_column("score", justify="right", style="bold")
+    table.add_column("band")
+    table.add_column("path")
+    table.add_column("top signal")
+    for c in flagged:
+        table.add_row(
+            str(c.score.value),
+            c.score.band.value,
+            c.path,
+            c.signals[0].headline,
+        )
+    console.print(table)
+    if quiet_n:
+        console.print(f"[dim]+ {quiet_n} file(s) changed with no flags[/dim]")
+    console.print(
+        "[dim]→ whycode why <path>   for the full Risk Card on any of the above[/dim]"
+    )
+
+    if threshold is not None:
+        breaches = [c for c in cards if c.score.value >= threshold]
+        if breaches:
+            err.print(
+                f"[red]fail-on:[/red] {len(breaches)} file(s) at or above "
+                f"[bold]{fail_on}[/bold] (≥{threshold})."
+            )
+            raise typer.Exit(1)
+
+
+@app.command()
+def scan(
+    top: int = typer.Option(10, "--top", help="How many files to list."),
+    sample: int = typer.Option(
+        500,
+        "--sample",
+        help="Cap on tracked files to evaluate (for very large repos).",
+    ),
+    repo: Path = typer.Option(
+        Path("."), "--repo", help="Path inside the repo (defaults to cwd)."
+    ),
+) -> None:
+    """List the top-N files with the highest risk scores in the repo."""
+    try:
+        repo_root = gf.discover_repo_root(repo.resolve())
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    raw = gf._run_git(repo_root, "ls-files")
+    paths = [line for line in raw.splitlines() if line.strip()][:sample]
+    if not paths:
+        console.print("[yellow]no tracked files found[/yellow]")
+        raise typer.Exit(0)
+
+    cards: list[rc.RiskCard] = []
+    with console.status(f"Scanning {len(paths)} files…", spinner="dots"):
+        for p in paths:
+            try:
+                card = rc.build(repo_root, p)
+            except gf.GitError:
+                continue
+            # Skip files whose only signal is NEWBORN — that's "not enough
+            # history yet", not real risk. `scan` is for surfacing risk;
+            # informational signals don't belong here.
+            useful = [s for s in card.signals if s.kind is not sig.SignalKind.NEWBORN]
+            if useful:
+                cards.append(card)
+
+    cards.sort(key=lambda c: -c.score.value)
+    top_cards = cards[:top]
+    if not top_cards:
+        # Be honest about what "no flagged files" actually means. A user who
+        # just installed WhyCode and sees a one-line "nothing fired" walks away
+        # thinking the tool is broken. Spell out the two real possibilities.
+        console.print(
+            f"[green]No flagged files among {len(paths)} scanned.[/green]\n\n"
+            "WhyCode reads commit messages, reverts and authorship to find risk.\n"
+            "A clean output means [bold]one of:[/bold]\n"
+            "  • Your repo's history is genuinely quiet, or\n"
+            "  • Commits are too terse for WhyCode to learn from "
+            "(e.g. only \"fix\", \"update\", \"wip\")."
+        )
+        return
+
+    table = Table(title=f"Top {len(top_cards)} flagged files")
+    table.add_column("score", justify="right", style="bold")
+    table.add_column("band")
+    table.add_column("path")
+    table.add_column("top signal")
+    for c in top_cards:
+        top_signal = c.signals[0].headline if c.signals else "—"
+        table.add_row(str(c.score.value), c.score.band.value, c.path, top_signal)
+    console.print(table)
+
+
+@app.command()
+def show(
+    sha: str = typer.Argument(..., help="Commit SHA (full or short) to inspect."),
+    repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of a card."),
+) -> None:
+    """Risk-flavored summary for a single commit: classification + per-file risk."""
+    try:
+        repo_root = gf.discover_repo_root(repo.resolve())
+        full_sha = gf._run_git(repo_root, "rev-parse", "--verify", f"{sha}^{{commit}}").strip()
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    raw = gf._run_git(
+        repo_root, "log", "-1", "--no-merges", f"--pretty=format:{gf._log_format()}", full_sha
+    )
+    commits = gf._parse_log_records(raw)
+    if not commits:
+        err.print(f"[red]error:[/red] could not read commit {full_sha}")
+        raise typer.Exit(2)
+    commit = commits[0]
+
+    is_incident = bool(
+        gf._INCIDENT_RE.search(commit.subject + "\n" + commit.body)
+        or gf._BREAKING_CC_RE.search(commit.subject)
+    )
+    invariants = gf.extract_invariant_quotes([commit])
+    file_changes = gf.files_changed_in(repo_root, full_sha)
+
+    cards: list[rc.RiskCard] = []
+    for change in file_changes:
+        try:
+            cards.append(rc.build(repo_root, change.path))
+        except gf.GitError:
+            continue
+    cards.sort(key=lambda c: -c.score.value)
+
+    if json_out:
+        console.print_json(
+            json.dumps(
+                {
+                    "sha": full_sha[:12],
+                    "subject": commit.subject,
+                    "author": commit.author_name,
+                    "authored_at": commit.authored_at.isoformat(),
+                    "incident_flavored": is_incident,
+                    "invariants_stated": len(invariants),
+                    "files_changed": len(file_changes),
+                    "files": [c.to_dict() for c in cards],
+                }
+            )
+        )
+        return
+
+    console.print(
+        f"[bold]{full_sha[:12]}[/bold]  {commit.author_name}  "
+        f"{commit.authored_at.date()}"
+    )
+    console.print(f"  {commit.subject}")
+    console.print()
+    classification = []
+    if is_incident:
+        classification.append("[bold red]incident-flavored[/bold red]")
+    if invariants:
+        classification.append(f"[yellow]states {len(invariants)} invariant(s)[/yellow]")
+    if not classification:
+        classification.append("[dim]no special classification[/dim]")
+    console.print("  " + "   ".join(classification))
+    console.print(f"  [dim]{len(file_changes)} files changed[/dim]")
+
+    if not cards:
+        return
+    table = Table(title="Files in this commit, by current risk")
+    table.add_column("score", justify="right", style="bold")
+    table.add_column("band")
+    table.add_column("path")
+    table.add_column("top signal")
+    for c in cards[:20]:
+        top = c.signals[0].headline if c.signals else "—"
+        table.add_row(str(c.score.value), c.score.band.value, c.path, top)
+    console.print(table)
+
+
+@app.command()
+def mcp(
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Log every tool call to stderr so you can verify the AI uses it.",
+    ),
+) -> None:
+    """Start the MCP stdio server."""
+    try:
+        from whycode.mcp_server import serve
+    except ImportError as exc:
+        err.print(
+            "[red]error:[/red] MCP support is not installed. "
+            "Run [bold]pip install 'whycode[mcp]'[/bold]."
+        )
+        raise typer.Exit(2) from exc
+    serve(verbose=verbose)
+
+
+@app.command()
+def version() -> None:
+    """Print the installed WhyCode version."""
+    console.print(__version__)
+
+
+def main() -> None:
+    """Entry-point used by ``python -m whycode`` and tests."""
+    try:
+        app()
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
