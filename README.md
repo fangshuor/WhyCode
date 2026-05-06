@@ -59,8 +59,9 @@ Requires Python 3.11+.
 ```bash
 cd /path/to/your/repo
 
+whycode tour                        # the one command to run first
 whycode init                        # one-command setup: CI workflow + pre-commit gate
-whycode highlights                  # first-run treasure map: top decisions + incidents
+whycode highlights                  # repo-wide treasure map: top decisions + incidents
 whycode why src/some/file.py        # the Risk Card for one file
 whycode why src/some/file.py -b     # one-line summary (for triage / scripts)
 whycode why src/some/file.py --at <sha>     # risk as of a past commit
