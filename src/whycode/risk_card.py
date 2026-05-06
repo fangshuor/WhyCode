@@ -24,6 +24,8 @@ from whycode.scorer import Band, Score, score
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from whycode.decisions import Decision
+
 
 @dataclass(frozen=True)
 class RiskCard:
@@ -37,6 +39,15 @@ class RiskCard:
     most_recent_at: str | None
     as_of_sha: str | None = None
     """When set, the card was computed *as of* this commit (historical view)."""
+
+    decisions: tuple[Decision, ...] = ()
+    """L3 — LLM-extracted structured decisions. Empty unless ``--llm`` was on."""
+
+    def with_decisions(self, decisions: tuple[Decision, ...]) -> RiskCard:
+        """Return a copy with the L3 ``decisions`` field populated."""
+        from dataclasses import replace
+
+        return replace(self, decisions=decisions)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +76,7 @@ class RiskCard:
                 }
                 for s in self.signals
             ],
+            "decisions": [d.to_dict() for d in self.decisions],
         }
 
 
@@ -190,11 +202,40 @@ def _next_step_hint(signals: tuple[sig.Signal, ...]) -> Text | None:
     return None
 
 
+def _decisions_block(decisions: tuple[Decision, ...]) -> Padding:
+    """Render the L3 decisions section inside a labelled panel."""
+    body = Text()
+    for i, d in enumerate(decisions):
+        if i:
+            body.append("\n\n")
+        # Header: type + confidence badge.
+        body.append(f"{d.decision_type.replace('_', ' ').upper()}", style="bold cyan")
+        body.append(f"   confidence {int(d.confidence * 100)}%\n", style="dim")
+        body.append(d.what_changed + "\n", style="bold")
+        body.append("Why: ", style="dim")
+        body.append(d.why + "\n", style="italic")
+        if d.do_not:
+            body.append("Don't: ", style="bold red")
+            body.append(d.do_not + "\n", style="")
+        if d.evidence:
+            short = ", ".join(s[:7] for s in d.evidence)
+            body.append(f"evidence: {short}", style="dim")
+    panel = Panel(
+        body,
+        title=Text(" DECISIONS (L3) ", style="bold white on magenta"),
+        title_align="left",
+        border_style="grey50",
+    )
+    return Padding(panel, (1, 1, 0, 1))
+
+
 def render_text(card: RiskCard) -> Group:
     pieces: list[Any] = [
         _header(card),
         Padding(_signals_table(card.signals), (0, 1, 0, 1)),
     ]
+    if card.decisions:
+        pieces.append(_decisions_block(card.decisions))
     hint = _next_step_hint(card.signals)
     if hint is not None:
         pieces.append(Padding(hint, (0, 1, 1, 2)))

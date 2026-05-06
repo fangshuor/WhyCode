@@ -4,6 +4,95 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-06
+
+### Added — L3 LLM-enriched decision extraction (the missing 40%)
+
+The original three-layer design always specified an opt-in L3 layer for
+LLM-enriched decision summarisation. L1 + L2 give keyword-level
+fragments ("do not switch to async"); L3 turns them into structured
+decisions with the *why* drawn from the surrounding commit body.
+
+```
+$ whycode why src/payment/refund.py --llm
+
+╭─ HANDLE WITH CARE  score 78/100 ─────────────╮
+│ src/payment/refund.py   (24 commits)         │
+│ Latest: hotfix: idempotency token regression │
+╰──────────────────────────────────────────────╯
+   HIGH    3 reverts touched this file (most recent: 4 months ago)
+   MED     2 invariants stated by past authors
+
+╭─ DECISIONS (L3) ───────────────────────────────────────────────╮
+│ COMPAT WORKAROUND   confidence 88%                              │
+│ Kept synchronous HTTP for the refund flow.                      │
+│ Why: v1 clients need synchronous responses to honour the SLA we │
+│      signed with Acme Corp; an async refactor in 2024 broke    │
+│      that and was rolled back the same week.                   │
+│ Don't: switch this to async without revisiting the SLA.        │
+│ evidence: a3f4b2c, 7e22a04                                     │
+╰────────────────────────────────────────────────────────────────╯
+```
+
+Privacy contract honoured:
+
+- **Off by default.** `--llm` is required to opt in. L1 and L2 still run
+  with zero network and zero API key, exactly as before.
+- **No vendor names in source.** Configuration is entirely via
+  environment variables — `WHYCODE_LLM_API_KEY` and `WHYCODE_LLM_MODEL`
+  must both be set explicitly. The source tree itself does not embed
+  any provider's product or model identifier.
+- **Lazy import.** The provider SDK is only imported when L3 is actually
+  invoked. Users who never use `--llm` pay no import cost and need no
+  AI dependency installed.
+- **`--llm-dry-run`** prints exactly how many commits and how many
+  characters *would* be sent to the LLM, without making the call.
+  Use it before paying any cost or letting any data leave the machine.
+- **Filtered input only.** L3 receives at most ten high-signal commits
+  per `--llm` invocation: the L2 incident-flagged commits plus any
+  commit body of substantial length. Trivial commits (`fix: typo`)
+  are never sent.
+
+Install the optional extras:
+
+```bash
+pip install 'whycode-cli[llm]'
+export WHYCODE_LLM_API_KEY=…
+export WHYCODE_LLM_MODEL=…
+whycode why src/some-file.py --llm
+```
+
+The decision schema:
+
+```json
+{
+  "decision_type": "incident_fix" | "compat_workaround" | "perf_rewrite"
+                   | "rollback" | "constraint" | "other",
+  "what_changed":  "one-sentence summary",
+  "why":           "one paragraph from the body, quoted where possible",
+  "do_not":        "actionable constraint or null",
+  "evidence":      ["sha1", "sha2", ...],
+  "confidence":    0.0 - 1.0
+}
+```
+
+Confidence below `0.5` is filtered out by default; the LLM is instructed
+to skip rather than invent. A malformed model response degrades to
+"no decisions" rather than crashing the card.
+
+### Internal
+- `src/whycode/llm.py` — provider-neutral client wrapper, lazy-imported.
+- `src/whycode/decisions.py` — `Decision` dataclass + extractor + parser.
+- `tests/test_decisions.py` — 14 tests against mocked LLM responses;
+  no real network in CI.
+- `RiskCard` gained an optional `decisions` field (empty by default);
+  `RiskCard.with_decisions()` returns an enriched copy.
+- The MCP server inherits the `decisions` field through `card.to_dict()`
+  for free — but L3 enrichment is not auto-triggered for MCP calls;
+  it stays opt-in.
+
+132 tests passing (118 prior + 14 L3). ruff + mypy strict clean.
+
 ## [0.2.6] — 2026-05-06
 
 ### Added

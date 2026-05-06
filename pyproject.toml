@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whycode-cli"
-version = "0.2.6"
+version = "0.3.0"
 description = "Tells you what to be afraid of before you touch a file."
 readme = "README.md"
 license = "MIT"
@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
+llm = ["anthropic>=0.40"]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
