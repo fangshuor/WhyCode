@@ -4,6 +4,50 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-06
+
+### Added — MCP `prompts/` capability (three saved-search shortcuts)
+
+The MCP server already exposes WhyCode's data through *tools* the host LLM
+can call on demand. But each user has had to write their own prompt to
+get the LLM to fetch and use that data sensibly ("call `get_risk_profile`,
+then walk me through any HIGH signals before editing"). That's friction.
+
+This release adds the MCP `prompts/` capability: three reusable templates
+the host editor surfaces as one-click actions. The server fills in the
+WhyCode data; the host LLM does the reasoning, exactly as it does for
+tools today.
+
+- **`before_edit_checklist(path)`** — fetches the Risk Card for the file
+  and asks the assistant to walk the user through every HIGH-severity
+  signal before suggesting any edit.
+- **`summarise_for_postmortem(sha)`** — fetches a commit's metadata and
+  WhyCode classification and asks the assistant to draft a concise
+  incident summary suitable for a postmortem document, citing specific
+  evidence SHAs.
+- **`risk_briefing_for_pr(base)`** — runs the diff risk briefing for
+  files changed against a base ref and asks the assistant to summarise
+  it for a PR reviewer in 3-5 bullets, putting HANDLE WITH CARE files
+  first.
+
+### Privacy
+
+The prompts surface adds **zero outbound network calls**. Each prompt
+composes a static template from local git data (the same calls already
+backing the tool surface and the CLI) and hands it to the client. The
+host LLM is the one making any LLM call, on the user's terms — exactly
+as it has been for tools. The server stays read-only.
+
+### Internal
+
+- `src/whycode/mcp_server.py` gained `_list_prompts` / `_get_prompt`
+  handlers and three rendering helpers (one per prompt). The existing
+  tool surface (`get_risk_profile`, `get_file_decisions`) is unchanged.
+- `tests/test_mcp_prompts.py` — 12 tests covering listing, retrieval,
+  argument validation, vendor-neutral prompt text, and a tripwire that
+  fails the build if any prompt opens an outbound IPv4/IPv6 socket.
+- 130 tests passing (118 prior + 12 prompts). ruff + mypy strict clean.
+
 ## [0.3.0] — 2026-05-06
 
 ### Added — L3 LLM-enriched decision extraction (the missing 40%)
