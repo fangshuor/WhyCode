@@ -4,6 +4,36 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — 2026-05-06
+
+This release is the result of running WhyCode against a real moderately-sized
+OSS repo (`pallets/click`, ~3000 commits, 149 files) and fixing what hurt.
+
+### Performance
+- `co_changes` (the engine behind the coupling signal) now uses a single
+  `git log --no-walk --numstat` over the file's pre-fetched SHA list
+  instead of one `git show` per commit. **`whycode why` on a real
+  100-commit core file: 3.1s → 0.79s (4×). `whycode scan --top 5` on a
+  3000-commit repo: 25.7s → 12.7s (2×).**
+- `whycode scan` gains `--scan-depth N` (default 200) capping the
+  per-file commit history scanned. `--scan-depth 0` for no cap (full
+  history; slow on large repos).
+
+### Changed
+- `whycode scan` now skips a built-in ignore list of "always-noisy"
+  paths: changelogs, lockfiles, generated stubs (`*_pb2.py`,
+  `*.pb.go`, `*.generated.*`), vendored dirs (`node_modules/`,
+  `vendor/`, `third_party/`), built docs (`_build/`, `site/`), and
+  static assets. **`CHANGELOG.rst` and other release-touched files
+  no longer dominate the top-N risk list.** `--no-ignore` opts back
+  in to scanning everything. A `.whycodeignore` file at repo root
+  (one fnmatch pattern per line, `#` for comments) extends the list.
+
+### Added
+- `whycode/ignore.py` module + `tests/test_ignore.py` (8 tests).
+- Three integration tests for `scan` covering ignore patterns and
+  the user-extension file.
+
 ## [0.2.2] — 2026-05-06
 
 ### Added

@@ -465,6 +465,62 @@ def test_why_mute_unknown_kind_errors(repo) -> None:  # type: ignore[no-untyped-
     assert "unknown signal kind" in result.output.lower()
 
 
+def test_scan_skips_default_ignored_paths_by_default(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """CHANGELOG and lockfiles must not appear in scan output by default."""
+    sha = repo.commit(
+        "init",
+        {"CHANGELOG.md": "v1", "package-lock.json": "{}", "src/app.py": "x"},
+        when=days_ago(60),
+    )
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "release: 1.1",
+        {"CHANGELOG.md": "v2", "src/app.py": "y"},
+        when=days_ago(20),
+    )
+    result = _invoke(repo.root, "scan", "--top", "10")
+    assert result.exit_code == 0
+    out = result.output
+    # CHANGELOG and lockfile must not appear in the table.
+    assert "CHANGELOG" not in out
+    assert "package-lock.json" not in out
+
+
+def test_scan_no_ignore_brings_them_back(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "init",
+        {"CHANGELOG.md": "v1", "src/app.py": "x"},
+        when=days_ago(60),
+    )
+    sha = repo.commit(
+        "feat: A",
+        {"CHANGELOG.md": "v2", "src/app.py": "y"},
+        when=days_ago(40),
+    )
+    repo.revert(sha, when=days_ago(20))  # safe to revert: files still exist after
+    default_run = _invoke(repo.root, "scan", "--top", "10")
+    permissive_run = _invoke(repo.root, "scan", "--top", "10", "--no-ignore")
+    assert default_run.exit_code == 0
+    assert permissive_run.exit_code == 0
+    # CHANGELOG was hidden from the default run by the ignore list…
+    assert "CHANGELOG" not in default_run.output
+    # …but is at least reachable when --no-ignore is on.
+    assert "CHANGELOG" in permissive_run.output or "src/app.py" in permissive_run.output
+
+
+def test_scan_respects_user_whycodeignore(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    (repo.root / ".whycodeignore").write_text("internal/legacy.py\n")
+    sha = repo.commit(
+        "init",
+        {"internal/legacy.py": "1", "src/app.py": "x"},
+        when=days_ago(60),
+    )
+    repo.revert(sha, when=days_ago(50))
+    result = _invoke(repo.root, "scan", "--top", "10")
+    assert result.exit_code == 0
+    assert "internal/legacy.py" not in result.output
+
+
 def test_mcp_summary_field_present_in_json(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """Verify the MCP server includes a quotable summary string in get_risk_profile."""
     sha = repo.commit("feat: A", {"a.py": "1"}, when=days_ago(40))

@@ -29,6 +29,7 @@ from rich.table import Table
 
 from whycode import __version__
 from whycode import git_facts as gf
+from whycode import ignore as ign
 from whycode import risk_card as rc
 from whycode import signals as sig
 from whycode import suppressions as supp
@@ -563,6 +564,19 @@ def scan(
         "--sample",
         help="Cap on tracked files to evaluate (for very large repos).",
     ),
+    scan_depth: int = typer.Option(
+        200,
+        "--scan-depth",
+        help=(
+            "Cap commits-per-file scanned (controls scan speed). "
+            "Use 0 for no cap (slow on large repos)."
+        ),
+    ),
+    no_ignore: bool = typer.Option(
+        False,
+        "--no-ignore",
+        help="Bypass the default-ignore list and scan everything (CHANGELOGs, lockfiles, vendored).",
+    ),
     repo: Path = typer.Option(
         Path("."), "--repo", help="Path inside the repo (defaults to cwd)."
     ),
@@ -575,16 +589,19 @@ def scan(
         raise typer.Exit(2) from exc
 
     raw = gf._run_git(repo_root, "ls-files")
-    paths = [line for line in raw.splitlines() if line.strip()][:sample]
+    all_paths = [line for line in raw.splitlines() if line.strip()]
+    patterns = () if no_ignore else ign.effective_patterns(repo_root)
+    paths = [p for p in all_paths if not ign.is_ignored(p, patterns)][:sample]
     if not paths:
         console.print("[yellow]no tracked files found[/yellow]")
         raise typer.Exit(0)
 
+    depth_cap = scan_depth if scan_depth > 0 else None
     cards: list[rc.RiskCard] = []
     with console.status(f"Scanning {len(paths)} files…", spinner="dots"):
         for p in paths:
             try:
-                card = rc.build(repo_root, p)
+                card = rc.build(repo_root, p, max_commits=depth_cap)
             except gf.GitError:
                 continue
             # Skip files whose only signal is NEWBORN — that's "not enough
