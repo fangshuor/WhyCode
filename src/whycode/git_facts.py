@@ -9,6 +9,9 @@ Design notes
   because they essentially never appear in commit messages or paths.
 - We use ``--follow`` so file rename history is traced through.
 - We never invoke a subcommand that mutates the repo.
+- An optional :class:`whycode.cache.CacheStore` can be threaded through the
+  read helpers; when present, repeat invocations skip the ``git log`` parse
+  entirely as long as ``HEAD`` has not advanced.
 """
 
 from __future__ import annotations
@@ -20,6 +23,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from whycode.cache import CacheStore
 
 UNIT_SEP = "\x1f"
 RECORD_SEP = "\x1e"
@@ -219,11 +226,20 @@ def commits_for_path(
     *,
     max_count: int | None = None,
     ref: str | None = None,
+    cache: CacheStore | None = None,
 ) -> list[Commit]:
     """Return commits that touched ``path`` (rename-aware), newest first.
 
     When ``ref`` is given, only commits reachable from that revision are
     returned — i.e., the file's history *as of* that point in time.
+
+    A :class:`whycode.cache.CacheStore` may be passed to serve repeat queries
+    from SQLite. The cache path is bypassed when ``ref`` is set (history
+    queries operate on a different sha-set), and on first call for an
+    unseen path: rename-following is a git-native feature we cannot mirror
+    deterministically in SQL. After git provides the rename-resolved list
+    once, every subsequent commit is upserted so future calls hit the
+    cache directly.
     """
     args = [
         "log",
@@ -237,16 +253,112 @@ def commits_for_path(
         args.append(ref)
     args.extend(["--", path])
     raw = _run_git(repo_root, *args)
-    return _parse_log_records(raw)
+    commits = _parse_log_records(raw)
+    if cache is not None and ref is None and commits:
+        _store_commits(cache, commits)
+    return commits
 
 
-def all_commits(repo_root: Path, *, max_count: int | None = None) -> list[Commit]:
-    """Return all commits in repo, newest first. Used for revert / ghost-author scans."""
+def all_commits(
+    repo_root: Path,
+    *,
+    max_count: int | None = None,
+    cache: CacheStore | None = None,
+) -> list[Commit]:
+    """Return all commits in repo, newest first. Used for revert / ghost-author scans.
+
+    With a cache: a fresh ``git rev-parse HEAD`` is compared against the
+    last-seen head. If unchanged, every row is read from SQLite.
+    Otherwise we ask git only for ``<last_head>..HEAD`` and append the
+    new rows; if ``last_head`` is unreachable we rebuild from scratch.
+    """
+    if cache is not None and max_count is None:
+        return _all_commits_via_cache(repo_root, cache)
     args = ["log", "--no-merges", f"--pretty=format:{_log_format()}"]
     if max_count is not None:
         args.append(f"--max-count={max_count}")
     raw = _run_git(repo_root, *args)
-    return _parse_log_records(raw)
+    commits = _parse_log_records(raw)
+    if cache is not None and commits:
+        _store_commits(cache, commits)
+    return commits
+
+
+def _store_commits(cache: CacheStore, commits: Sequence[Commit]) -> None:
+    """Persist a batch of commits to the cache."""
+    rows = [
+        (
+            c.sha,
+            c.author_name,
+            c.author_email,
+            c.authored_at.isoformat(),
+            c.subject,
+            c.body,
+        )
+        for c in commits
+    ]
+    cache.upsert_commits(rows)
+
+
+def _commit_from_row(row: object) -> Commit:
+    """Rehydrate a Commit from a sqlite3.Row."""
+    sha = str(row["sha"])  # type: ignore[index]
+    return Commit(
+        sha=sha,
+        author_name=str(row["author_name"]),  # type: ignore[index]
+        author_email=str(row["author_email"]),  # type: ignore[index]
+        authored_at=_parse_iso(str(row["authored_at"])),  # type: ignore[index]
+        subject=str(row["subject"]),  # type: ignore[index]
+        body=str(row["body"]),  # type: ignore[index]
+    )
+
+
+def _all_commits_via_cache(repo_root: Path, cache: CacheStore) -> list[Commit]:
+    """Cache-backed implementation of :func:`all_commits` (no max_count).
+
+    Strategy:
+      1. Ask git for the current HEAD sha.
+      2. If it matches the cache's recorded head, every row is already
+         present — read them all back and return.
+      3. Otherwise try an incremental ``git log <last_head>..HEAD`` to
+         pull only new commits. If ``last_head`` is unreachable
+         (force-push, branch swap), fall back to a full rebuild.
+    """
+    head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+    last_head = cache.head_sha
+    if last_head == head_sha:
+        return [_commit_from_row(r) for r in cache.fetch_all_commit_rows()]
+
+    if last_head:
+        try:
+            raw_inc = _run_git(
+                repo_root,
+                "log",
+                "--no-merges",
+                f"--pretty=format:{_log_format()}",
+                f"{last_head}..HEAD",
+            )
+        except GitError:
+            # last_head not reachable — fall through to a full rebuild.
+            pass
+        else:
+            new_commits = _parse_log_records(raw_inc)
+            if new_commits:
+                _store_commits(cache, new_commits)
+            cache.set_head_sha(head_sha)
+            return [_commit_from_row(r) for r in cache.fetch_all_commit_rows()]
+
+    # Full rebuild: clear existing rows so an unreachable branch's commits
+    # don't linger after a force-push or branch swap.
+    cache.clear()
+    raw = _run_git(
+        repo_root, "log", "--no-merges", f"--pretty=format:{_log_format()}"
+    )
+    commits = _parse_log_records(raw)
+    if commits:
+        _store_commits(cache, commits)
+    cache.set_head_sha(head_sha)
+    return commits
 
 
 def read_commit(repo_root: Path, ref: str) -> Commit | None:
@@ -268,8 +380,27 @@ def read_commit(repo_root: Path, ref: str) -> Commit | None:
     return parsed[0] if parsed else None
 
 
-def files_changed_in(repo_root: Path, sha: str) -> list[FileChange]:
-    """Return the list of files (with diffstat) changed in ``sha``."""
+def files_changed_in(
+    repo_root: Path,
+    sha: str,
+    *,
+    cache: CacheStore | None = None,
+) -> list[FileChange]:
+    """Return the list of files (with diffstat) changed in ``sha``.
+
+    With a cache supplied, the diffstat for any sha already populated is
+    served from SQLite and the ``git show`` invocation is skipped.
+    """
+    if cache is not None and cache.has_commit_files(sha):
+        return [
+            FileChange(
+                sha=str(row["sha"]),
+                path=str(row["path"]),
+                insertions=int(row["insertions"]),
+                deletions=int(row["deletions"]),
+            )
+            for row in cache.fetch_files_for_commit(sha)
+        ]
     raw = _run_git(
         repo_root, "show", "--no-renames", "--numstat", "--format=", sha
     )
@@ -289,6 +420,10 @@ def files_changed_in(repo_root: Path, sha: str) -> list[FileChange]:
         except ValueError:
             continue
         out.append(FileChange(sha=sha, path=path, insertions=insertions, deletions=deletions))
+    if cache is not None and out:
+        cache.upsert_commit_files(
+            [(c.sha, c.path, c.insertions, c.deletions) for c in out]
+        )
     return out
 
 
@@ -298,6 +433,7 @@ def co_changes(
     target_path: str,
     *,
     max_count: int | None = None,
+    cache: CacheStore | None = None,
 ) -> Counter[str]:
     """Count, across the file's history, how often other files changed alongside ``target_path``.
 
@@ -310,11 +446,31 @@ def co_changes(
     because git limits the numstat output to the followed path itself in
     that mode. So we depend on the caller having already resolved the
     relevant SHAs (in ``commits``), then pass them via ``--no-walk``.
+
+    With a cache supplied, the per-sha diffstat rows are persisted on the
+    way through. The next call covering any subset of those shas is
+    served entirely from SQLite without spawning a git process.
     """
     del max_count  # depth was already applied when ``commits`` was built
     if not commits:
         return Counter()
     shas = [c.sha for c in commits]
+    if cache is not None:
+        missing = cache.shas_missing_files(shas)
+        if not missing:
+            return cache.fetch_co_changes(shas, target_path)
+        # Only fetch the missing ones from git. That's the whole point of
+        # the cache: incremental warm-up across runs and across files.
+        _populate_diffstat_cache(repo_root, cache, missing)
+        return cache.fetch_co_changes(shas, target_path)
+
+    return _co_changes_via_git(repo_root, shas, target_path)
+
+
+def _co_changes_via_git(
+    repo_root: Path, shas: Sequence[str], target_path: str
+) -> Counter[str]:
+    """The original cache-free implementation of :func:`co_changes`."""
     args = ["log", "--no-walk", "--numstat", "--format=%x1eCOMMIT"]
     args.extend(shas)
     raw = _run_git(repo_root, *args)
@@ -331,6 +487,51 @@ def co_changes(
             continue
         counter[path] += 1
     return counter
+
+
+def _populate_diffstat_cache(
+    repo_root: Path, cache: CacheStore, shas: Sequence[str]
+) -> None:
+    """Run ``git log --no-walk --numstat`` for ``shas`` and upsert rows.
+
+    The single batched git call replaces what would otherwise be one
+    ``git show`` per commit when warming the cache for a new file.
+    Output is split on the record separator emitted in the ``--pretty``
+    format rather than on lines, because Python's ``splitlines`` would
+    otherwise consume that separator silently.
+    """
+    if not shas:
+        return
+    args = ["log", "--no-walk", "--numstat", f"--pretty=format:{RECORD_SEP}%H"]
+    args.extend(shas)
+    raw = _run_git(repo_root, *args)
+    rows: list[tuple[str, str, int, int]] = []
+    for record in raw.split(RECORD_SEP):
+        record = record.strip("\n")
+        if not record:
+            continue
+        lines = record.splitlines()
+        if not lines:
+            continue
+        sha = lines[0].strip()
+        if not sha:
+            continue
+        for diffstat in lines[1:]:
+            stripped = diffstat.strip()
+            if not stripped:
+                continue
+            parts = stripped.split("\t")
+            if len(parts) != 3:
+                continue
+            ins_s, del_s, path = parts
+            try:
+                insertions = int(ins_s) if ins_s != "-" else 0
+                deletions = int(del_s) if del_s != "-" else 0
+            except ValueError:
+                continue
+            rows.append((sha, path, insertions, deletions))
+    if rows:
+        cache.upsert_commit_files(rows)
 
 
 _REVERT_PREFIX = 'this reverts commit '
@@ -503,18 +704,28 @@ def gather(
     *,
     max_commits: int | None = None,
     ref: str | None = None,
+    cache: CacheStore | None = None,
 ) -> RepoFacts:
     """Top-level convenience: build a RepoFacts snapshot for ``path``.
 
     Pass ``ref`` to compute facts as of a past commit (e.g., for postmortem
     "what did this file's risk look like at the time of the outage" queries).
+
+    With a ``cache`` supplied, both the per-path commit history and the
+    co-change diffstat reads are routed through SQLite. Historical (``ref``)
+    queries skip the cache because the sha-set differs from current HEAD.
     """
-    commits = commits_for_path(repo_root, path, max_count=max_commits, ref=ref)
+    use_cache = cache if ref is None else None
+    commits = commits_for_path(
+        repo_root, path, max_count=max_commits, ref=ref, cache=use_cache
+    )
     return RepoFacts(
         repo_root=repo_root,
         path=path,
         commits=commits,
-        co_changed_files=co_changes(repo_root, commits, path, max_count=max_commits),
+        co_changed_files=co_changes(
+            repo_root, commits, path, max_count=max_commits, cache=use_cache
+        ),
         revert_pairs=find_revert_pairs(commits),
         incident_commits=find_incidents(commits),
         invariant_quotes=extract_invariant_quotes(commits),
