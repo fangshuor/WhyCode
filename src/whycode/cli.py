@@ -4,7 +4,9 @@ Commands
 --------
 - ``whycode why <path>``        — print the Risk Card for a single file.
 - ``whycode diff [--base REF]`` — risk-rank files changed against a base ref.
+- ``whycode show <sha>``        — risk-flavored summary for one commit.
 - ``whycode scan [--top N]``    — print the top-N riskiest files in the repo.
+- ``whycode init``              — install CI workflow + pre-commit risk gate.
 - ``whycode mcp``               — start the MCP stdio server.
 - ``whycode version``           — print version.
 """
@@ -414,6 +416,73 @@ def show(
         top = c.signals[0].headline if c.signals else "—"
         table.add_row(str(c.score.value), c.score.band.value, c.path, top)
     console.print(table)
+
+
+def _install_template(
+    template_name: str,
+    dst: Path,
+    repo_root: Path,
+    *,
+    force: bool,
+    executable: bool,
+) -> str:
+    """Copy a packaged template to ``dst``. Returns a one-line status."""
+    from importlib.resources import files
+
+    rel_label = str(dst.relative_to(repo_root)) if dst.is_relative_to(repo_root) else str(dst)
+    if dst.exists() and not force:
+        return f"[dim]skipped:[/dim] {rel_label}  (exists; use --force to overwrite)"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    payload = (files("whycode") / "templates" / template_name).read_text()
+    dst.write_text(payload)
+    if executable:
+        dst.chmod(0o755)
+    return f"[green]wrote:[/green]   {rel_label}"
+
+
+@app.command()
+def init(
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Overwrite existing files instead of skipping."
+    ),
+    repo: Path = typer.Option(
+        Path("."), "--repo", help="Path inside the repo (defaults to cwd)."
+    ),
+) -> None:
+    """One-command setup: install CI risk gate + local pre-commit hook."""
+    try:
+        repo_root = gf.discover_repo_root(repo.resolve())
+    except gf.GitError as exc:
+        err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    workflow_status = _install_template(
+        "github-workflow.yml",
+        repo_root / ".github" / "workflows" / "whycode.yml",
+        repo_root,
+        force=force,
+        executable=False,
+    )
+    hook_status = _install_template(
+        "pre-commit",
+        repo_root / ".git" / "hooks" / "pre-commit",
+        repo_root,
+        force=force,
+        executable=True,
+    )
+
+    console.print(workflow_status)
+    console.print(hook_status)
+    console.print()
+    console.print("[bold]WhyCode is wired into this repo.[/bold]")
+    console.print(
+        "  [dim]local[/dim]  pre-commit blocks HANDLE WITH CARE commits "
+        "(`git commit --no-verify` to bypass)"
+    )
+    console.print(
+        "  [dim]ci[/dim]     .github/workflows/whycode.yml gates PRs "
+        "(commit + push the workflow file to enable)"
+    )
 
 
 @app.command()

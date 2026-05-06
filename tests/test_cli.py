@@ -213,6 +213,53 @@ def test_show_unknown_sha_errors(repo) -> None:  # type: ignore[no-untyped-def]
     assert result.exit_code != 0
 
 
+def test_init_writes_workflow_and_hook(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "init")
+    assert result.exit_code == 0
+    workflow = repo.root / ".github" / "workflows" / "whycode.yml"
+    hook = repo.root / ".git" / "hooks" / "pre-commit"
+    assert workflow.exists()
+    assert hook.exists()
+    assert "name: WhyCode" in workflow.read_text()
+    assert "whycode diff --staged" in hook.read_text()
+    # Hook must be executable.
+    import os
+    assert os.access(hook, os.X_OK)
+
+
+def test_init_skips_existing_without_force(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    workflow = repo.root / ".github" / "workflows" / "whycode.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("custom: do not overwrite\n")
+    result = _invoke(repo.root, "init")
+    assert result.exit_code == 0
+    assert "skipped" in result.output.lower()
+    # File must be untouched.
+    assert workflow.read_text() == "custom: do not overwrite\n"
+
+
+def test_init_force_overwrites(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    workflow = repo.root / ".github" / "workflows" / "whycode.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("old content\n")
+    result = _invoke(repo.root, "init", "--force")
+    assert result.exit_code == 0
+    assert "name: WhyCode" in workflow.read_text()
+
+
+def test_init_outside_repo_errors(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        result = runner.invoke(app, ["init"], catch_exceptions=False)
+    finally:
+        os.chdir(cwd)
+    assert result.exit_code != 0
+
+
 def test_scan_lists_top_files(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     sha = repo.commit("init", {"a.py": "1", "b.py": "1"}, when=days_ago(60))
     repo.revert(sha, when=days_ago(50))

@@ -50,6 +50,7 @@ pip install git+https://github.com/fangshuor/WhyCode.git
 ```bash
 cd /path/to/your/repo
 
+whycode init                        # one-command setup: CI workflow + pre-commit gate
 whycode why src/some/file.py        # the Risk Card for one file
 whycode why src/some/file.py -b     # one-line summary (for triage / scripts)
 whycode diff                        # rank everything you changed vs origin/main
@@ -126,19 +127,22 @@ Tools exposed:
 ## Wire it into git, CI, and your editor
 
 WhyCode is most useful when it shows up automatically in the moments you'd
-otherwise forget to look. Three drop-in patterns:
-
-**Pre-commit hook** — block scary commits before they leave your machine:
+otherwise forget to look. The fast path:
 
 ```bash
-# .git/hooks/pre-commit  (chmod +x it)
-#!/usr/bin/env bash
-whycode diff --staged --fail-on handle
+whycode init
 ```
 
-**GitHub Action** — gate PRs on risk. Copy [`.github/workflows/whycode.yml`](
-./.github/workflows/whycode.yml) into your repo and tune the `--fail-on`
-threshold. PRs that touch files ≥ `READ HISTORY FIRST` will fail by default.
+That installs two things:
+
+- **`.git/hooks/pre-commit`** — runs `whycode diff --staged --fail-on handle`
+  before every commit. HANDLE WITH CARE files can't be touched without an
+  explicit `git commit --no-verify`.
+- **`.github/workflows/whycode.yml`** — a GitHub Action that risk-ranks every
+  PR's files and fails the build at `--fail-on history` (≥ READ HISTORY FIRST).
+
+Tune the `--fail-on` thresholds inside those two files for your repo. Re-run
+with `whycode init --force` to overwrite.
 
 **MCP server** — see the next section.
 

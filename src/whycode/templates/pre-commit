@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# WhyCode pre-commit risk gate.
+# Blocks commits that touch HANDLE WITH CARE files (score >= 75) without
+# acknowledging them. Tune `--fail-on` if this is too strict for you.
+#
+# Bypass (rare): commit with `git commit --no-verify` — but think twice.
+exec whycode diff --staged --fail-on handle
