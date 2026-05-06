@@ -4,6 +4,18 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-05-06
+
+### Changed
+- The GitHub Action template that `whycode init` writes is now **advisory
+  by default**: it prints the risk-ranked table to the job log but does
+  not fail the build. Users opt into hard gating by appending
+  `--fail-on <band>` to the diff line. Rationale: a brand-new repo's
+  history is usually too thin for `READ HISTORY FIRST` to be meaningful,
+  and a tool whose first contact blocks merging is a tool that gets
+  uninstalled the same day. Advisory first; gate on opt-in.
+- README's "Wire it into git, CI" section reflects the new default.
+
 ## [0.2.0] — 2026-05-06
 
 Published to PyPI as **`whycode-cli`** (the bare name `whycode` was already

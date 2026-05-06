@@ -150,11 +150,13 @@ That installs two things:
 - **`.git/hooks/pre-commit`** — runs `whycode diff --staged --fail-on handle`
   before every commit. HANDLE WITH CARE files can't be touched without an
   explicit `git commit --no-verify`.
-- **`.github/workflows/whycode.yml`** — a GitHub Action that risk-ranks every
-  PR's files and fails the build at `--fail-on history` (≥ READ HISTORY FIRST).
+- **`.github/workflows/whycode.yml`** — a GitHub Action that prints a
+  risk-ranked table for every PR. Advisory by default (never blocks merging);
+  append `--fail-on history` (or `handle` / `look`) to the diff line to turn
+  it into a hard gate.
 
-Tune the `--fail-on` thresholds inside those two files for your repo. Re-run
-with `whycode init --force` to overwrite.
+Tune the thresholds inside those two files for your repo. Re-run with
+`whycode init --force` to overwrite.
 
 **MCP server** — see the next section.
 

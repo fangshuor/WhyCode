@@ -1,16 +1,14 @@
-# Risk-gates pull requests with WhyCode.
+# Risk-rank pull requests with WhyCode.
 #
 # On every PR this workflow computes the Risk Card for each changed file
-# (vs the PR base) and:
-#   - prints a risk-ranked table to the job log
-#   - exits non-zero if any file reaches the band you choose, blocking merge
+# (vs the PR base) and prints a risk-ranked table to the job log.
+# Advisory by default — humans decide.
 #
-# Tune `--fail-on` to taste:
-#   handle   block PRs touching files >= HANDLE WITH CARE (>= 75)
-#   history  block PRs touching files >= READ HISTORY FIRST (>= 50)
-#   look     stricter; block at >= 25 (probably too noisy)
-#
-# Remove `--fail-on` entirely to make WhyCode advisory only.
+# To turn it into a hard gate that blocks merging, append `--fail-on <band>`
+# to the `whycode diff` line below:
+#   handle    block at HANDLE WITH CARE   (score >= 75)
+#   history   block at READ HISTORY FIRST (score >= 50)
+#   look      stricter — block at >= 25
 name: WhyCode
 
 on:
@@ -39,4 +37,4 @@ jobs:
         run: pip install whycode-cli
 
       - name: Risk-rank files in this PR
-        run: whycode diff --base origin/${{ github.base_ref }} --fail-on history
+        run: whycode diff --base origin/${{ github.base_ref }}
