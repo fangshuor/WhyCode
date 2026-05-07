@@ -233,12 +233,16 @@ def _all_signals_without_ghost_keeper(facts: gf.RepoFacts) -> list[sig.Signal]:
 
 # ----- rendering ------------------------------------------------------------
 
-_BAND_STYLE: dict[Band, str] = {
+# Public alias so the diff command's bucket headers can reuse the same band
+# colours a reader sees on the per-file Risk Card. Keep ``_BAND_STYLE`` as a
+# back-compat reference so the rest of this module reads as before.
+BAND_STYLE: dict[Band, str] = {
     Band.HANDLE_WITH_CARE: "bold white on red",
     Band.READ_HISTORY_FIRST: "bold black on yellow",
     Band.WORTH_A_LOOK: "bold black on cyan",
     Band.NO_FLAGS: "bold black on green",
 }
+_BAND_STYLE = BAND_STYLE
 
 
 def _severity_badge(severity: int) -> Text:
@@ -370,4 +374,4 @@ def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     return Group(*pieces)
 
 
-__all__ = ["RiskCard", "build", "build_from_diff_facts", "render_text"]
+__all__ = ["BAND_STYLE", "RiskCard", "build", "build_from_diff_facts", "render_text"]

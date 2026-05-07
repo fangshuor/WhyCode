@@ -226,6 +226,72 @@ def _print_brief(card: rc.RiskCard) -> None:
     )
 
 
+# --- shared: bucket grouping for diff and tour -----------------------------
+#
+# The diff and tour commands present a flat list of files sorted by score.
+# That made a 50-file PR a wall of identical-looking rows. Grouping them
+# under a heading per band gives a reviewer the cluster of HANDLE WITH CARE
+# files at a glance and demotes everything else below it. The order is
+# fixed: HANDLE WITH CARE → READ HISTORY FIRST → WORTH A LOOK → CLEAR.
+# CLEAR collapses NEWBORN-only and signal-less files together, since both
+# mean "nothing to flag".
+
+# Bucket order is fixed by the brief; not configurable.
+_BUCKET_ORDER: tuple[str, ...] = (
+    "HANDLE WITH CARE",
+    "READ HISTORY FIRST",
+    "WORTH A LOOK",
+    "CLEAR",
+)
+
+
+def _bucket_for(card: rc.RiskCard) -> str:
+    """Return the bucket label for a single card.
+
+    Files in the three risky bands keep their band as the bucket label.
+    NEWBORN-only files, signal-less files, and (rarely) files with one weak
+    signal still in the NO_FLAGS band collapse into a single CLEAR bucket;
+    they're "we have nothing to flag", not actionable risk.
+    """
+    from whycode.scorer import Band
+
+    actionable = any(s.kind is not sig.SignalKind.NEWBORN for s in card.signals)
+    if not actionable:
+        return "CLEAR"
+    if card.score.band is Band.NO_FLAGS:
+        return "CLEAR"
+    return card.score.band.value
+
+
+def _group_into_buckets(cards: list[rc.RiskCard]) -> dict[str, list[rc.RiskCard]]:
+    """Partition cards into the four fixed buckets.
+
+    Each bucket preserves the input order, so callers that pre-sort by
+    ``(-score, path)`` keep that stable tie-break inside each bucket.
+    Empty buckets are present in the dict (with an empty list value); the
+    renderer chooses whether to skip them.
+    """
+    buckets: dict[str, list[rc.RiskCard]] = {b: [] for b in _BUCKET_ORDER}
+    for c in cards:
+        buckets[_bucket_for(c)].append(c)
+    return buckets
+
+
+def _bucket_header_style(bucket: str) -> str:
+    """Return the rich style for a bucket header.
+
+    The first three buckets reuse the same band colours that ``risk_card``
+    uses so a reader scanning the diff picks up the same colour mapping
+    they will see on the per-file Risk Card.  CLEAR uses the green NO_FLAGS
+    style — that's what a flat ``no flags`` row would have looked like.
+    """
+    from whycode.scorer import Band
+
+    if bucket == "CLEAR":
+        return rc.BAND_STYLE[Band.NO_FLAGS]
+    return rc.BAND_STYLE[Band(bucket)]
+
+
 @app.command()
 @_propagate_failures
 def why(
@@ -438,6 +504,14 @@ def diff(
             "Use in CI: `whycode diff --fail-on history`."
         ),
     ),
+    show_clear: bool = typer.Option(
+        False,
+        "--show-clear",
+        help=(
+            "Expand the CLEAR bucket (files with no risk signals). Default "
+            "behaviour collapses it to a single count line."
+        ),
+    ),
     no_cache: bool = typer.Option(
         False,
         "--no-cache",
@@ -529,12 +603,26 @@ def diff(
         if cache is not None:
             cache.close()
 
+    # Bucket the cards by band (with NEWBORN-only / signal-less rolled into
+    # CLEAR). Each bucket preserves the (-score, path) tie-break already
+    # applied to ``cards``, so callers that walk a bucket get a stable order
+    # within it. ``--top N`` was applied above against the global sorted list,
+    # so the bucketed view contains exactly N rows distributed across buckets
+    # in fixed order.
+    buckets = _group_into_buckets(cards)
+    flagged_total = sum(len(buckets[b]) for b in _BUCKET_ORDER if b != "CLEAR")
+    clear_n = len(buckets["CLEAR"])
+
     if json_out:
         console.print_json(
             json.dumps(
                 {
                     "base": actual_base,
                     "files": [c.to_dict() for c in cards],
+                    "buckets": {
+                        band: [c.to_dict() for c in buckets[band]]
+                        for band in _BUCKET_ORDER
+                    },
                 }
             )
         )
@@ -542,13 +630,6 @@ def diff(
             raise typer.Exit(1)
         return
 
-    # NEWBORN-only files have no real risk signal — they're "we don't know yet".
-    # Push them into the quiet bucket so the table only shows actionable risk.
-    def _is_actionable(c: rc.RiskCard) -> bool:
-        return any(s.kind is not sig.SignalKind.NEWBORN for s in c.signals)
-
-    flagged = [c for c in cards if _is_actionable(c)]
-    quiet_n = len(cards) - len(flagged)
     scope_md = "files staged for commit" if staged else f"files changed vs `{actual_base}`"
     if markdown:
         # Stable marker so a follow-up workflow step can find-and-update the
@@ -558,21 +639,38 @@ def diff(
         print()
         print(f"**{len(files)} {scope_md}**")
         print()
-        if not flagged:
+        if flagged_total == 0 and not show_clear:
             print("Nothing flagged. Read the diff anyway.")
-        else:
-            print("| Score | Band | File | Top signal |")
-            print("| ----: | ---- | ---- | ---------- |")
-            for c in flagged:
-                top_signal = c.signals[0].headline.replace("|", "\\|")
-                print(
-                    f"| {c.score.value} | {c.score.band.value} | "
-                    f"`{c.path}` | {top_signal} |"
-                )
-            if quiet_n:
+            if clear_n:
                 print()
-                print(f"_+ {quiet_n} file(s) changed with no flags._")
-            print()
+                print(
+                    f"_+ {clear_n} file(s) with no risk signals — "
+                    "pass `--show-clear` to list._"
+                )
+        else:
+            for band in _BUCKET_ORDER:
+                rows = buckets[band]
+                if not rows:
+                    continue
+                if band == "CLEAR" and not show_clear:
+                    continue
+                print(f"### {band} ({len(rows)})")
+                print()
+                print("| Score | File | Top signal |")
+                print("| ----: | ---- | ---------- |")
+                for c in rows:
+                    if c.signals:
+                        top_signal = c.signals[0].headline.replace("|", "\\|")
+                    else:
+                        top_signal = "no flags"
+                    print(f"| {c.score.value} | `{c.path}` | {top_signal} |")
+                print()
+            if clear_n and not show_clear:
+                print(
+                    f"_+ {clear_n} file(s) with no risk signals — "
+                    "pass `--show-clear` to list._"
+                )
+                print()
             print(
                 "_Run `whycode why <path>` for the full Risk Card on any of the above._"
             )
@@ -582,27 +680,39 @@ def diff(
 
     scope = "staged for commit" if staged else f"changed vs {actual_base}"
     console.print(f"[bold]{len(files)} file(s) {scope}[/bold]")
-    if not flagged:
+    console.print()
+    if flagged_total == 0 and not show_clear:
         console.print("[green]nothing flagged[/green] — but read the diff anyway.")
-        return
-    table = Table(title="Risk-ranked changes")
-    table.add_column("score", justify="right", style="bold")
-    table.add_column("band")
-    table.add_column("path")
-    table.add_column("top signal")
-    for c in flagged:
-        table.add_row(
-            str(c.score.value),
-            c.score.band.value,
-            c.path,
-            c.signals[0].headline,
+        if clear_n:
+            console.print(
+                f"[dim]+ {clear_n} file(s) with no risk signals — "
+                "pass --show-clear to list[/dim]"
+            )
+    else:
+        for band in _BUCKET_ORDER:
+            rows = buckets[band]
+            if not rows:
+                continue
+            if band == "CLEAR" and not show_clear:
+                continue
+            style = _bucket_header_style(band)
+            console.print(f"[{style}] {band} [/{style}]  [dim]({len(rows)})[/dim]")
+            for c in rows:
+                top_signal = c.signals[0].headline if c.signals else "no flags"
+                console.print(
+                    f"  [bold]{c.score.value:>3}[/bold]  "
+                    f"[cyan]{c.path}[/cyan]   [dim]{top_signal}[/dim]"
+                )
+            console.print()
+        if clear_n and not show_clear:
+            console.print(
+                f"[dim]+ {clear_n} file(s) with no risk signals — "
+                "pass --show-clear to list[/dim]"
+            )
+            console.print()
+        console.print(
+            "[dim]→ whycode why <path>   for the full Risk Card on any of the above[/dim]"
         )
-    console.print(table)
-    if quiet_n:
-        console.print(f"[dim]+ {quiet_n} file(s) changed with no flags[/dim]")
-    console.print(
-        "[dim]→ whycode why <path>   for the full Risk Card on any of the above[/dim]"
-    )
 
     if threshold is not None:
         breaches = [c for c in cards if c.score.value >= threshold]
