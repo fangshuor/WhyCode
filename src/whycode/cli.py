@@ -374,7 +374,7 @@ def why(
                 card = card.with_decisions(tuple(decisions))
 
         if json_out:
-            console.print_json(json.dumps(card.to_dict()))
+            console.print_json(json.dumps(card.to_dict(explain=explain)))
             return
         if brief:
             _print_brief(card)

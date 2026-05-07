@@ -50,7 +50,37 @@ class RiskCard:
 
         return replace(self, decisions=decisions)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, explain: bool = False) -> dict[str, Any]:
+        """Render the card as a JSON-friendly dict.
+
+        With ``explain=True``, each signal entry grows an ``explanation``
+        key carrying the rule identifier, prose, evidence, and source
+        location populated by the detector. ``None`` is emitted when a
+        signal has no explanation attached (e.g. data ingested from an
+        older cache); the key is omitted entirely when ``explain`` is
+        off, so default consumers see no shape change.
+        """
+        signals_out: list[dict[str, Any]] = []
+        for s in self.signals:
+            entry: dict[str, Any] = {
+                "kind": s.kind.value,
+                "severity": s.severity,
+                "headline": s.headline,
+                "detail": s.detail,
+                "evidence": list(s.evidence),
+            }
+            if explain:
+                entry["explanation"] = (
+                    {
+                        "rule": s.explanation.rule,
+                        "why_it_fired": s.explanation.why_it_fired,
+                        "evidence": list(s.explanation.evidence),
+                        "source_ref": s.explanation.source_ref,
+                    }
+                    if s.explanation is not None
+                    else None
+                )
+            signals_out.append(entry)
         return {
             "path": self.path,
             "score": self.score.value,
@@ -67,16 +97,7 @@ class RiskCard:
                 if self.most_recent_sha
                 else None
             ),
-            "signals": [
-                {
-                    "kind": s.kind.value,
-                    "severity": s.severity,
-                    "headline": s.headline,
-                    "detail": s.detail,
-                    "evidence": list(s.evidence),
-                }
-                for s in self.signals
-            ],
+            "signals": signals_out,
             "decisions": [d.to_dict() for d in self.decisions],
         }
 
