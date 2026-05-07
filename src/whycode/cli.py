@@ -714,6 +714,12 @@ def timeline(
                     top,
                 )
             )
+    # Field-test report F14: ``timeline`` used to render rows in whatever
+    # non-monotonic order ``_sample_indices`` produced (uniform-across-index
+    # selection on a list whose ordering is git's parent traversal).  Sort
+    # by date ascending before rendering so a reader can scan left-to-right
+    # without misreading the trajectory.
+    rows.sort(key=lambda r: r[0])
 
     if json_out:
         console.print_json(
@@ -1070,18 +1076,34 @@ def tour(
         incidents_top = gf.find_incidents(commits)[:3]
 
         if invariants_top or incidents_top:
-            console.print("[bold yellow]Decisions and incidents[/bold yellow]")
-            for line, c in invariants_top:
-                console.print(f"  [italic]{line}[/italic]")
+            # Field-test report F16: the original tour rendered both classes
+            # under one ``Decisions and incidents`` header, so a parenthetical
+            # invariant prose line was visually indistinguishable from a real
+            # incident commit. Render two subheads matching the layout
+            # ``highlights`` already uses.
+            if invariants_top:
                 console.print(
-                    f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+                    f"[bold yellow]Stated invariants[/bold yellow] "
+                    f"[dim]({len(invariants_top)} most recent)[/dim]"
                 )
-            for c in incidents_top:
-                subj = c.subject if len(c.subject) <= 70 else c.subject[:69] + "…"
-                console.print(f"  [red]{subj}[/red]")
+                for line, c in invariants_top:
+                    console.print(f"  [italic]{line}[/italic]")
+                    console.print(
+                        f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  "
+                        f"{c.author_name}[/dim]\n"
+                    )
+            if incidents_top:
                 console.print(
-                    f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+                    f"[bold red]Recent incidents[/bold red] "
+                    f"[dim]({len(incidents_top)} most recent)[/dim]"
                 )
+                for c in incidents_top:
+                    subj = c.subject if len(c.subject) <= 70 else c.subject[:69] + "…"
+                    console.print(f"  [red]{subj}[/red]")
+                    console.print(
+                        f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  "
+                        f"{c.author_name}[/dim]\n"
+                    )
         else:
             console.print(
                 "[dim]No headline decisions or incidents in recent history.[/dim]"
