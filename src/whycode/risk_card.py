@@ -264,7 +264,7 @@ def _evidence_redundant(evidence: tuple[str, ...], detail: str) -> bool:
     return all(token in detail for token in evidence)
 
 
-def _signals_table(signals: tuple[sig.Signal, ...]) -> Table | Text:
+def _signals_table(signals: tuple[sig.Signal, ...], *, explain: bool = False) -> Table | Text:
     if not signals:
         return Text(
             "No flags fired. The history is quiet — this is information, "
@@ -280,6 +280,18 @@ def _signals_table(signals: tuple[sig.Signal, ...]) -> Table | Text:
         block.append(s.detail, style="")
         if s.evidence and not _evidence_redundant(s.evidence, s.detail):
             block.append("\nevidence: " + ", ".join(s.evidence), style="dim")
+        if explain and s.explanation is not None:
+            ex = s.explanation
+            block.append("\n", style="")
+            block.append("─ rule: ", style="dim")
+            block.append(ex.rule, style="dim bold")
+            if ex.source_ref:
+                block.append("  ", style="dim")
+                block.append(ex.source_ref, style="dim")
+            block.append("\n  fired because: ", style="dim")
+            block.append(ex.why_it_fired, style="dim")
+            if ex.evidence:
+                block.append("\n  evidence: " + ", ".join(ex.evidence), style="dim")
         table.add_row(_severity_badge(s.severity), block)
     return table
 
@@ -324,10 +336,10 @@ def _decisions_block(decisions: tuple[Decision, ...]) -> Padding:
     return Padding(panel, (1, 1, 0, 1))
 
 
-def render_text(card: RiskCard) -> Group:
+def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     pieces: list[Any] = [
         _header(card),
-        Padding(_signals_table(card.signals), (0, 1, 0, 1)),
+        Padding(_signals_table(card.signals, explain=explain), (0, 1, 0, 1)),
     ]
     if card.decisions:
         pieces.append(_decisions_block(card.decisions))
