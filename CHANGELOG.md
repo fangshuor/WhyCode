@@ -4,6 +4,121 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [0.5.3] — 2026-05-07
+
+### Changed — `whycode diff` is now bucketed by band
+
+The pre-PR command produced a single sorted table for every changed
+file. On a 50-file PR that became a wall: HANDLE WITH CARE rows shared
+visual weight with NO FLAGS rows, and a reviewer had to scan top to
+bottom to find the cluster of risky files. Output is now grouped by
+band, with each bucket clearly headed and the bucket order fixed.
+
+Before:
+
+```
+16 file(s) changed vs origin/main
+                              Risk-ranked changes
+┏━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
+┃ score ┃ band               ┃ path                   ┃ top signal     ┃
+┡━━━━━━━╇━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
+│    82 │ HANDLE WITH CARE   │ src/whycode/cli.py     │ Tightly coupled│
+│    82 │ HANDLE WITH CARE   │ tests/test_cli.py      │ Tightly coupled│
+│    71 │ READ HISTORY FIRST │ src/whycode/git_facts… │ Tightly coupled│
+│    59 │ READ HISTORY FIRST │ src/whycode/risk_card… │ Tightly coupled│
+│    39 │ WORTH A LOOK       │ tests/test_git_facts.… │ Tightly coupled│
+│    15 │ NO FLAGS           │ src/whycode/signals.py │ Tightly coupled│
+│   …                                                                 │
+└───────┴────────────────────┴────────────────────────┴────────────────┘
++ 4 file(s) changed with no flags
+```
+
+After:
+
+```
+16 file(s) changed vs HEAD~5
+
+ HANDLE WITH CARE   (2)
+   82  src/whycode/cli.py        Tightly coupled to 5 other files
+   82  tests/test_cli.py         Tightly coupled to 5 other files
+
+ READ HISTORY FIRST   (5)
+   71  src/whycode/git_facts.py  Tightly coupled to 5 other files
+   59  src/whycode/risk_card.py  Tightly coupled to 5 other files
+   …
+
+ WORTH A LOOK   (1)
+   39  tests/test_git_facts.py   Tightly coupled to 5 other files
+
++ 8 file(s) with no risk signals — pass --show-clear to list
+
+→ whycode why <path>   for the full Risk Card on any of the above
+```
+
+Behaviours:
+
+- Bucket order is fixed: HANDLE WITH CARE → READ HISTORY FIRST →
+  WORTH A LOOK → CLEAR. Empty buckets are not rendered (no
+  ``READ HISTORY FIRST (0)`` lines).
+- The CLEAR bucket (NEWBORN-only / no useful signals) is collapsed to
+  a single count line by default; ``--show-clear`` expands it.
+- Within each bucket the existing stable tie-break ``(-score, path)``
+  from 0.4.2 is preserved.
+- ``--top N`` still caps the **total** row count across all buckets,
+  not per-bucket.
+- ``--json`` gains a top-level ``buckets`` field keyed by band string;
+  each value is the file array. The flat ``files`` array is
+  preserved for backward compatibility.
+- ``--markdown`` emits a ``### <band> (<count>)`` heading per
+  non-empty bucket. The PR-comment marker (``<!-- whycode-comment -->``)
+  is unchanged.
+- ``--fail-on`` summary line and exit codes are unchanged.
+
+The same bucketing applies to ``whycode tour``'s "Top 3 risky files"
+block — three rows is short enough that the bucket headers don't feel
+bureaucratic, and the visual consistency with ``whycode diff`` is what
+the change is for.
+
+### Changed — Risk Card visual de-noise
+
+Two redundancies in the per-file Risk Card:
+
+- The header rendered both the band (``HANDLE WITH CARE``) AND the
+  integer score (``score 78/100``) at full prominence. The band
+  already names the bucket; the score is duplication on the most
+  prominent surface of the card. Demoted to a small dim ``· 78``
+  suffix on the same line. JSON output is unchanged — ``score``
+  stays as an integer key.
+- The signals table appended ``evidence: <sha>`` even when that SHA
+  was already visible in the card header (the silence detector's
+  evidence is the head-of-history commit the header just printed two
+  rows up). The header SHA is now considered when checking
+  redundancy, so single-SHA evidence trailers that repeat the header
+  are suppressed.
+
+Per-signal severity badges (``HIGH`` / ``MED`` / ``LOW``) stay — they
+communicate per-detector weight, not band.
+
+### Internal
+
+- ``src/whycode/cli.py`` — ``_BUCKET_ORDER``, ``_bucket_for``,
+  ``_group_into_buckets``, ``_bucket_header_style`` are the only new
+  symbols. Bucketing is inline in the ``diff`` command and ``tour``;
+  no generic table-grouping abstraction.
+- ``src/whycode/risk_card.py`` — ``BAND_STYLE`` is now public so the
+  diff command's bucket headers reuse the same band colours; ``_BAND_STYLE``
+  is kept as a back-compat alias. ``_evidence_redundant`` accepts an
+  ``extra_context`` keyword so the header SHA is part of the visible
+  surface used to decide whether the trailer is duplication.
+- ``--show-clear`` flag added to ``whycode diff``.
+- ``tests/test_cli.py`` — 7 new tests: bucket headers, empty-bucket
+  suppression, ``--top N`` global cap, ``--json`` ``buckets`` key,
+  ``--markdown`` per-bucket section, tour bucket labels, header
+  ``· N`` suffix.
+
+201 tests passing (194 from 0.5.0 + 7 new). ruff + mypy strict clean.
+Privacy contract is unchanged — bucketing is rendering-only.
 ## [0.5.2] — 2026-05-07
 
 ### Added — `whycode why <path> --explain` makes the rule ladder transparent

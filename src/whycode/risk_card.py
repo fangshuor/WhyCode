@@ -233,12 +233,16 @@ def _all_signals_without_ghost_keeper(facts: gf.RepoFacts) -> list[sig.Signal]:
 
 # ----- rendering ------------------------------------------------------------
 
-_BAND_STYLE: dict[Band, str] = {
+# Public alias so the diff command's bucket headers can reuse the same band
+# colours a reader sees on the per-file Risk Card. Keep ``_BAND_STYLE`` as a
+# back-compat reference so the rest of this module reads as before.
+BAND_STYLE: dict[Band, str] = {
     Band.HANDLE_WITH_CARE: "bold white on red",
     Band.READ_HISTORY_FIRST: "bold black on yellow",
     Band.WORTH_A_LOOK: "bold black on cyan",
     Band.NO_FLAGS: "bold black on green",
 }
+_BAND_STYLE = BAND_STYLE
 
 
 def _severity_badge(severity: int) -> Text:
@@ -255,8 +259,12 @@ def _header(card: RiskCard) -> Panel:
     title = Text()
     title.append(" ")
     title.append(card.score.band.value, style=style)
-    title.append("  ")
-    title.append(f"score {card.score.value}/100", style="bold")
+    # The band already names the bucket; the integer score adds little
+    # except duplication on the most prominent surface of the card. Demote
+    # it to a small dim suffix so the band is what the eye lands on.
+    # JSON output is unchanged — ``RiskCard.to_dict`` still emits ``score``
+    # as an integer for tools that consume the structured shape.
+    title.append(f"  · {card.score.value}", style="dim")
     if card.as_of_sha:
         title.append(f"   as of {card.as_of_sha}", style="dim")
     body = Text()
@@ -278,14 +286,33 @@ def _header(card: RiskCard) -> Panel:
     return Panel(body, title=title, title_align="left", border_style="grey50")
 
 
-def _evidence_redundant(evidence: tuple[str, ...], detail: str) -> bool:
-    """True if every evidence token already appears verbatim in the detail."""
+def _evidence_redundant(
+    evidence: tuple[str, ...],
+    detail: str,
+    *,
+    extra_context: str = "",
+) -> bool:
+    """True if every evidence token already appears verbatim somewhere visible.
+
+    The signals table renders ``evidence: <sha>, <sha>`` only when the
+    detail does not already mention those tokens. ``extra_context`` lets
+    the caller add more visible surface — the card header, for instance,
+    where ``most_recent_sha`` is already printed in dim text. Without this,
+    the silence detector's single-SHA evidence line repeats what the header
+    just showed two rows up.
+    """
     if not evidence:
         return True
-    return all(token in detail for token in evidence)
+    haystack = detail + " " + extra_context
+    return all(token in haystack for token in evidence)
 
 
-def _signals_table(signals: tuple[sig.Signal, ...], *, explain: bool = False) -> Table | Text:
+def _signals_table(
+    signals: tuple[sig.Signal, ...],
+    *,
+    explain: bool = False,
+    extra_context: str = "",
+) -> Table | Text:
     if not signals:
         return Text(
             "No flags fired. The history is quiet — this is information, "
@@ -299,7 +326,9 @@ def _signals_table(signals: tuple[sig.Signal, ...], *, explain: bool = False) ->
         block = Text()
         block.append(s.headline + "\n", style="bold")
         block.append(s.detail, style="")
-        if s.evidence and not _evidence_redundant(s.evidence, s.detail):
+        if s.evidence and not _evidence_redundant(
+            s.evidence, s.detail, extra_context=extra_context
+        ):
             block.append("\nevidence: " + ", ".join(s.evidence), style="dim")
         if explain and s.explanation is not None:
             ex = s.explanation
@@ -358,9 +387,17 @@ def _decisions_block(decisions: tuple[Decision, ...]) -> Padding:
 
 
 def render_text(card: RiskCard, *, explain: bool = False) -> Group:
+    # The header already prints the most-recent SHA in dim text. Pass it to
+    # the signals table so single-SHA evidence (silence, newborn) is treated
+    # as redundant — those detectors' evidence is exactly the head-of-history
+    # commit the header just showed.
+    extra_context = card.most_recent_sha or ""
     pieces: list[Any] = [
         _header(card),
-        Padding(_signals_table(card.signals, explain=explain), (0, 1, 0, 1)),
+        Padding(
+            _signals_table(card.signals, explain=explain, extra_context=extra_context),
+            (0, 1, 0, 1),
+        ),
     ]
     if card.decisions:
         pieces.append(_decisions_block(card.decisions))
@@ -370,4 +407,4 @@ def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     return Group(*pieces)
 
 
-__all__ = ["RiskCard", "build", "build_from_diff_facts", "render_text"]
+__all__ = ["BAND_STYLE", "RiskCard", "build", "build_from_diff_facts", "render_text"]

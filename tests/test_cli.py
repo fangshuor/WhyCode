@@ -632,8 +632,12 @@ def test_diff_markdown_output(repo, days_ago) -> None:  # type: ignore[no-untype
     out = result.output
     # Hidden marker so the workflow can find-and-update its prior comment.
     assert "<!-- whycode-comment -->" in out
-    # Markdown table syntax.
-    assert "| Score | Band |" in out
+    # Bucketed markdown: a section header per band, table inside each bucket.
+    assert any(
+        f"### {band} (" in out
+        for band in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK")
+    )
+    assert "| Score | File | Top signal |" in out
     assert "| ----: |" in out
     # File path appears as inline code.
     assert "`refund.py`" in out
@@ -963,3 +967,225 @@ def test_no_cache_scan_matches_warm_scan_byte_for_byte(
     warm_again = _invoke(repo.root, "scan", "--top", "5").output
     assert warm == no_cache
     assert warm == warm_again
+
+
+# ---- 0.5.3: bucketed diff output ------------------------------------------
+
+
+def test_diff_text_renders_bucket_headers(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`whycode diff` text output groups files under their band as a heading.
+
+    A reviewer scanning a 50-file PR no longer needs to read every row to
+    find the riskiest cluster — the HANDLE WITH CARE bucket is its own
+    section heading at the top of the page.
+    """
+    repo.commit("init", {"refund.py": "0", "docs.md": "v1"}, when=days_ago(180))
+    sha = repo.commit("feat: refund", {"refund.py": "1"}, when=days_ago(120))
+    repo.revert(sha, when=days_ago(100))
+    sha2 = repo.commit("feat: refund again", {"refund.py": "2"}, when=days_ago(80))
+    repo.revert(sha2, when=days_ago(70))
+    sha3 = repo.commit("feat: refund 3", {"refund.py": "3"}, when=days_ago(60))
+    repo.revert(sha3, when=days_ago(55))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "4"},
+        body="incident #INC-42",
+        when=days_ago(10),
+    )
+    repo.commit("docs: tweak", {"docs.md": "v2"}, when=days_ago(2))
+    # Diff against the very first commit so refund.py and docs.md both
+    # appear as changed files in the briefing.
+    result = _invoke(repo.root, "diff", "--base", "HEAD~8")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # The bucket header carries the band label and a parenthesised count on
+    # the same line.  Rich's space-padded styling means the gap between the
+    # label and the count is implementation-defined — assert the band name
+    # appears, and that a ``(N)`` count appears on the same line.
+    import re
+
+    assert any(
+        re.search(rf"{band}\s+\(\d+\)", out)
+        for band in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK")
+    ), out
+    # CLEAR is collapsed by default to a single count line, not a table row.
+    assert "no risk signals" in out
+
+
+def test_diff_skips_empty_buckets(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """An empty bucket must not be rendered.
+
+    A diff with only one HANDLE WITH CARE file should not emit a vacuous
+    `READ HISTORY FIRST (0)` section.
+    """
+    repo.commit("init", {"a.py": "0"}, when=days_ago(180))
+    sha = repo.commit("feat 1", {"a.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    sha2 = repo.commit("feat 2", {"a.py": "2"}, when=days_ago(40))
+    repo.revert(sha2, when=days_ago(35))
+    sha3 = repo.commit("feat 3", {"a.py": "3"}, when=days_ago(30))
+    repo.revert(sha3, when=days_ago(25))
+    repo.commit(
+        "hotfix: incident",
+        {"a.py": "4"},
+        body="incident #INC-1",
+        when=days_ago(2),
+    )
+    result = _invoke(repo.root, "diff", "--base", "HEAD~7")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # Only one file changed → at most one risky bucket should be present.
+    assert "READ HISTORY FIRST (0)" not in out
+    assert "WORTH A LOOK (0)" not in out
+    assert "HANDLE WITH CARE (0)" not in out
+
+
+def test_diff_top_caps_total_rows_across_buckets(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`--top N` applies across all buckets combined, not per-bucket.
+
+    Asking for 5 rows on a diff with twelve flagged files should show
+    exactly five total rows distributed across whichever buckets they fall
+    in — a global cap, not a per-band cap.
+    """
+    files = {f"f{i}.py": "0" for i in range(8)}
+    repo.commit("init", files, when=days_ago(120))
+    sha = repo.commit(
+        "feat: introduce", {f"f{i}.py": "1" for i in range(8)}, when=days_ago(60)
+    )
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {f"f{i}.py": "2" for i in range(8)},
+        body="incident #INC-1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "diff", "--base", "HEAD~3", "--top", "3", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    # Top-3 cap means exactly 3 file entries in `files`, regardless of how
+    # those 3 split across buckets.
+    assert len(data["files"]) == 3
+    # And the bucketed view sums to the same 3.
+    bucketed_total = sum(len(v) for v in data["buckets"].values())
+    assert bucketed_total == 3
+
+
+def test_diff_json_emits_buckets_field(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`--json` exposes a top-level `buckets` field keyed by band name.
+
+    The four bucket keys are always present (even when empty) so a tool
+    consuming the JSON sees a stable shape across runs.
+    """
+    sha = repo.commit("init", {"a.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "diff", "--base", "HEAD~2", "--json")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert "buckets" in data
+    expected_keys = {"HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK", "CLEAR"}
+    assert set(data["buckets"].keys()) == expected_keys
+
+
+def test_diff_markdown_emits_section_per_bucket(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`--markdown` emits a `### <band> (<count>)` heading per non-empty bucket.
+
+    A PR comment posted by the workflow now opens with the bucket the
+    reviewer should look at first, then the next-most-risky bucket, etc.
+    """
+    repo.commit("init", {"a.py": "0"}, when=days_ago(180))
+    sha = repo.commit("feat: A", {"a.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "diff", "--base", "HEAD~3", "--markdown")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # At least one bucket header rendered.
+    assert any(
+        f"### {band} (" in out
+        for band in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK")
+    ), out
+    # The bucket-internal table no longer has a Band column (the heading
+    # already encodes the band).
+    assert "| Score | File | Top signal |" in out
+
+
+def test_tour_top_files_render_bucket_labels(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`whycode tour`'s Top-3 risky files block renders bucket headings.
+
+    Three rows is short, but the bucket headers give the same visual
+    mapping ``whycode diff`` uses. A reader scanning the tour sees
+    HANDLE WITH CARE files under their own heading rather than as a
+    fixed-width band column.
+    """
+    repo.commit("init", {"a.py": "0", "b.py": "0"}, when=days_ago(180))
+    repo.commit(
+        "compat: keep sync path",
+        {"a.py": "1"},
+        body="Do not switch to async.",
+        when=days_ago(60),
+    )
+    sha = repo.commit("feat: A", {"a.py": "2"}, when=days_ago(40))
+    repo.revert(sha, when=days_ago(35))
+    repo.commit(
+        "hotfix: refund regression",
+        {"a.py": "3"},
+        body="See INC-447.",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "tour")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # Top 3 block exists and at least one bucket label appears under it.
+    assert "Top 3 risky files" in out
+    assert any(
+        band in out
+        for band in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK")
+    ), out
+
+
+def test_why_header_demotes_score_to_dim_suffix(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The Risk Card header shows the band; the score is a dim ``· N`` suffix.
+
+    The band already names the bucket; an explicit ``score 78/100`` next to
+    it is duplication on the most prominent surface of the card. The new
+    layout keeps the band's coloured pill and demotes the score to a small
+    dim trailing suffix on the same line.
+
+    JSON output is unchanged — ``score`` stays as an integer key for tools
+    consuming the structured shape.
+    """
+    sha = repo.commit("init", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: refund regression",
+        {"refund.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "why", "refund.py")
+    assert result.exit_code == 0
+    out = result.output
+    # Old format: "score X/100" must NOT appear in the rendered text.
+    assert "score" not in out.lower() or "/100" not in out
+    # New format: a "· <int>" suffix sits next to the band on the header line.
+    import re
+
+    band_score = re.search(r"(HANDLE WITH CARE|READ HISTORY FIRST|WORTH A LOOK).*?·\s*\d+", out)
+    assert band_score is not None, out
+    # JSON output preserves the integer score field.
+    json_result = _invoke(repo.root, "why", "refund.py", "--json")
+    assert json_result.exit_code == 0
+    data = json.loads(json_result.output)
+    assert "score" in data
+    assert isinstance(data["score"], int)

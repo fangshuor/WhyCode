@@ -81,7 +81,7 @@ That's it. No config file, no daemon, no account, no upload.
 ### What a Risk Card looks like
 
 ```
-╭─  READ HISTORY FIRST  score 57/100 ──────────────────────────────╮
+╭─  READ HISTORY FIRST  · 57 ──────────────────────────────────────╮
 │ src/payment/refund.py   (24 commits)                             │
 │ Latest: hotfix: idempotency token regression                     │
 │         a3f4b2c1   Mei Chen   2025-09-14                         │
@@ -100,6 +100,32 @@ That's it. No config file, no daemon, no account, no upload.
 
   → git show 9d2e7a1   to read the most relevant commit in full
 ```
+
+### What a `whycode diff` briefing looks like
+
+```
+8 file(s) changed vs origin/main
+
+ HANDLE WITH CARE   (2)
+   78  src/payment/refund.py     3 reverts touched this file
+   77  src/payment/charge.py     primary author last active 1100 days ago
+
+ READ HISTORY FIRST   (2)
+   62  src/api/auth.py           tightly coupled to 4 other files
+   51  src/foo.py                2 invariants stated by past authors
+
+ WORTH A LOOK   (1)
+   33  src/bar.py                tightly coupled to 3 other files
+
++ 3 file(s) with no risk signals — pass --show-clear to list
+
+→ whycode why <path>   for the full Risk Card on any of the above
+```
+
+The output groups files by band so a reviewer scanning a 50-file PR sees
+the cluster of HANDLE WITH CARE files first instead of having to read
+top-to-bottom. The CLEAR bucket (no risk signals) collapses to a count
+line by default; pass `--show-clear` to expand it.
 
 Score interpretation:
 
