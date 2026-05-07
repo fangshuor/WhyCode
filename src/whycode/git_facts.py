@@ -735,6 +735,242 @@ def _populate_diffstat_cache(
         cache.upsert_commit_files(rows)
 
 
+# ---- batch loading for whycode diff ---------------------------------------
+
+
+@dataclass(frozen=True)
+class DiffFacts:
+    """A whole-repo snapshot built once for a single ``whycode diff`` evaluation.
+
+    The diff command scores N changed files; previously each file fired its
+    own ``git log --follow`` plus a co-change diffstat pass, so wall-clock
+    cost scaled with N. ``DiffFacts`` replaces N path-restricted log walks
+    with a single un-pathed walk: one ``git log --no-merges --numstat`` over
+    the repo, parsed once into ``commits_by_path`` (every commit that named
+    each path) and ``co_change_index`` (each commit's full file-set, used
+    for in-memory coupling counts). Per-file scoring then reads from this
+    map rather than re-shelling-out.
+
+    The map deliberately does NOT follow renames: the diff command only
+    scores files present in HEAD's working tree, so the tradeoff is "lose
+    rename-resolved history pre-rename" against "scoring 1,927 files in
+    seconds rather than minutes". Coupling against pre-rename names still
+    surfaces under those names in the map; the surface diff in practice is
+    a stable-tie-break difference, not a structural one.
+    """
+
+    repo_root: Path
+    commits_by_path: dict[str, list[Commit]]
+    """``path -> [Commit]``, newest-first, capped per path during load.
+
+    A missing key — i.e. ``commits_by_path.get(path)`` returns ``None`` —
+    means the loader walk did not see this path. ``gather_for_diff`` treats
+    that the same as an empty list: a path that the un-pathed walk did not
+    touch has no history to score from.
+    """
+
+    co_change_index: dict[str, tuple[str, ...]]
+    """``commit_sha -> tuple of paths touched by that commit``.
+
+    Snapshot of the same numstat parse used to build ``commits_by_path``.
+    Per-file ``co_changes`` reads this for in-memory coupling counts so
+    the diff pipeline never re-issues ``git log --no-walk`` per file.
+    """
+
+    cache: CacheStore | None = None
+    """Optional cache, threaded through so signal detectors (specifically
+    ``detect_ghost_keeper``) reuse it for ``git blame`` line ownership."""
+
+
+_NUMSTAT_LINE_RE = re.compile(r"^(\d+|-)\t(\d+|-)\t(.+)$")
+
+
+def load_diff_facts(
+    repo_root: Path,
+    *,
+    max_commits: int | None = None,
+    cache: CacheStore | None = None,
+) -> DiffFacts:
+    """Build a :class:`DiffFacts` snapshot from one ``git log`` invocation.
+
+    Strategy:
+      1. Walk HEAD with ``git log --no-merges --numstat --pretty=...`` once.
+      2. Parse each commit + its full file-set into a single in-memory map.
+      3. Return the snapshot for the diff command's per-file scorer to drive.
+
+    With a ``cache`` supplied, the walked commits are persisted to
+    ``commits``; per-file diffstat presence rows are persisted to
+    ``commit_files`` so a subsequent ``why`` / ``scan`` / ``diff`` invocation
+    on the same HEAD reuses what we just paid for.
+
+    The walk is intentionally un-pathed: the diff command scores files
+    that appear in ``git diff --name-only base...HEAD``, all of which exist
+    at HEAD by definition. A single un-pathed walk that captures every
+    commit's diffstat is strictly cheaper than N path-restricted walks
+    that each re-walk the full graph. ``max_commits`` is applied per-path
+    *after* the walk so callers can cap per-file depth without changing
+    the cost of the walk itself.
+    """
+    # Pretty format: RECORD_SEP starts each commit; metadata fields are
+    # UNIT_SEP-delimited; the body is the last metadata field. Numstat
+    # output git appends after the body needs no further separator —
+    # the next commit's leading RECORD_SEP marks the boundary.
+    pretty_format = (
+        f"{RECORD_SEP}%H{UNIT_SEP}%an{UNIT_SEP}%ae{UNIT_SEP}"
+        f"%aI{UNIT_SEP}%s{UNIT_SEP}%b"
+    )
+    raw = _run_git(
+        repo_root,
+        "log",
+        "--no-merges",
+        "--numstat",
+        f"--pretty=format:{pretty_format}",
+    )
+    all_commits, commits_by_path, co_change_index = _parse_log_with_files(raw)
+    if max_commits is not None:
+        commits_by_path = {p: cs[:max_commits] for p, cs in commits_by_path.items()}
+    if cache is not None and all_commits:
+        _store_commits(cache, all_commits)
+        # Persist diffstat presence rows so a subsequent `why` against the
+        # same HEAD does not re-shell-out per file. Insertion/deletion
+        # widths are not captured by this walk (the diff command's
+        # detectors only depend on the *path set* of each commit), so they
+        # are stored as zero — see the paragraph in ``DiffFacts``.
+        files_rows: list[tuple[str, str, int, int]] = []
+        for sha, paths in co_change_index.items():
+            for p in paths:
+                files_rows.append((sha, p, 0, 0))
+        if files_rows:
+            cache.upsert_commit_files(files_rows)
+        try:
+            head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+        except GitError:
+            head_sha = ""
+        if head_sha and not cache.head_sha:
+            cache.set_head_sha(head_sha)
+    return DiffFacts(
+        repo_root=repo_root,
+        commits_by_path=commits_by_path,
+        co_change_index=co_change_index,
+        cache=cache,
+    )
+
+
+def _parse_log_with_files(
+    raw: str,
+) -> tuple[list[Commit], dict[str, list[Commit]], dict[str, tuple[str, ...]]]:
+    """Parse ``git log --no-merges --numstat --pretty=<sep><commit>`` output.
+
+    Returns ``(all_commits, commits_by_path, co_change_index)``:
+      - ``all_commits`` is every parsed commit, newest first.
+      - ``commits_by_path[path]`` is the subset whose numstat block named
+        ``path``, preserving the newest-first order of the walk.
+      - ``co_change_index[sha]`` is the full path tuple from the same
+        numstat block, used by the diff command's in-memory coupling.
+
+    Within one record the format is
+    ``<sha>\\x1f<an>\\x1f<ae>\\x1f<aI>\\x1f<subject>\\x1f<body...>``
+    followed by zero or more numstat lines (``ins\\tdel\\tpath``). The body
+    is free-form prose; numstat is tab-delimited 3-column. We walk lines
+    forward, holding the first line as the metadata + start-of-body, and
+    accumulate further lines as either body (free-form) or numstat
+    (matches :data:`_NUMSTAT_LINE_RE`). Once a numstat line fires, the
+    remaining lines for that record are taken to be more numstat lines.
+    """
+    all_commits: list[Commit] = []
+    commits_by_path: dict[str, list[Commit]] = {}
+    co_change_index: dict[str, tuple[str, ...]] = {}
+    for record in raw.split(RECORD_SEP):
+        record = record.strip("\n")
+        if not record:
+            continue
+        lines = record.split("\n")
+        # The first line carries every metadata field plus the first body
+        # line (the body itself was emitted verbatim by ``%b``).
+        head_parts = lines[0].split(UNIT_SEP)
+        if len(head_parts) < 6:
+            continue
+        sha = head_parts[0].strip()
+        if not sha:
+            continue
+        author_name = head_parts[1]
+        author_email = head_parts[2]
+        authored_at = head_parts[3]
+        subject = head_parts[4]
+        first_body = UNIT_SEP.join(head_parts[5:])
+        body_lines: list[str] = [first_body] if first_body else []
+        files: list[str] = []
+        in_numstat = False
+        for line in lines[1:]:
+            m = _NUMSTAT_LINE_RE.match(line)
+            if in_numstat:
+                if m is not None:
+                    files.append(m.group(3))
+                continue
+            if m is not None:
+                in_numstat = True
+                files.append(m.group(3))
+                continue
+            body_lines.append(line)
+        try:
+            authored = _parse_iso(authored_at)
+        except ValueError:
+            # Bad timestamps from a single 15-year-old commit shouldn't kill
+            # the diff command. F1 (full timezone-tolerant parser) is owned
+            # by another branch; we degrade locally rather than crash.
+            continue
+        body = "\n".join(body_lines).strip("\n")
+        commit = Commit(
+            sha=sha,
+            author_name=author_name,
+            author_email=author_email,
+            authored_at=authored,
+            subject=subject,
+            body=body,
+            files=tuple(files),
+        )
+        all_commits.append(commit)
+        co_change_index[sha] = commit.files
+        for path in files:
+            commits_by_path.setdefault(path, []).append(commit)
+    return all_commits, commits_by_path, co_change_index
+
+
+def gather_for_diff(
+    diff_facts: DiffFacts,
+    path: str,
+    *,
+    max_commits: int | None = None,
+) -> RepoFacts:
+    """Build a :class:`RepoFacts` for ``path`` using only the in-memory map.
+
+    The diff command calls this once per changed file, replacing the per-file
+    ``gather()`` (and its embedded ``git log --follow`` + co-change shell-out)
+    with O(1) dict lookups. All higher-layer detectors run unchanged on the
+    returned ``RepoFacts``.
+    """
+    commits = diff_facts.commits_by_path.get(path, [])
+    if max_commits is not None:
+        commits = commits[:max_commits]
+    co_changed: Counter[str] = Counter()
+    for commit in commits:
+        touched = diff_facts.co_change_index.get(commit.sha, ())
+        for other in touched:
+            if other == path:
+                continue
+            co_changed[other] += 1
+    return RepoFacts(
+        repo_root=diff_facts.repo_root,
+        path=path,
+        commits=commits,
+        co_changed_files=co_changed,
+        revert_pairs=find_revert_pairs(commits),
+        incident_commits=find_incidents(commits),
+        invariant_quotes=extract_invariant_quotes(commits),
+        cache=diff_facts.cache,
+    )
+
+
 _REVERT_PREFIX = 'this reverts commit '
 
 

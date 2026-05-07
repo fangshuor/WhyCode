@@ -101,7 +101,63 @@ def build(
     the same repo (e.g. inside ``scan`` or ``diff``) share a warm cache.
     """
     facts = gf.gather(repo_root, path, max_commits=max_commits, ref=ref, cache=cache)
-    signals = sig.all_signals(facts)
+    return _from_facts(
+        path=path,
+        facts=facts,
+        repo_root=repo_root,
+        ref=ref,
+        apply_suppressions=apply_suppressions,
+    )
+
+
+def build_from_diff_facts(
+    diff_facts: gf.DiffFacts,
+    path: str,
+    *,
+    max_commits: int | None = None,
+    apply_suppressions: bool = True,
+    skip_ghost_keeper: bool = False,
+) -> RiskCard:
+    """Build a Risk Card from an in-memory :class:`DiffFacts` map.
+
+    The diff command pre-loads one ``DiffFacts`` for the whole evaluation
+    via :func:`whycode.git_facts.load_diff_facts`, then calls this helper
+    once per changed file. The card's signals, score, and ``most_recent_*``
+    fields all derive from the same in-memory map, so per-file cost is
+    O(1) rather than the per-file ``git log --follow`` it replaces.
+
+    With ``skip_ghost_keeper=True`` the per-file ``git blame`` call is
+    deferred — the diff command uses this for its first pass over every
+    changed file, then re-evaluates only the top-N with full signals.
+    Without this skip, scoring 1,927 files spends ~4-5 minutes inside
+    ``git blame`` even though > 95% of those files never reach the table
+    the user sees.
+    """
+    facts = gf.gather_for_diff(diff_facts, path, max_commits=max_commits)
+    return _from_facts(
+        path=path,
+        facts=facts,
+        repo_root=diff_facts.repo_root,
+        ref=None,
+        apply_suppressions=apply_suppressions,
+        skip_ghost_keeper=skip_ghost_keeper,
+    )
+
+
+def _from_facts(
+    *,
+    path: str,
+    facts: gf.RepoFacts,
+    repo_root: Path,
+    ref: str | None,
+    apply_suppressions: bool,
+    skip_ghost_keeper: bool = False,
+) -> RiskCard:
+    """Common tail of :func:`build` and :func:`build_from_diff_facts`."""
+    if skip_ghost_keeper:
+        signals = _all_signals_without_ghost_keeper(facts)
+    else:
+        signals = sig.all_signals(facts)
     if apply_suppressions:
         suppressions = supp.load(repo_root)
         signals = supp.filter_signals(signals, suppressions, path)
@@ -118,6 +174,40 @@ def build(
         most_recent_at=head.authored_at.isoformat() if head else None,
         as_of_sha=ref[:12] if ref else None,
     )
+
+
+# Detectors whose evidence is already in :class:`RepoFacts` (no git blame, no
+# follow-up shell-out). The ghost-keeper detector is the only one missing
+# here — it calls ``git blame`` per-file, which is the diff command's
+# remaining bottleneck after the log walk is shared.
+_FAST_DETECTORS = (
+    sig.detect_revert_chain,
+    sig.detect_incident_history,
+    sig.detect_invariant_quotes,
+    sig.detect_coupling,
+    sig.detect_high_churn,
+    sig.detect_silence,
+    sig.detect_newborn,
+)
+
+
+def _all_signals_without_ghost_keeper(facts: gf.RepoFacts) -> list[sig.Signal]:
+    """Re-implement the public ``all_signals`` ladder, minus ghost-keeper.
+
+    Mirrors the NEWBORN-suppression rule that ``signals.all_signals`` uses
+    so that an empty signal list collapses cleanly to NEWBORN-only when the
+    other detectors are all silent. If any other detector fires, NEWBORN is
+    dropped, exactly as the canonical helper does.
+    """
+    out: list[sig.Signal] = []
+    for detector in _FAST_DETECTORS:
+        signal = detector(facts)
+        if signal is not None:
+            out.append(signal)
+    if any(s.kind is not sig.SignalKind.NEWBORN for s in out):
+        out = [s for s in out if s.kind is not sig.SignalKind.NEWBORN]
+    out.sort(key=lambda s: (-s.severity, s.kind.value))
+    return out
 
 
 # ----- rendering ------------------------------------------------------------
@@ -247,4 +337,4 @@ def render_text(card: RiskCard) -> Group:
     return Group(*pieces)
 
 
-__all__ = ["RiskCard", "build", "render_text"]
+__all__ = ["RiskCard", "build", "build_from_diff_facts", "render_text"]
