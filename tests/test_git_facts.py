@@ -81,6 +81,76 @@ def test_find_incidents_matches_regression_keyword(repo) -> None:  # type: ignor
     assert len(gf.find_incidents(commits)) == 1
 
 
+def test_find_incidents_rejects_regression_test_subjects(repo) -> None:  # type: ignore[no-untyped-def]
+    """F3 — feature commits whose subject contains 'regression' descriptively
+    must not be flagged as incidents."""
+    benign_subjects = (
+        "Fixed #36883 -- Split monolithic aggregation regression tests.",
+        "Refs #31055 -- Augmented regression tests for database system checks.",
+        "docs: clarify regression nature of data loss bug",
+        "test: add regression suite for refund flow",
+        "feat: include 'no regression' badge on the dashboard",
+    )
+    for i, subject in enumerate(benign_subjects):
+        repo.commit(subject, {"a.txt": str(i)})
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert incidents == []
+
+
+def test_find_incidents_keeps_real_regressions(repo) -> None:  # type: ignore[no-untyped-def]
+    """A "regression in X" subject IS an incident — anchors the word as a
+    reference to an actual outage marker rather than as a test category."""
+    repo.commit("fix: regression in refund processing", {"a.txt": "1"})
+    repo.commit("hotfix: regression in idempotency tokens", {"a.txt": "2"})
+    repo.commit(
+        "Fixed: regression in admin filters",
+        {"a.txt": "3"},
+        body="See #4567 — admin filters used to render duplicates.",
+    )
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert len(incidents) == 3
+
+
+def test_find_incidents_fires_on_cve_subject(repo) -> None:  # type: ignore[no-untyped-def]
+    """A subject naming a CVE or GHSA always fires — the act of citing one
+    is unambiguous evidence."""
+    repo.commit(
+        "Fixed CVE-2026-6907 -- Prevented caching of requests when Vary header contains *.",
+        {"a.txt": "1"},
+    )
+    repo.commit(
+        "GHSA-abcd-1234-efgh: patch the auth bypass",
+        {"a.txt": "2"},
+    )
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert len(incidents) == 2
+
+
+def test_find_incidents_fires_on_revert_subjects(repo) -> None:  # type: ignore[no-untyped-def]
+    """``Reverted "..."`` and ``Reverts <sha>`` are explicit rollback markers."""
+    repo.commit('Reverted "feat: switch to async refund flow"', {"a.txt": "1"})
+    repo.commit("Reverts a3f4b2c1234567 (cherry-picked from 2026)", {"a.txt": "2"})
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert len(incidents) == 2
+
+
+def test_find_incidents_rejects_restore_pathlib_style(repo) -> None:  # type: ignore[no-untyped-def]
+    """Subjects like 'Restore support for using pathlib.Path' are descriptive
+    behaviour-restoration commits, not incidents — they used to falsely fire
+    on F3 when keyword matching was looser. Today they don't carry an
+    incident keyword at all and stay clean."""
+    repo.commit(
+        "Restore support for using pathlib.Path for static_folder.",
+        {"a.txt": "1"},
+    )
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    assert gf.find_incidents(commits) == []
+
+
 def test_find_incidents_ignores_passing_body_mentions(repo) -> None:  # type: ignore[no-untyped-def]
     """A body that mentions 'incident' as part of a feature description, with
     no issue id nearby, is not an incident commit."""

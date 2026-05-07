@@ -81,6 +81,39 @@ _BREAKING_CC_RE = re.compile(
 _ISSUE_ID_RE = re.compile(
     r"(?:#\d+|\b[A-Z][A-Z0-9_]+-\d+|\bSEV[- ]?\d\b|\bP[01]\b)",
 )
+# Security-advisory tokens fire as incidents on subject alone — the deliberate
+# act of citing one is unambiguous high-confidence evidence.
+_CVE_RE = re.compile(r"\bCVE-\d{4}-\d+\b")
+_GHSA_RE = re.compile(r"\bGHSA-[a-z0-9-]+\b", re.IGNORECASE)
+# Default ``git revert`` body subject ("Reverted ...") and the human variant
+# ("Reverts <sha>") are both unambiguous incident-class evidence on subject.
+_REVERTED_SUBJECT_RE = re.compile(r'^Reverted\s+"', re.IGNORECASE)
+_REVERTS_SUBJECT_RE = re.compile(r"\bReverts\s+[0-9a-f]{7,}\b", re.IGNORECASE)
+# Subject-level "regression" usage that is descriptive rather than incident:
+# "regression test(s)", "regression suite", "no regression", "regression nature".
+# These prevention/test-housekeeping phrases must NOT fire as incidents.
+_BENIGN_REGRESSION_RE = re.compile(
+    r"\b(?:regression\s+(?:tests?|suite|nature)|no\s+regression)\b",
+    re.IGNORECASE,
+)
+# Conversely, a subject using "regression" with a corroborating incident id
+# (``#1234``, ``INC-447``, …), or as part of an unambiguous incident phrase
+# like ``regression in <something>`` / ``Fixed: regression`` / ``fix the
+# regression``, IS an incident.  These are the patterns that distinguish
+# "split the regression-test files" (housekeeping) from "fix the refund
+# regression" (a real outage marker).
+_INCIDENT_REGRESSION_RE = re.compile(
+    # ``regression in <something>`` — "fix the refund regression in admin".
+    r"\bregression\s+in\b"
+    # ``fix the regression`` / ``fix a regression`` — explicit incident verb.
+    r"|\bfix(?:ed|es)?\s+(?:the\s+|a\s+)?regression\b"
+    # ``regression — …`` / ``regression: …`` — stated subject category.
+    r"|\bregression\s*[:—-]"
+    # ``Fixed: regression`` / ``Hotfix: regression`` — pre-colon incident verb
+    # explicitly framing the rest as the incident category itself.
+    r"|\b(?:fix(?:ed|es)?|hotfix|revert(?:ed)?)\s*:\s*regression\b",
+    re.IGNORECASE,
+)
 INVARIANT_TOKENS: tuple[str, ...] = (
     "do not",
     "don't",
@@ -726,26 +759,77 @@ def find_revert_pairs(commits: Sequence[Commit]) -> list[tuple[str, str]]:
     return pairs
 
 
+def _is_subject_incident(subject: str, body: str) -> bool:
+    """Determine whether a single commit's subject signals incident intent.
+
+    The trickiest case is ``regression``. The 0.4.0 classifier accepted any
+    subject that contained the word and so flagged routine bug fixes that
+    happened to mention "regression tests" or "regression nature" as
+    incidents. The new rule:
+
+    - ``regression`` in a subject fires only when corroborated:
+        * an issue / incident id on the same subject or anywhere in the body
+          (``#1234``, ``INC-447``, ``SEV-1``, …); OR
+        * a pre-marker that anchors the word as an incident reference,
+          such as ``regression in <something>`` / ``Fixed: regression`` /
+          ``fix the regression`` / ``regression — …``.
+    - The phrases ``regression test(s)``, ``regression suite``,
+      ``no regression``, ``regression nature`` never fire on their own.
+    - Subjects citing a security advisory (``CVE-…`` / ``GHSA-…``) always
+      fire — the act of naming an advisory is unambiguous high-confidence.
+    - The default ``git revert`` body subject (``Reverted "…"``) and the
+      human variant (``Reverts <sha>``) always fire — both are explicit
+      rollback markers.
+    - Other incident keywords (``hotfix``, ``outage``, ``rollback``, …)
+      keep their existing subject-level acceptance.
+    """
+    if _CVE_RE.search(subject) or _GHSA_RE.search(subject):
+        return True
+    if _REVERTED_SUBJECT_RE.search(subject) or _REVERTS_SUBJECT_RE.search(subject):
+        return True
+    if _BREAKING_CC_RE.search(subject):
+        return True
+    # Regression demands corroboration: either it appears as part of a
+    # high-confidence phrase, or an issue/incident id is present.
+    has_regression = bool(re.search(r"\bregression\b", subject, re.IGNORECASE))
+    if has_regression:
+        if _BENIGN_REGRESSION_RE.search(subject):
+            return False
+        if _INCIDENT_REGRESSION_RE.search(subject):
+            return True
+        if _ISSUE_ID_RE.search(subject) or _ISSUE_ID_RE.search(body):
+            return True
+        # Strip the word and check whether any other incident keyword carries
+        # the subject — a "rollback regression" should still fire on
+        # "rollback" alone.
+        without_regression = re.sub(r"\bregression\b", "", subject, flags=re.IGNORECASE)
+        return bool(_INCIDENT_RE.search(without_regression))
+    return bool(_INCIDENT_RE.search(subject))
+
+
 def find_incidents(commits: Sequence[Commit]) -> list[Commit]:
     """Return commits whose evidence-level signals incident-flavored intent.
 
     Acceptance ladder (highest to lowest confidence):
-      1. Subject contains an incident keyword.  A commit's subject is its
-         declared purpose, so a subject hit is treated as ground truth.
-      2. Subject carries the Conventional Commits breaking marker
+      1. Subject cites a security advisory (``CVE-…`` / ``GHSA-…``) — fires
+         on subject alone.
+      2. Subject is a default ``git revert`` body (``Reverted "…"``) or a
+         human revert pointer (``Reverts <sha>``) — fires on subject alone.
+      3. Subject carries the Conventional Commits breaking marker
          (``feat!:`` / ``fix!:`` / …).
-      3. Body carries the structured ``BREAKING CHANGE:`` footer.  This is a
-         deliberate, anchored marker, not free-form prose.
-      4. Body contains an incident keyword AND an issue / incident
-         identifier nearby (``#1234``, ``INC-447``, ``SEV-1``, ``P0``).
-         This filters out passing mentions in prose like "feat: add
-         incident-aware logging" where the keyword describes a *feature*.
+      4. Subject contains an incident keyword that is NOT a benign
+         "regression test/suite/nature" phrase. ``regression`` requires
+         either an issue id (on subject or body) or a pre-marker that
+         anchors it as an incident reference.
+      5. Body carries the structured ``BREAKING CHANGE:`` footer.
+      6. Body contains an incident keyword AND an issue / incident
+         identifier nearby. Filters out passing mentions in prose.
 
     A bare body keyword with no corroborating ID does NOT fire.
     """
     out: list[Commit] = []
     for c in commits:
-        if _INCIDENT_RE.search(c.subject) or _BREAKING_CC_RE.search(c.subject):
+        if _is_subject_incident(c.subject, c.body):
             out.append(c)
             continue
         if _BREAKING_FOOTER_RE.search(c.body):
