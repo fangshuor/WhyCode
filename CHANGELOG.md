@@ -4,6 +4,76 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-05-07
+
+### Fixed — quality and CI-safety pass against three real OSS repos
+
+A read-only field test against `pallets/flask`, `psf/requests`, and
+`django/django` (5,500 / 6,500 / 10,000 commits) caught seven issues
+that hurt the headline experience on real repositories. This release
+fixes all of them.
+
+- **F1** — Tolerate pathological tz offsets in commit timestamps.
+  A 2011 commit on `psf/requests` records its tz offset as `+51800`
+  in the underlying object, which `git --pretty=%aI` emits as
+  `+518:00` and which `datetime.fromisoformat` rejects. That single
+  record poisoned `_parse_log_records` and through it every command
+  that walks history (`tour`, `highlights`, `scan`, `why`). The new
+  parser repairs `+518:00` → `+05:18` and `+51800` → `+05:18`; on
+  irrecoverable failure it returns a tz-aware Unix-epoch sentinel
+  so the walk continues. A single per-session stderr warning is
+  emitted; no per-line spam, no network.
+- **F11 / F12** — Force non-zero exit on uncaught command failures.
+  `whycode tour` and `whycode scan` rendered a Rich traceback to
+  stderr but exited with status 0, falsifying CI signals (a
+  `whycode diff --fail-on history` step that had crashed could be
+  reported as green). Each command body now propagates unhandled
+  exceptions as `typer.Exit(2)`; the existing rich traceback
+  rendering is preserved.
+- **F2** — Filter pasted tool output and cap per-commit invariants.
+  On django, 15 of the top 20 "invariants stated by past authors"
+  were quoted spell-check warnings from a single commit. Lines
+  that look like `WARNING: …`, `path/to/file:line:`, or are
+  preceded by a `> ` block-quote are now dropped at the source,
+  and each commit body contributes at most two invariants — real
+  authors rarely state more than two crisp constraints in one
+  message; anything beyond is almost certainly a paste.
+- **F3** — Tighten the incident classifier; add CVE / GHSA / revert
+  recognition. `regression` in a subject now requires either a
+  corroborating issue id or an anchored incident phrase (e.g.
+  `regression in <something>`, `Fixed: regression`); the phrases
+  `regression test(s)`, `regression suite`, `no regression`,
+  `regression nature` no longer fire. Subjects citing
+  `CVE-YYYY-NNN` or `GHSA-…` always fire — naming an advisory is
+  unambiguous evidence. Default `git revert` body subjects
+  (`Reverted "…"`) and the human variant (`Reverts <sha>`) are
+  added to the high-confidence incident set.
+- **F8** — Extend the default ignore list to suppress high-touch
+  metadata. The django top-10 risk list was dominated by `AUTHORS`,
+  `.github/workflows/*.yml`, locale `.po` files and `.gitignore`,
+  with no application code at all reaching the top 10. The default
+  ignore list now covers `.github/**`, `.gitlab/**`, `.circleci/**`,
+  `AUTHORS*`, `LICENSE*`, `COPYING*`, `NOTICE*`, `*.po` / `*.mo` /
+  `*.pot`, `setup.{py,cfg}`, `MANIFEST.in`, `.editorconfig`,
+  `.pre-commit-config.yaml`, `.readthedocs.{yaml,yml}`, `.flake8`,
+  `tox.ini`, `pytest.ini`, `Makefile`, and release-notes-shaped
+  `*.txt` paths only (a random `requirements.txt` stays visible).
+- **F10** — Apply the scan ignore list to coupling. The per-file
+  coupling signal used to surface `CHANGELOG`, `.github` workflows
+  and other metadata as a file's "tight coupling"; the same filter
+  that powers `whycode scan` now runs inside `signals.detect_coupling`
+  so every consumer (`why`, `diff`, `scan`, the MCP server)
+  inherits it for free.
+- **F14** — Sort `timeline` rows by date ascending before render.
+  Out-of-order authored_at values from cherry-picks / rebases used
+  to produce non-monotonic table rows that were easy to misread.
+- **F16** — Split `tour`'s "Decisions and incidents" cell into two
+  subheads — `Stated invariants` (yellow) and `Recent incidents`
+  (red) — matching the layout `highlights` already uses.
+
+22 new tests cover the regressions; 182 tests passing total.
+Privacy contract is unchanged. ruff + mypy strict clean.
+
 ## [0.4.0] — 2026-05-06
 
 ### Performance — local SQLite cache for git facts
