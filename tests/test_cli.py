@@ -639,6 +639,52 @@ def test_tour_outside_repo_errors(tmp_path) -> None:  # type: ignore[no-untyped-
     assert result.exit_code != 0
 
 
+def test_outside_repo_every_command_exits_non_zero(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """F11/F12 — a path outside any git repo printed ``error:`` but exited 0,
+    falsifying CI signals. Every command that walks the repo must propagate
+    the failure as a non-zero exit, never status 0."""
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        for argv in (
+            ["tour"],
+            ["scan", "--top", "1"],
+            ["highlights"],
+            ["why", "anything.txt"],
+            ["diff"],
+            ["timeline", "anything.txt"],
+            ["honest", "anything.txt"],
+            ["show", "deadbeef"],
+            ["init"],
+        ):
+            result = runner.invoke(app, argv, catch_exceptions=False)
+            assert result.exit_code != 0, f"{argv} exited 0 outside a repo"
+    finally:
+        os.chdir(cwd)
+
+
+def test_uncaught_exception_in_command_body_exits_non_zero(repo, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """F11 — a command body that raises an unexpected exception used to
+    render a Rich traceback to stderr but exit with status 0. The
+    ``_propagate_failures`` wrapper now forces ``typer.Exit(2)`` so CI
+    integrations can tell the run silently failed."""
+    repo.commit("init", {"a.txt": "1"})
+    # Force ``all_commits`` to blow up partway through tour's body.
+    from whycode import git_facts as gf
+
+    def _boom(*_a: object, **_kw: object) -> object:
+        raise RuntimeError("simulated mid-walk failure")
+
+    monkeypatch.setattr(gf, "all_commits", _boom)
+    cwd = os.getcwd()
+    os.chdir(repo.root)
+    try:
+        result = runner.invoke(app, ["tour"], catch_exceptions=False)
+    finally:
+        os.chdir(cwd)
+    assert result.exit_code != 0
+
+
 def test_cache_stats_before_any_run_reports_no_cache(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.txt": "1"})
     result = _invoke(repo.root, "cache", "stats")
