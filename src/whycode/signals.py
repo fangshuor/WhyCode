@@ -31,6 +31,29 @@ class SignalKind(StrEnum):
 
 
 @dataclass(frozen=True)
+class Explanation:
+    """Structured trace of why a single signal fired.
+
+    Each detector that produces a :class:`Signal` populates this with the
+    concrete rule branch that matched, the literal evidence (token, count,
+    threshold) the rule looked at, and a stable ``file:function`` reference
+    so a curious reader can open the source and audit the ladder.
+    """
+
+    rule: str
+    """Short stable identifier, e.g. ``"incident_subject_keyword"``."""
+
+    why_it_fired: str
+    """One-sentence prose describing the matching condition."""
+
+    evidence: tuple[str, ...] = field(default_factory=tuple)
+    """Literal matched substrings, threshold values, or counts."""
+
+    source_ref: str = ""
+    """``path:function`` pointer into the project source for the rule."""
+
+
+@dataclass(frozen=True)
 class Signal:
     kind: SignalKind
     severity: int  # 1..5; 5 is loudest.
@@ -38,6 +61,9 @@ class Signal:
     detail: str
     evidence: tuple[str, ...] = field(default_factory=tuple)
     """Commit SHAs (or other identifiers) backing this signal."""
+
+    explanation: Explanation | None = None
+    """Per-rule trace populated when ``whycode why --explain`` is on."""
 
 
 # ----- thresholds -----------------------------------------------------------
@@ -388,6 +414,7 @@ def all_signals(facts: RepoFacts) -> list[Signal]:
 
 
 __all__ = [
+    "Explanation",
     "Signal",
     "SignalKind",
     "all_signals",
