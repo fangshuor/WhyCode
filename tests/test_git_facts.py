@@ -81,6 +81,76 @@ def test_find_incidents_matches_regression_keyword(repo) -> None:  # type: ignor
     assert len(gf.find_incidents(commits)) == 1
 
 
+def test_find_incidents_rejects_regression_test_subjects(repo) -> None:  # type: ignore[no-untyped-def]
+    """F3 — feature commits whose subject contains 'regression' descriptively
+    must not be flagged as incidents."""
+    benign_subjects = (
+        "Fixed #36883 -- Split monolithic aggregation regression tests.",
+        "Refs #31055 -- Augmented regression tests for database system checks.",
+        "docs: clarify regression nature of data loss bug",
+        "test: add regression suite for refund flow",
+        "feat: include 'no regression' badge on the dashboard",
+    )
+    for i, subject in enumerate(benign_subjects):
+        repo.commit(subject, {"a.txt": str(i)})
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert incidents == []
+
+
+def test_find_incidents_keeps_real_regressions(repo) -> None:  # type: ignore[no-untyped-def]
+    """A "regression in X" subject IS an incident — anchors the word as a
+    reference to an actual outage marker rather than as a test category."""
+    repo.commit("fix: regression in refund processing", {"a.txt": "1"})
+    repo.commit("hotfix: regression in idempotency tokens", {"a.txt": "2"})
+    repo.commit(
+        "Fixed: regression in admin filters",
+        {"a.txt": "3"},
+        body="See #4567 — admin filters used to render duplicates.",
+    )
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert len(incidents) == 3
+
+
+def test_find_incidents_fires_on_cve_subject(repo) -> None:  # type: ignore[no-untyped-def]
+    """A subject naming a CVE or GHSA always fires — the act of citing one
+    is unambiguous evidence."""
+    repo.commit(
+        "Fixed CVE-2026-6907 -- Prevented caching of requests when Vary header contains *.",
+        {"a.txt": "1"},
+    )
+    repo.commit(
+        "GHSA-abcd-1234-efgh: patch the auth bypass",
+        {"a.txt": "2"},
+    )
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert len(incidents) == 2
+
+
+def test_find_incidents_fires_on_revert_subjects(repo) -> None:  # type: ignore[no-untyped-def]
+    """``Reverted "..."`` and ``Reverts <sha>`` are explicit rollback markers."""
+    repo.commit('Reverted "feat: switch to async refund flow"', {"a.txt": "1"})
+    repo.commit("Reverts a3f4b2c1234567 (cherry-picked from 2026)", {"a.txt": "2"})
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    incidents = gf.find_incidents(commits)
+    assert len(incidents) == 2
+
+
+def test_find_incidents_rejects_restore_pathlib_style(repo) -> None:  # type: ignore[no-untyped-def]
+    """Subjects like 'Restore support for using pathlib.Path' are descriptive
+    behaviour-restoration commits, not incidents — they used to falsely fire
+    on F3 when keyword matching was looser. Today they don't carry an
+    incident keyword at all and stay clean."""
+    repo.commit(
+        "Restore support for using pathlib.Path for static_folder.",
+        {"a.txt": "1"},
+    )
+    commits = gf.commits_for_path(repo.root, "a.txt")
+    assert gf.find_incidents(commits) == []
+
+
 def test_find_incidents_ignores_passing_body_mentions(repo) -> None:  # type: ignore[no-untyped-def]
     """A body that mentions 'incident' as part of a feature description, with
     no issue id nearby, is not an incident commit."""
@@ -135,6 +205,70 @@ def test_extract_invariant_quotes_ignores_quoted_tokens(repo) -> None:  # type: 
     assert not any('"do not"' in line for line in lines)
 
 
+def test_extract_invariant_quotes_caps_a_single_paste_at_two(repo) -> None:  # type: ignore[no-untyped-def]
+    """F2 — a spell-check commit on django used to supply 12 ALLCAPS warnings
+    that all flowed through as 'invariants', dominating the highlights view.
+
+    The per-commit cap of 2 keeps the loudest noise commit from drowning
+    out genuine invariants from other commits.
+    """
+    body = "\n".join(
+        f"WARNING: spell check found misspelling number {i}" for i in range(12)
+    )
+    repo.commit("docs: fix spelling typos", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    # All twelve are tool-output ALLCAPS lines — they're filtered before the
+    # cap even applies. Total quotes from this commit: 0.
+    assert len(quotes) == 0
+
+
+def test_extract_invariant_quotes_drops_path_line_prefixed_lines(repo) -> None:  # type: ignore[no-untyped-def]
+    """A ``tools/spelling.py:50:`` linter prefix is unmistakably tool output."""
+    body = (
+        "tools/spelling.py:50: warning: misspelled 'recieve'\n"
+        "tools/spelling.py:51: warning: misspelled 'occured'\n"
+        "tools/spelling.py:52: warning: misspelled 'seperate'"
+    )
+    repo.commit("docs: fix typos", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert len(quotes) == 0
+
+
+def test_extract_invariant_quotes_keeps_real_invariant(repo) -> None:  # type: ignore[no-untyped-def]
+    """A genuine author-stated invariant is still surfaced as one entry."""
+    body = (
+        "Refactored the refund flow.\n"
+        "Do not switch to async — v1 clients break."
+    )
+    repo.commit("compat: keep sync", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert len(quotes) == 1
+    assert "Do not switch to async" in quotes[0][1]
+
+
+def test_extract_invariant_quotes_caps_at_two_real_invariants(repo) -> None:  # type: ignore[no-untyped-def]
+    """When a commit body has 5 genuine invariants, only the first 2 surface."""
+    body = "\n".join(
+        [
+            "Do not call this from threads.",
+            "Do not switch to async.",
+            "Do not bypass the rate limiter.",
+            "Do not log the auth header.",
+            "Do not delete the legacy endpoint.",
+        ]
+    )
+    repo.commit("compat: hardening", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert len(quotes) == 2
+    # First two are preserved (most informative-looking ranks).
+    assert "Do not call this from threads" in quotes[0][1]
+    assert "Do not switch to async" in quotes[1][1]
+
+
 def test_co_changes_excludes_target_file(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.txt": "1", "b.txt": "1", "c.txt": "1"})
     repo.commit("change a and b", {"a.txt": "2", "b.txt": "2"})
@@ -186,3 +320,75 @@ def test_line_ownership_returns_email_to_line_count(repo) -> None:  # type: igno
 def test_line_ownership_empty_for_missing_file(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.txt": "1"})
     assert gf.line_ownership(repo.root, "no-such-file.py") == {}
+
+
+def test_parse_log_records_tolerates_pathological_timezone() -> None:
+    """A 2011 commit on psf/requests has tz offset ``+518:00``.
+
+    ``datetime.fromisoformat`` rejects that. The repair must normalise it
+    to ``+05:18`` so a single bad record cannot poison the whole walk.
+    """
+    raw = (
+        "abc1234"
+        + gf.UNIT_SEP
+        + "Author"
+        + gf.UNIT_SEP
+        + "a@b"
+        + gf.UNIT_SEP
+        + "2011-09-08T02:38:50+518:00"
+        + gf.UNIT_SEP
+        + "subject"
+        + gf.UNIT_SEP
+        + "body"
+        + gf.RECORD_SEP
+    )
+    # Must not raise.
+    commits = gf._parse_log_records(raw)
+    assert len(commits) == 1
+    assert commits[0].sha == "abc1234"
+    # The repaired offset is +05:18 — i.e. tz info attached.
+    assert commits[0].authored_at.utcoffset() is not None
+
+
+def test_parse_log_records_tolerates_compact_offset_form() -> None:
+    """``+51800`` (no colon) — the underlying object form — also normalises."""
+    raw = (
+        "deadbee"
+        + gf.UNIT_SEP
+        + "Author"
+        + gf.UNIT_SEP
+        + "a@b"
+        + gf.UNIT_SEP
+        + "2011-09-08T02:38:50+51800"
+        + gf.UNIT_SEP
+        + "subject"
+        + gf.UNIT_SEP
+        + "body"
+        + gf.RECORD_SEP
+    )
+    commits = gf._parse_log_records(raw)
+    assert len(commits) == 1
+    assert commits[0].authored_at.utcoffset() is not None
+
+
+def test_parse_log_records_irrecoverable_falls_back_to_epoch() -> None:
+    """A truly unrepairable timestamp falls back to the epoch sentinel
+    so the walk continues — never crashes the analysis."""
+    raw = (
+        "feedfac"
+        + gf.UNIT_SEP
+        + "Author"
+        + gf.UNIT_SEP
+        + "a@b"
+        + gf.UNIT_SEP
+        + "totally not a date"
+        + gf.UNIT_SEP
+        + "subject"
+        + gf.UNIT_SEP
+        + "body"
+        + gf.RECORD_SEP
+    )
+    commits = gf._parse_log_records(raw)
+    assert len(commits) == 1
+    # Still a tz-aware datetime so callers can compare it.
+    assert commits[0].authored_at.tzinfo is not None

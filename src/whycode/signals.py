@@ -13,6 +13,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from whycode import git_facts as gf
+from whycode import ignore as ign
 
 if TYPE_CHECKING:
     from whycode.git_facts import RepoFacts
@@ -148,7 +149,23 @@ def detect_high_churn(facts: RepoFacts) -> Signal | None:
 
 
 def detect_coupling(facts: RepoFacts) -> Signal | None:
-    paired = [(p, n) for p, n in facts.co_changed_files.items() if n >= COUPLING_MIN_COCHANGES]
+    """Files that change together with the target file, ranked by frequency.
+
+    Co-change candidates are filtered through the same ignore list that
+    powers ``whycode scan`` (built-in defaults plus an optional repo-local
+    ``.whycodeignore``). Without this filter, a per-file coupling signal
+    would surface ``CHANGELOG``, ``.github/workflows/*.yml``, ``AUTHORS``
+    and similar high-touch metadata as the file's "tight coupling" — the
+    field-test report flagged ``flask/app.py``'s top co-changers as 60%
+    metadata, leaving only two genuinely informative entries. Applying
+    the same filter here keeps the most-shown signal honest.
+    """
+    patterns = ign.effective_patterns(facts.repo_root)
+    paired = [
+        (p, n)
+        for p, n in facts.co_changed_files.items()
+        if n >= COUPLING_MIN_COCHANGES and not ign.is_ignored(p, patterns)
+    ]
     if not paired:
         return None
     paired.sort(key=lambda x: (-x[1], x[0]))

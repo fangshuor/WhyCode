@@ -116,6 +116,64 @@ def test_coupling_fires_when_files_co_change_often(repo, days_ago) -> None:  # t
     assert "b.py" in signal.detail
 
 
+def test_coupling_filters_ignored_paths(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """F10 — co-change candidates that scan would hide must not appear in
+    the per-file coupling signal either. ``CHANGELOG.md`` is in the default
+    ignore list; it co-changes 4x with ``src/foo.py`` here but must not
+    surface in the headline.
+    """
+    repo.commit(
+        "init",
+        {"src/foo.py": "1", "CHANGELOG.md": "v1", "src/bar.py": "1"},
+        when=days_ago(60),
+    )
+    repo.commit(
+        "change",
+        {"src/foo.py": "2", "CHANGELOG.md": "v2", "src/bar.py": "2"},
+        when=days_ago(50),
+    )
+    repo.commit(
+        "change",
+        {"src/foo.py": "3", "CHANGELOG.md": "v3", "src/bar.py": "3"},
+        when=days_ago(40),
+    )
+    repo.commit(
+        "change",
+        {"src/foo.py": "4", "CHANGELOG.md": "v4", "src/bar.py": "4"},
+        when=days_ago(30),
+    )
+    facts = _facts_for(repo, "src/foo.py")
+    signal = sig.detect_coupling(facts)
+    assert signal is not None
+    assert "src/bar.py" in signal.detail
+    # CHANGELOG.md must not appear in the headline / detail / evidence.
+    assert "CHANGELOG" not in signal.detail
+    assert "CHANGELOG" not in " ".join(signal.evidence)
+
+
+def test_coupling_returns_none_when_only_ignored_paths_co_change(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A file whose only co-changers are filtered must produce no signal —
+    not a "tightly coupled to 0 files" surface."""
+    repo.commit(
+        "init",
+        {"src/foo.py": "1", "CHANGELOG.md": "v1", "AUTHORS": "alice"},
+        when=days_ago(60),
+    )
+    repo.commit(
+        "change",
+        {"src/foo.py": "2", "CHANGELOG.md": "v2", "AUTHORS": "bob"},
+        when=days_ago(50),
+    )
+    repo.commit(
+        "change",
+        {"src/foo.py": "3", "CHANGELOG.md": "v3", "AUTHORS": "carol"},
+        when=days_ago(40),
+    )
+    facts = _facts_for(repo, "src/foo.py")
+    signal = sig.detect_coupling(facts)
+    assert signal is None
+
+
 def test_high_churn_fires(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     for i in range(7):
         repo.commit(f"tweak {i}", {"hot.py": str(i)}, when=days_ago(80 - i * 5))
@@ -236,16 +294,20 @@ def test_first_sentence_splits_at_real_boundary() -> None:
 
 
 def test_invariant_signal_caps_at_three_bullets(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
-    body = "\n".join(
-        [
-            "Do not switch to async — v1 clients break.",
-            "Important: keep the legacy header in place.",
-            "Warning: idempotency token must be unique.",
-            "Workaround for upstream bug #5: noop when input is empty.",
-            "Tradeoff: we accept ~10ms latency to keep correctness.",
-        ]
-    )
-    repo.commit("compat: many constraints", {"x.py": "1"}, body=body, when=days_ago(20))
+    # Spread the five invariants across five separate commits so the F2
+    # per-commit cap of two does not apply (it only filters within a single
+    # commit body — commits each contribute up to two genuine constraints).
+    bodies = [
+        "Do not switch to async — v1 clients break.",
+        "Important: keep the legacy header in place.",
+        "Warning: idempotency token must be unique.",
+        "Workaround for upstream bug #5: noop when input is empty.",
+        "Tradeoff: we accept ~10ms latency to keep correctness.",
+    ]
+    for i, body in enumerate(bodies):
+        repo.commit(
+            f"compat: constraint {i}", {"x.py": str(i)}, body=body, when=days_ago(20 + i)
+        )
     facts = _facts_for(repo, "x.py")
     signal = sig.detect_invariant_quotes(facts)
     assert signal is not None

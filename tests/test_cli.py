@@ -310,6 +310,20 @@ def test_timeline_lists_sample_points(repo, days_ago) -> None:  # type: ignore[n
     assert "incident" in out.lower()
 
 
+def test_timeline_rows_sorted_by_date_ascending(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """F14 — table rows must be sorted by date ascending before rendering."""
+    repo.commit("init", {"a.py": "1"}, when=days_ago(400))
+    repo.commit("change", {"a.py": "2"}, when=days_ago(300))
+    repo.commit("change", {"a.py": "3"}, when=days_ago(200))
+    repo.commit("change", {"a.py": "4"}, when=days_ago(100))
+    repo.commit("change", {"a.py": "5"}, when=days_ago(20))
+    result = _invoke(repo.root, "timeline", "a.py", "--samples", "10", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    dates = [s["date"] for s in data["samples"]]
+    assert dates == sorted(dates), f"timeline rows not in ascending date order: {dates}"
+
+
 def test_timeline_json_output(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.py": "1"}, when=days_ago(60))
     repo.commit("update", {"a.py": "2"}, when=days_ago(30))
@@ -610,7 +624,10 @@ def test_tour_runs_and_emits_all_sections(repo, days_ago) -> None:  # type: igno
     assert result.exit_code == 0
     out = result.output
     assert "Welcome to WhyCode" in out
-    assert "Decisions and incidents" in out
+    # F16 — invariants and incidents are rendered under separate subheads
+    # so a reader can tell prose from real incident commits at a glance.
+    assert "Stated invariants" in out
+    assert "Recent incidents" in out
     assert "Do not switch to async" in out
     assert "hotfix: refund regression" in out
     assert "Wire WhyCode into your AI editor" in out
@@ -632,6 +649,52 @@ def test_tour_quiet_repo_explains_why(repo) -> None:  # type: ignore[no-untyped-
 def test_tour_outside_repo_errors(tmp_path) -> None:  # type: ignore[no-untyped-def]
     cwd = os.getcwd()
     os.chdir(tmp_path)
+    try:
+        result = runner.invoke(app, ["tour"], catch_exceptions=False)
+    finally:
+        os.chdir(cwd)
+    assert result.exit_code != 0
+
+
+def test_outside_repo_every_command_exits_non_zero(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """F11/F12 — a path outside any git repo printed ``error:`` but exited 0,
+    falsifying CI signals. Every command that walks the repo must propagate
+    the failure as a non-zero exit, never status 0."""
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        for argv in (
+            ["tour"],
+            ["scan", "--top", "1"],
+            ["highlights"],
+            ["why", "anything.txt"],
+            ["diff"],
+            ["timeline", "anything.txt"],
+            ["honest", "anything.txt"],
+            ["show", "deadbeef"],
+            ["init"],
+        ):
+            result = runner.invoke(app, argv, catch_exceptions=False)
+            assert result.exit_code != 0, f"{argv} exited 0 outside a repo"
+    finally:
+        os.chdir(cwd)
+
+
+def test_uncaught_exception_in_command_body_exits_non_zero(repo, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """F11 — a command body that raises an unexpected exception used to
+    render a Rich traceback to stderr but exit with status 0. The
+    ``_propagate_failures`` wrapper now forces ``typer.Exit(2)`` so CI
+    integrations can tell the run silently failed."""
+    repo.commit("init", {"a.txt": "1"})
+    # Force ``all_commits`` to blow up partway through tour's body.
+    from whycode import git_facts as gf
+
+    def _boom(*_a: object, **_kw: object) -> object:
+        raise RuntimeError("simulated mid-walk failure")
+
+    monkeypatch.setattr(gf, "all_commits", _boom)
+    cwd = os.getcwd()
+    os.chdir(repo.root)
     try:
         result = runner.invoke(app, ["tour"], catch_exceptions=False)
     finally:

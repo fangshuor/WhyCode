@@ -20,10 +20,12 @@ Commands
 
 from __future__ import annotations
 
+import functools
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import typer
 from rich.console import Console
@@ -115,6 +117,37 @@ def _require_tracked(path_arg: str) -> tuple[Path, str]:
     return repo_root, rel
 
 
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _propagate_failures(func: _F) -> _F:
+    """Convert any uncaught exception into ``typer.Exit(2)``.
+
+    A read-only field test against psf/requests caught a bug where a single
+    bad-timezone commit raised ``ValueError`` deep inside ``_parse_log_records``;
+    Rich rendered the traceback to stderr, but the process exited with status
+    0. CI integrations could not tell that the run had silently failed
+    (a ``whycode diff --fail-on history`` step was reported as green even
+    though it had crashed). We wrap each command body so any unhandled
+    exception leaves the existing rich traceback rendering in place but
+    forces a non-zero exit code (``2`` for general failure). ``typer.Exit``
+    and ``KeyboardInterrupt`` propagate untouched so explicit exit-code
+    paths and Ctrl-C still behave normally.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except (typer.Exit, typer.Abort, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            err.print_exception(show_locals=False)
+            raise typer.Exit(2) from exc
+
+    return wrapper  # type: ignore[return-value]
+
+
 # --- shared: band threshold parsing ----------------------------------------
 
 _BAND_THRESHOLDS_BY_KEY: dict[str, int] = {
@@ -148,6 +181,7 @@ def _print_brief(card: rc.RiskCard) -> None:
 
 
 @app.command()
+@_propagate_failures
 def why(
     path: str = typer.Argument(..., help="File path to inspect."),
     json_out: bool = typer.Option(
@@ -317,6 +351,7 @@ def _resolve_base_ref(repo_root: Path, requested: str | None) -> str:
 
 
 @app.command()
+@_propagate_failures
 def diff(
     base: str | None = typer.Option(
         None, "--base", help="Base ref (default: origin/main → main → HEAD~1)."
@@ -482,6 +517,7 @@ def diff(
 
 
 @app.command()
+@_propagate_failures
 def highlights(
     invariants: int = typer.Option(
         5, "--invariants", help="How many invariant lines to surface."
@@ -636,6 +672,7 @@ def _sample_indices(total: int, max_samples: int) -> list[int]:
 
 
 @app.command()
+@_propagate_failures
 def timeline(
     path: str = typer.Argument(..., help="File path to inspect."),
     samples: int = typer.Option(
@@ -677,6 +714,12 @@ def timeline(
                     top,
                 )
             )
+    # Field-test report F14: ``timeline`` used to render rows in whatever
+    # non-monotonic order ``_sample_indices`` produced (uniform-across-index
+    # selection on a list whose ordering is git's parent traversal).  Sort
+    # by date ascending before rendering so a reader can scan left-to-right
+    # without misreading the trajectory.
+    rows.sort(key=lambda r: r[0])
 
     if json_out:
         console.print_json(
@@ -714,6 +757,7 @@ def timeline(
 
 
 @app.command()
+@_propagate_failures
 def scan(
     top: int = typer.Option(10, "--top", help="How many files to list."),
     sample: int = typer.Option(
@@ -811,6 +855,7 @@ def scan(
 
 
 @app.command()
+@_propagate_failures
 def honest(
     path: str = typer.Argument(..., help="File path to inspect."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of prose."),
@@ -874,6 +919,7 @@ def honest(
 
 
 @app.command()
+@_propagate_failures
 def show(
     sha: str = typer.Argument(..., help="Commit SHA (full or short) to inspect."),
     repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
@@ -981,6 +1027,7 @@ _MCP_SNIPPET = '''    {
 
 
 @app.command()
+@_propagate_failures
 def tour(
     repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
     no_cache: bool = typer.Option(
@@ -1029,18 +1076,34 @@ def tour(
         incidents_top = gf.find_incidents(commits)[:3]
 
         if invariants_top or incidents_top:
-            console.print("[bold yellow]Decisions and incidents[/bold yellow]")
-            for line, c in invariants_top:
-                console.print(f"  [italic]{line}[/italic]")
+            # Field-test report F16: the original tour rendered both classes
+            # under one ``Decisions and incidents`` header, so a parenthetical
+            # invariant prose line was visually indistinguishable from a real
+            # incident commit. Render two subheads matching the layout
+            # ``highlights`` already uses.
+            if invariants_top:
                 console.print(
-                    f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+                    f"[bold yellow]Stated invariants[/bold yellow] "
+                    f"[dim]({len(invariants_top)} most recent)[/dim]"
                 )
-            for c in incidents_top:
-                subj = c.subject if len(c.subject) <= 70 else c.subject[:69] + "…"
-                console.print(f"  [red]{subj}[/red]")
+                for line, c in invariants_top:
+                    console.print(f"  [italic]{line}[/italic]")
+                    console.print(
+                        f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  "
+                        f"{c.author_name}[/dim]\n"
+                    )
+            if incidents_top:
                 console.print(
-                    f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  {c.author_name}[/dim]\n"
+                    f"[bold red]Recent incidents[/bold red] "
+                    f"[dim]({len(incidents_top)} most recent)[/dim]"
                 )
+                for c in incidents_top:
+                    subj = c.subject if len(c.subject) <= 70 else c.subject[:69] + "…"
+                    console.print(f"  [red]{subj}[/red]")
+                    console.print(
+                        f"  [dim]{c.sha[:7]}  {c.authored_at.date()}  "
+                        f"{c.author_name}[/dim]\n"
+                    )
         else:
             console.print(
                 "[dim]No headline decisions or incidents in recent history.[/dim]"
@@ -1113,6 +1176,7 @@ def tour(
 
 
 @app.command()
+@_propagate_failures
 def init(
     force: bool = typer.Option(
         False, "--force", "-f", help="Overwrite existing files instead of skipping."

@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,17 @@ if TYPE_CHECKING:
 
 UNIT_SEP = "\x1f"
 RECORD_SEP = "\x1e"
+
+# Per-process record of commits whose authored timestamp could not be parsed
+# even after defensive normalisation. We surface these once per session via
+# a single stderr line so a single bad record does not spam a per-line warning
+# — never on every read, never to a network.
+_UNPARSEABLE_TIMESTAMPS: set[str] = set()
+_BAD_TZ_WARNING_EMITTED = False
+# The Unix epoch as a tz-aware UTC datetime; used as a safe fallback when a
+# commit's authored_at is irrecoverably malformed. Picked over datetime.min
+# because callers expect a tz-aware value (signal age math compares to UTC).
+_EPOCH_FALLBACK = datetime.fromtimestamp(0, UTC)
 
 # A commit subject/body containing one of these markers is treated as evidence
 # that the original author flagged something worth carrying forward.
@@ -68,6 +80,39 @@ _BREAKING_CC_RE = re.compile(
 # Used to raise body matches above the "passing mention in prose" floor.
 _ISSUE_ID_RE = re.compile(
     r"(?:#\d+|\b[A-Z][A-Z0-9_]+-\d+|\bSEV[- ]?\d\b|\bP[01]\b)",
+)
+# Security-advisory tokens fire as incidents on subject alone — the deliberate
+# act of citing one is unambiguous high-confidence evidence.
+_CVE_RE = re.compile(r"\bCVE-\d{4}-\d+\b")
+_GHSA_RE = re.compile(r"\bGHSA-[a-z0-9-]+\b", re.IGNORECASE)
+# Default ``git revert`` body subject ("Reverted ...") and the human variant
+# ("Reverts <sha>") are both unambiguous incident-class evidence on subject.
+_REVERTED_SUBJECT_RE = re.compile(r'^Reverted\s+"', re.IGNORECASE)
+_REVERTS_SUBJECT_RE = re.compile(r"\bReverts\s+[0-9a-f]{7,}\b", re.IGNORECASE)
+# Subject-level "regression" usage that is descriptive rather than incident:
+# "regression test(s)", "regression suite", "no regression", "regression nature".
+# These prevention/test-housekeeping phrases must NOT fire as incidents.
+_BENIGN_REGRESSION_RE = re.compile(
+    r"\b(?:regression\s+(?:tests?|suite|nature)|no\s+regression)\b",
+    re.IGNORECASE,
+)
+# Conversely, a subject using "regression" with a corroborating incident id
+# (``#1234``, ``INC-447``, …), or as part of an unambiguous incident phrase
+# like ``regression in <something>`` / ``Fixed: regression`` / ``fix the
+# regression``, IS an incident.  These are the patterns that distinguish
+# "split the regression-test files" (housekeeping) from "fix the refund
+# regression" (a real outage marker).
+_INCIDENT_REGRESSION_RE = re.compile(
+    # ``regression in <something>`` — "fix the refund regression in admin".
+    r"\bregression\s+in\b"
+    # ``fix the regression`` / ``fix a regression`` — explicit incident verb.
+    r"|\bfix(?:ed|es)?\s+(?:the\s+|a\s+)?regression\b"
+    # ``regression — …`` / ``regression: …`` — stated subject category.
+    r"|\bregression\s*[:—-]"
+    # ``Fixed: regression`` / ``Hotfix: regression`` — pre-colon incident verb
+    # explicitly framing the rest as the incident category itself.
+    r"|\b(?:fix(?:ed|es)?|hotfix|revert(?:ed)?)\s*:\s*regression\b",
+    re.IGNORECASE,
 )
 INVARIANT_TOKENS: tuple[str, ...] = (
     "do not",
@@ -187,8 +232,94 @@ def is_tracked(repo_root: Path, path: str) -> bool:
     return bool(out.strip())
 
 
+def _normalise_tz_offset(timestamp: str) -> str:
+    """Repair pathological tz offsets that ``datetime.fromisoformat`` rejects.
+
+    Real-world git history contains commits authored on systems with broken
+    timezone configuration (e.g. an offset of ``+518:00`` or ``+51800`` —
+    encountered on a 2011 commit in psf/requests, where the underlying object
+    really stores ``+51800``). ``fromisoformat`` raises ``ValueError`` on
+    those, which would otherwise poison every command that walks history.
+
+    We coerce the suffix into the canonical ``[+-]HH:MM`` form when we can
+    recognise it. Anything else is left untouched and the caller falls back
+    to a safe default.
+    """
+    stripped = timestamp.strip()
+    if "T" not in stripped:
+        return stripped
+    body, _, after_t = stripped.partition("T")
+    sign_idx = -1
+    for i, ch in enumerate(after_t):
+        if ch in "+-":
+            sign_idx = i
+            break
+    if sign_idx < 0:
+        return stripped
+    prefix = body + "T" + after_t[:sign_idx]
+    sign = after_t[sign_idx]
+    rest = after_t[sign_idx + 1 :]
+    digits = rest.replace(":", "")
+    if not digits.isdigit():
+        return stripped
+    # Acceptable shapes: 4 digits → HHMM; 5 digits → HHHMM (broken, e.g.
+    # ``+51800`` → hours ``5``, minutes ``18``); 6 digits → HHMMSS (rare).
+    if len(digits) == 4:
+        hh, mm = digits[:2], digits[2:]
+    elif len(digits) == 5:
+        hh, mm = "0" + digits[0], digits[1:3]
+    elif len(digits) == 6:
+        hh, mm = digits[:2], digits[2:4]
+    elif len(digits) == 2:
+        hh, mm = digits, "00"
+    else:
+        return stripped
+    try:
+        if int(hh) > 23 or int(mm) > 59:
+            return stripped
+    except ValueError:
+        return stripped
+    return f"{prefix}{sign}{hh}:{mm}"
+
+
 def _parse_iso(timestamp: str) -> datetime:
-    return datetime.fromisoformat(timestamp.strip())
+    """Parse an ISO 8601 timestamp; tolerate malformed tz offsets.
+
+    Returns a Unix-epoch sentinel if the offset cannot be repaired so a
+    single bad record never crashes a whole-repo analysis. The bad raw
+    string is tracked in a per-session set so verbose callers can mention
+    which commits were affected.
+    """
+    raw = timestamp.strip()
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        repaired = _normalise_tz_offset(raw)
+        if repaired != raw:
+            try:
+                return datetime.fromisoformat(repaired)
+            except ValueError:
+                pass
+        _UNPARSEABLE_TIMESTAMPS.add(raw)
+        return _EPOCH_FALLBACK
+
+
+def _maybe_warn_bad_timestamps() -> None:
+    """Emit a single stderr line per session if any record fell back to epoch.
+
+    Called once at the end of a top-level read so a single bad commit never
+    spams a per-line warning. Stays purely local — no network, no telemetry.
+    """
+    global _BAD_TZ_WARNING_EMITTED
+    if _BAD_TZ_WARNING_EMITTED or not _UNPARSEABLE_TIMESTAMPS:
+        return
+    _BAD_TZ_WARNING_EMITTED = True
+    n = len(_UNPARSEABLE_TIMESTAMPS)
+    print(
+        f"warning: {n} commit{'s' if n != 1 else ''} had an unparseable "
+        f"authored timestamp; treating those as epoch for date math.",
+        file=sys.stderr,
+    )
 
 
 def _log_format() -> str:
@@ -285,6 +416,7 @@ def commits_for_path(
             cache.store_path_log(path, head_sha, [c.sha for c in commits])
     if max_count is not None and len(commits) > max_count:
         commits = commits[:max_count]
+    _maybe_warn_bad_timestamps()
     return commits
 
 
@@ -342,12 +474,15 @@ def all_commits(
     """
     if cache is not None:
         full = _all_commits_via_cache(repo_root, cache)
+        _maybe_warn_bad_timestamps()
         return full if max_count is None else full[:max_count]
     args = ["log", "--no-merges", f"--pretty=format:{_log_format()}"]
     if max_count is not None:
         args.append(f"--max-count={max_count}")
     raw = _run_git(repo_root, *args)
-    return _parse_log_records(raw)
+    out = _parse_log_records(raw)
+    _maybe_warn_bad_timestamps()
+    return out
 
 
 def _store_commits(cache: CacheStore, commits: Sequence[Commit]) -> None:
@@ -624,26 +759,77 @@ def find_revert_pairs(commits: Sequence[Commit]) -> list[tuple[str, str]]:
     return pairs
 
 
+def _is_subject_incident(subject: str, body: str) -> bool:
+    """Determine whether a single commit's subject signals incident intent.
+
+    The trickiest case is ``regression``. The 0.4.0 classifier accepted any
+    subject that contained the word and so flagged routine bug fixes that
+    happened to mention "regression tests" or "regression nature" as
+    incidents. The new rule:
+
+    - ``regression`` in a subject fires only when corroborated:
+        * an issue / incident id on the same subject or anywhere in the body
+          (``#1234``, ``INC-447``, ``SEV-1``, …); OR
+        * a pre-marker that anchors the word as an incident reference,
+          such as ``regression in <something>`` / ``Fixed: regression`` /
+          ``fix the regression`` / ``regression — …``.
+    - The phrases ``regression test(s)``, ``regression suite``,
+      ``no regression``, ``regression nature`` never fire on their own.
+    - Subjects citing a security advisory (``CVE-…`` / ``GHSA-…``) always
+      fire — the act of naming an advisory is unambiguous high-confidence.
+    - The default ``git revert`` body subject (``Reverted "…"``) and the
+      human variant (``Reverts <sha>``) always fire — both are explicit
+      rollback markers.
+    - Other incident keywords (``hotfix``, ``outage``, ``rollback``, …)
+      keep their existing subject-level acceptance.
+    """
+    if _CVE_RE.search(subject) or _GHSA_RE.search(subject):
+        return True
+    if _REVERTED_SUBJECT_RE.search(subject) or _REVERTS_SUBJECT_RE.search(subject):
+        return True
+    if _BREAKING_CC_RE.search(subject):
+        return True
+    # Regression demands corroboration: either it appears as part of a
+    # high-confidence phrase, or an issue/incident id is present.
+    has_regression = bool(re.search(r"\bregression\b", subject, re.IGNORECASE))
+    if has_regression:
+        if _BENIGN_REGRESSION_RE.search(subject):
+            return False
+        if _INCIDENT_REGRESSION_RE.search(subject):
+            return True
+        if _ISSUE_ID_RE.search(subject) or _ISSUE_ID_RE.search(body):
+            return True
+        # Strip the word and check whether any other incident keyword carries
+        # the subject — a "rollback regression" should still fire on
+        # "rollback" alone.
+        without_regression = re.sub(r"\bregression\b", "", subject, flags=re.IGNORECASE)
+        return bool(_INCIDENT_RE.search(without_regression))
+    return bool(_INCIDENT_RE.search(subject))
+
+
 def find_incidents(commits: Sequence[Commit]) -> list[Commit]:
     """Return commits whose evidence-level signals incident-flavored intent.
 
     Acceptance ladder (highest to lowest confidence):
-      1. Subject contains an incident keyword.  A commit's subject is its
-         declared purpose, so a subject hit is treated as ground truth.
-      2. Subject carries the Conventional Commits breaking marker
+      1. Subject cites a security advisory (``CVE-…`` / ``GHSA-…``) — fires
+         on subject alone.
+      2. Subject is a default ``git revert`` body (``Reverted "…"``) or a
+         human revert pointer (``Reverts <sha>``) — fires on subject alone.
+      3. Subject carries the Conventional Commits breaking marker
          (``feat!:`` / ``fix!:`` / …).
-      3. Body carries the structured ``BREAKING CHANGE:`` footer.  This is a
-         deliberate, anchored marker, not free-form prose.
-      4. Body contains an incident keyword AND an issue / incident
-         identifier nearby (``#1234``, ``INC-447``, ``SEV-1``, ``P0``).
-         This filters out passing mentions in prose like "feat: add
-         incident-aware logging" where the keyword describes a *feature*.
+      4. Subject contains an incident keyword that is NOT a benign
+         "regression test/suite/nature" phrase. ``regression`` requires
+         either an issue id (on subject or body) or a pre-marker that
+         anchors it as an incident reference.
+      5. Body carries the structured ``BREAKING CHANGE:`` footer.
+      6. Body contains an incident keyword AND an issue / incident
+         identifier nearby. Filters out passing mentions in prose.
 
     A bare body keyword with no corroborating ID does NOT fire.
     """
     out: list[Commit] = []
     for c in commits:
-        if _INCIDENT_RE.search(c.subject) or _BREAKING_CC_RE.search(c.subject):
+        if _is_subject_incident(c.subject, c.body):
             out.append(c)
             continue
         if _BREAKING_FOOTER_RE.search(c.body):
@@ -696,6 +882,41 @@ def _all_matches_are_quoted(line: str, regex: re.Pattern[str]) -> bool:
     return True
 
 
+# An ALLCAPS line prefix (e.g. ``WARNING:``, ``ERROR:``, ``DEBUG:``) is the
+# canonical signature of pasted compiler / linter / spell-checker output.
+# A genuine human invariant statement opens with a normal sentence ("Do
+# not...", "Important: ...") and never with two or more uppercase letters
+# followed by an immediate colon.
+_TOOL_OUTPUT_ALLCAPS_RE = re.compile(r"^[A-Z]{2,}:\s")
+# A ``path:line:`` or ``path:line:col:`` prefix near the start of a line is
+# the unmistakable shape of compiler / aspell output. We accept any path-
+# shaped token (slashes, dots, hyphens, underscores, alnum) followed by
+# ``:<digits>:`` — anchored so it also catches ``./foo/bar.py:50:``.
+_TOOL_OUTPUT_PATH_RE = re.compile(r"^[\w./-]+:\d+:")
+# Per-(commit, file) cap on invariant lines pulled from one body. A real
+# author rarely states more than two crisp invariants in a single message;
+# anything beyond is almost certainly a paste. Set deliberately low so a
+# single noisy commit can no longer dominate the "highlights" view.
+_PER_COMMIT_INVARIANT_CAP = 2
+
+
+def _is_tool_output_line(line: str, prev_line: str) -> bool:
+    """True if ``line`` looks like quoted compiler / linter / aspell output.
+
+    Heuristics:
+      - ALLCAPS followed immediately by a colon (``WARNING:``, ``ERROR:``,
+        ``DEBUG:``…) — pasted tool output.
+      - ``path/to/file:line:`` prefix near the start — clang / mypy / aspell.
+      - Preceded by a ``> `` block-quote line — markdown-style "this is
+        what the tool said" framing.
+    """
+    if _TOOL_OUTPUT_ALLCAPS_RE.match(line):
+        return True
+    if _TOOL_OUTPUT_PATH_RE.match(line):
+        return True
+    return prev_line.startswith("> ")
+
+
 def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]:
     """Pull lines from commit *bodies* that match invariant tokens.
 
@@ -706,20 +927,43 @@ def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]
     eliminates the meta-mention failure mode where a commit *about* an
     invariant token (e.g. "fix invariant matcher") would self-flag.
 
+    Two filters keep pasted tool output out of the "stated invariants"
+    surface:
+
+    1. Lines that look like quoted compiler / linter / aspell output are
+       dropped (``WARNING: …``, ``foo/bar.py:50: …``, lines preceded by a
+       ``> `` block-quote). One noisy spell-check commit on django used to
+       supply 15 of the top-20 highlights; this rule kills it at the
+       source.
+    2. A per-commit cap of two invariants. Real authors rarely state more
+       than two crisp constraints in one message; anything beyond is
+       almost certainly a paste. The first two matches are preserved
+       (most informative-looking entries rank).
+
     Lines where every matching token is wrapped in quotes (``"do not"``) are
     treated as references rather than statements and are skipped.
     """
     out: list[tuple[str, str]] = []
     for commit in commits:
+        per_commit = 0
+        prev_line = ""
         for raw_line in commit.body.splitlines():
             line = raw_line.strip()
             if not line:
+                prev_line = raw_line
                 continue
+            if _is_tool_output_line(line, prev_line):
+                prev_line = raw_line
+                continue
+            prev_line = raw_line
             if not _INVARIANT_RE.search(line):
                 continue
             if _all_matches_are_quoted(line, _INVARIANT_RE):
                 continue
+            if per_commit >= _PER_COMMIT_INVARIANT_CAP:
+                continue
             out.append((commit.sha, line[:200]))
+            per_commit += 1
     return out
 
 

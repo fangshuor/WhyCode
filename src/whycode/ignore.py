@@ -3,7 +3,16 @@
 These are paths/files that almost always pollute risk analysis without
 adding signal: changelogs (touched on every release, so they look "tightly
 coupled to everything"), lockfiles (regenerated on every dependency bump),
-vendored third-party code, and machine-generated stubs.
+vendored third-party code, machine-generated stubs, CI / packaging
+metadata, project-membership files (``AUTHORS``, ``LICENSE``), and
+translation catalogues (``*.po`` / ``*.mo``).
+
+A field test against django (10,000 commits, 7,043 files) showed the
+top-10 risk list was dominated by these high-touch metadata files —
+``AUTHORS``, ``.github/workflows/*.yml``, locale ``.po``, ``.gitignore``
+— and no application code at all reached the top 10. A scan-top list
+that surfaces zero source files is unactionable; demoting these
+metadata files lets real source code rank.
 
 Users can extend this list with a ``.whycodeignore`` file at repo root,
 one ``fnmatch``-style pattern per line. Comments start with ``#``.
@@ -71,6 +80,49 @@ DEFAULT_IGNORE_PATTERNS: tuple[str, ...] = (
     "*.ttf",
     "*.otf",
     "*.eot",
+    # CI / repo metadata — high-touch but never the source of risk in code.
+    ".github/**",
+    ".gitlab/**",
+    ".circleci/**",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    ".pre-commit-config.yaml",
+    ".readthedocs.yaml",
+    ".readthedocs.yml",
+    ".flake8",
+    ".coveragerc",
+    "tox.ini",
+    "pytest.ini",
+    "Makefile",
+    # Project-membership / licensing files — touched on every contributor add.
+    "AUTHORS",
+    "AUTHORS.*",
+    "CONTRIBUTORS",
+    "CONTRIBUTORS.*",
+    "LICENSE",
+    "LICENSE.*",
+    "LICENSES/**",
+    "COPYING",
+    "COPYING.*",
+    "NOTICE",
+    "NOTICE.*",
+    # Python packaging metadata — low-signal-per-touch.
+    "setup.py",
+    "setup.cfg",
+    "MANIFEST.in",
+    # Translation catalogues — bulk-edited every release, never an indicator
+    # of code risk.
+    "*.po",
+    "*.mo",
+    "*.pot",
+    # Release-notes-style ``*.txt`` files only — narrow patterns; we are
+    # deliberately conservative here so a random ``requirements.txt`` is not
+    # ignored. The shapes below match common repo layouts (django, flask).
+    "release_notes/*.txt",
+    "docs/releases/*.txt",
+    "docs/release-notes/*.txt",
+    "release-notes/*.txt",
 )
 
 _USER_IGNORE_FILE = ".whycodeignore"
