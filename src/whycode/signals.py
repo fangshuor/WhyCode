@@ -16,7 +16,7 @@ from whycode import git_facts as gf
 from whycode import ignore as ign
 
 if TYPE_CHECKING:
-    from whycode.git_facts import RepoFacts
+    from whycode.git_facts import Commit, RepoFacts
 
 
 class SignalKind(StrEnum):
@@ -116,6 +116,84 @@ def _decay_severity(severity: int, days_since_most_recent: int) -> int:
     return severity
 
 
+def _classify_incident_commit(commit: Commit) -> tuple[str, str, tuple[str, ...]]:
+    """Return ``(rule, why, evidence_tokens)`` for the rule branch that fired.
+
+    Mirrors the acceptance ladder in :func:`whycode.git_facts.find_incidents`
+    so an :class:`Explanation` can name which clause matched on this specific
+    commit. Evaluation order matches the ladder; the first match wins.
+    """
+    subject = commit.subject
+    body = commit.body
+    cve = gf._CVE_RE.search(subject)
+    if cve:
+        return (
+            "incident_subject_security_advisory",
+            f"subject cites the security advisory {cve.group(0)!r}",
+            (cve.group(0),),
+        )
+    ghsa = gf._GHSA_RE.search(subject)
+    if ghsa:
+        return (
+            "incident_subject_security_advisory",
+            f"subject cites the security advisory {ghsa.group(0)!r}",
+            (ghsa.group(0),),
+        )
+    if gf._REVERTED_SUBJECT_RE.search(subject) or gf._REVERTS_SUBJECT_RE.search(subject):
+        return (
+            "incident_subject_revert_marker",
+            "subject is a default git revert pointer (Reverted/Reverts)",
+            ("Reverted",) if gf._REVERTED_SUBJECT_RE.search(subject) else ("Reverts",),
+        )
+    cc = gf._BREAKING_CC_RE.search(subject)
+    if cc:
+        return (
+            "incident_subject_conventional_commits_breaking",
+            f"subject carries the Conventional Commits breaking marker {cc.group(0).strip()!r}",
+            (cc.group(0).strip(),),
+        )
+    # Subject keyword path (regression handled with corroboration inside the helper).
+    if gf._is_subject_incident(subject, body):
+        # Find which keyword actually matched in subject.
+        match = gf._INCIDENT_RE.search(subject)
+        if match:
+            tok = match.group(0)
+            return (
+                "incident_subject_keyword",
+                f"subject {subject[:60]!r} matched the literal token {tok!r}",
+                (tok,),
+            )
+        # _is_subject_incident also accepts the regression+id corroboration
+        # path even when no other keyword is in the subject.
+        return (
+            "incident_subject_regression_corroborated",
+            "subject contains 'regression' and a corroborating issue id",
+            ("regression",),
+        )
+    if gf._BREAKING_FOOTER_RE.search(body):
+        return (
+            "incident_body_breaking_change_footer",
+            "body carries the structured 'BREAKING CHANGE:' footer",
+            ("BREAKING CHANGE:",),
+        )
+    body_kw = gf._INCIDENT_RE.search(body)
+    issue = gf._ISSUE_ID_RE.search(body)
+    if body_kw and issue:
+        return (
+            "incident_body_keyword_with_issue_id",
+            (
+                f"body keyword {body_kw.group(0)!r} corroborated by issue id "
+                f"{issue.group(0)!r}"
+            ),
+            (body_kw.group(0), issue.group(0)),
+        )
+    # Should not happen — find_incidents only returns commits that match one
+    # of the branches above. Falling through means the ladder grew without
+    # this helper. Return a neutral classification so the explanation surface
+    # never crashes.
+    return ("incident_unclassified", "matched the incident ladder", ())
+
+
 def detect_revert_chain(facts: RepoFacts) -> Signal | None:
     if not facts.revert_pairs:
         return None
@@ -130,12 +208,22 @@ def detect_revert_chain(facts: RepoFacts) -> Signal | None:
         age_phrase = f" (most recent: {_age_phrase(days)})"
     evidence = tuple(_short(rev) for rev, _ in facts.revert_pairs)
     pairs_text = ", ".join(f"{_short(rev)} reverts {_short(orig)}" for rev, orig in facts.revert_pairs)
+    explanation = Explanation(
+        rule="revert_pair_default_message",
+        why_it_fired=(
+            f"{n} commit{' body matches' if n == 1 else ' bodies match'} the default git "
+            "revert footer 'This reverts commit <sha>'"
+        ),
+        evidence=evidence,
+        source_ref="src/whycode/git_facts.py:find_revert_pairs",
+    )
     return Signal(
         kind=SignalKind.REVERT_CHAIN,
         severity=severity,
         headline=f"{n} revert{'s' if n != 1 else ''} touched this file{age_phrase}",
         detail=f"Reverts in this file's history: {pairs_text}.",
         evidence=evidence,
+        explanation=explanation,
     )
 
 
@@ -150,12 +238,20 @@ def detect_incident_history(facts: RepoFacts) -> Signal | None:
         f"{n} commit{'s' if n != 1 else ''} matched incident keywords "
         f"(latest {days} day{'s' if days != 1 else ''} ago: '{most_recent.subject[:80]}')."
     )
+    rule, why, tokens = _classify_incident_commit(most_recent)
+    explanation = Explanation(
+        rule=rule,
+        why_it_fired=why,
+        evidence=tokens,
+        source_ref="src/whycode/git_facts.py:find_incidents",
+    )
     return Signal(
         kind=SignalKind.INCIDENT_HISTORY,
         severity=severity,
         headline=f"{n} incident-flagged change{'s' if n != 1 else ''} in history",
         detail=detail,
         evidence=tuple(_short(c.sha) for c in facts.incident_commits[:5]),
+        explanation=explanation,
     )
 
 
@@ -165,12 +261,26 @@ def detect_high_churn(facts: RepoFacts) -> Signal | None:
     if len(recent) < HIGH_CHURN_MIN_COMMITS:
         return None
     severity = 3 if len(recent) < 12 else 4
+    explanation = Explanation(
+        rule="high_churn_recent_window",
+        why_it_fired=(
+            f"{len(recent)} commits within the last {cutoff_days} days crossed the "
+            f"threshold of {HIGH_CHURN_MIN_COMMITS}"
+        ),
+        evidence=(
+            f"recent_commits={len(recent)}",
+            f"window_days={cutoff_days}",
+            f"threshold={HIGH_CHURN_MIN_COMMITS}",
+        ),
+        source_ref="src/whycode/signals.py:detect_high_churn",
+    )
     return Signal(
         kind=SignalKind.HIGH_CHURN,
         severity=severity,
         headline=f"High churn: {len(recent)} commits in last {cutoff_days} days",
         detail="Code that changes this often is rarely settled — read recent diffs first.",
         evidence=tuple(_short(c.sha) for c in recent[:5]),
+        explanation=explanation,
     )
 
 
@@ -198,12 +308,27 @@ def detect_coupling(facts: RepoFacts) -> Signal | None:
     top = paired[:5]
     severity = 3 if top[0][1] < 6 else 4
     listed = "; ".join(f"{p} (x{n})" for p, n in top)
+    top_path, top_count = top[0]
+    explanation = Explanation(
+        rule="coupling_co_change_threshold",
+        why_it_fired=(
+            f"{top_path!r} changed together with this file {top_count} times "
+            f"(threshold {COUPLING_MIN_COCHANGES})"
+        ),
+        evidence=(
+            f"top_co_changer={top_path}",
+            f"co_changes={top_count}",
+            f"threshold={COUPLING_MIN_COCHANGES}",
+        ),
+        source_ref="src/whycode/signals.py:detect_coupling",
+    )
     return Signal(
         kind=SignalKind.COUPLING,
         severity=severity,
         headline=f"Tightly coupled to {len(top)} other file{'s' if len(top) != 1 else ''}",
         detail=f"Tends to change together with: {listed}.",
         evidence=tuple(p for p, _ in top),
+        explanation=explanation,
     )
 
 
@@ -215,6 +340,18 @@ def detect_silence(facts: RepoFacts) -> Signal | None:
     if days < SILENCE_DAYS:
         return None
     severity = 2 if days < 365 else 3
+    explanation = Explanation(
+        rule="silence_untouched_threshold",
+        why_it_fired=(
+            f"most recent commit on this file is {days} days old, exceeding the "
+            f"{SILENCE_DAYS}-day silence threshold"
+        ),
+        evidence=(
+            f"days_since_last_commit={days}",
+            f"threshold={SILENCE_DAYS}",
+        ),
+        source_ref="src/whycode/signals.py:detect_silence",
+    )
     return Signal(
         kind=SignalKind.SILENCE,
         severity=severity,
@@ -224,6 +361,7 @@ def detect_silence(facts: RepoFacts) -> Signal | None:
             "before assuming the silence means stability."
         ),
         evidence=(_short(most_recent.sha),),
+        explanation=explanation,
     )
 
 
@@ -234,12 +372,25 @@ def detect_newborn(facts: RepoFacts) -> Signal | None:
     days = _days_since(oldest.authored_at)
     if days > NEWBORN_DAYS:
         return None
+    explanation = Explanation(
+        rule="newborn_first_commit_window",
+        why_it_fired=(
+            f"oldest commit on this file is {days} day(s) old, within the "
+            f"{NEWBORN_DAYS}-day newborn window"
+        ),
+        evidence=(
+            f"days_since_first_commit={days}",
+            f"threshold={NEWBORN_DAYS}",
+        ),
+        source_ref="src/whycode/signals.py:detect_newborn",
+    )
     return Signal(
         kind=SignalKind.NEWBORN,
         severity=1,
         headline=f"New file (first commit {days} day{'s' if days != 1 else ''} ago)",
         detail="Limited history — the usual signals are not yet trustworthy.",
         evidence=(_short(oldest.sha),),
+        explanation=explanation,
     )
 
 
@@ -292,9 +443,27 @@ def detect_ghost_keeper(facts: RepoFacts) -> Signal | None:
 
     if ownership_share is not None:
         ownership_phrase = f"wrote {ownership_share:.0%} of current lines"
+        ownership_evidence = f"line_ownership_share={ownership_share:.2f}"
+        rule = "ghost_keeper_inactive_line_owner"
     else:
         share = sum(1 for c in facts.commits if c.author_email == primary_email)
         ownership_phrase = f"wrote {share} of {len(facts.commits)} commits here"
+        ownership_evidence = f"commits_by_primary={share}"
+        rule = "ghost_keeper_inactive_commit_owner"
+
+    explanation = Explanation(
+        rule=rule,
+        why_it_fired=(
+            f"primary author of this file has not committed anywhere for "
+            f"{days_since_seen} days (threshold {GHOST_KEEPER_DAYS})"
+        ),
+        evidence=(
+            f"days_since_active={days_since_seen}",
+            f"threshold={GHOST_KEEPER_DAYS}",
+            ownership_evidence,
+        ),
+        source_ref="src/whycode/signals.py:detect_ghost_keeper",
+    )
 
     return Signal(
         kind=SignalKind.GHOST_KEEPER,
@@ -306,6 +475,7 @@ def detect_ghost_keeper(facts: RepoFacts) -> Signal | None:
             f"Knowledge may have left the team."
         ),
         evidence=(_short(primary_commit.sha),),
+        explanation=explanation,
     )
 
 
@@ -371,6 +541,22 @@ def detect_invariant_quotes(facts: RepoFacts) -> Signal | None:
         if short not in seen_shas:
             seen_shas.add(short)
             evidence_shas.append(short)
+    matched_tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    for line in seen:
+        m = gf._INVARIANT_RE.search(line)
+        if m and m.group(0).lower() not in seen_tokens:
+            seen_tokens.add(m.group(0).lower())
+            matched_tokens.append(m.group(0))
+    explanation = Explanation(
+        rule="invariant_token_match_in_body",
+        why_it_fired=(
+            f"{total} commit body line{'s' if total != 1 else ''} contained a known "
+            "invariant token (e.g. 'do not', 'must not', 'workaround', …)"
+        ),
+        evidence=tuple(matched_tokens) if matched_tokens else (f"matches={total}",),
+        source_ref="src/whycode/git_facts.py:extract_invariant_quotes",
+    )
     return Signal(
         kind=SignalKind.INVARIANT_QUOTE,
         severity=severity,
@@ -380,6 +566,7 @@ def detect_invariant_quotes(facts: RepoFacts) -> Signal | None:
         ),
         detail="Past authors used cautionary language in commit messages:\n" + rendered,
         evidence=tuple(evidence_shas),
+        explanation=explanation,
     )
 
 
