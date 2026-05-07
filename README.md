@@ -110,6 +110,32 @@ Score interpretation:
 | 25–49   | WORTH A LOOK        | One thing might bite you. Glance.       |
 | 0–24    | NO FLAGS            | Quiet history — but read the diff anyway. |
 
+### "But why exactly did this fire?" — `--explain`
+
+When a signal looks wrong (or you just want to understand the reasoning
+before trusting the tool), pass `--explain`. Each fired signal grows a
+small block naming the precise rule that produced it, the literal evidence
+the rule looked at, and the source location of the ladder branch:
+
+```
+$ whycode why src/payment/refund.py --explain
+
+   MED     1 incident-flagged change in history
+           1 commit matched incident keywords (latest 12 days ago:
+           'hotfix: idempotency token regression').
+           evidence: a3f4b2c
+           ─ rule: incident_subject_keyword  src/whycode/git_facts.py:find_incidents
+             fired because: subject 'hotfix: idempotency token regression'
+                            matched the literal token 'hotfix'
+             evidence: hotfix
+```
+
+Without `--explain`, output is exactly as before — this is purely an
+opt-in transparency surface. `--explain --json` adds an `explanation`
+key per signal in the JSON output, with the same fields. The flag covers
+L1+L2 detectors only; if you also pass `--llm`, the L3 decision block is
+unaffected.
+
 ## The killer use case: hand it to your AI editor
 
 WhyCode is also an MCP server. Configure it in any MCP-aware editor or

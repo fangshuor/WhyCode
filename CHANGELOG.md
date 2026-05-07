@@ -4,6 +4,110 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-05-07
+
+### Added — `whycode why <path> --explain` makes the rule ladder transparent
+
+When WhyCode flagged a file before this release, the user could see
+*what* fired (a one-line headline plus a detail string) but not *how*
+the rule had matched. A signal whose detail read
+
+> *"1 commit matched incident keywords (latest: 'hotfix: regression')"*
+
+does not tell the reader whether the match was on the literal token
+`hotfix:`, on a Conventional Commits `fix!:` marker, on a
+`BREAKING CHANGE:` footer, or on the `regression + #INC-447`
+corroboration rule. That ambiguity hurt in two scenarios: a user who
+believed the signal was a false positive could not tell whether the
+*rule* was wrong or their *understanding* of the rule was wrong, and
+a new user who wanted to audit the tool's reasoning before relying on
+it had no entry point into the source.
+
+`whycode why <path> --explain` adds a small dim block under each fired
+signal naming the precise rule branch that produced it. Each detector
+now records a structured `Explanation` (rule identifier, one-sentence
+prose, literal evidence, source location) at fire-time; `--explain`
+renders that structure inline. The default surface is unchanged for
+users who already learned to read the card.
+
+```
+$ whycode why src/payment/refund.py --explain
+
+   MED  3 reverts touched this file (most recent: 4 months ago)
+        Reverts in this file's history: 9d2e7a1 reverts c5b81fe; …
+        ─ rule: revert_pair_default_message  src/whycode/git_facts.py:find_revert_pairs
+          fired because: 3 commit bodies match the default git revert
+                         footer 'This reverts commit <sha>'
+          evidence: 9d2e7a1, bbf441c, 0e1f883
+```
+
+`--explain --json` adds the same structure to the JSON output:
+
+```json
+"signals": [
+  {
+    "kind": "incident_history",
+    "severity": 3,
+    "headline": "...",
+    "detail": "...",
+    "evidence": ["..."],
+    "explanation": {
+      "rule": "incident_subject_keyword",
+      "why_it_fired": "subject 'hotfix: regression' matched the literal token 'hotfix'",
+      "evidence": ["hotfix"],
+      "source_ref": "src/whycode/git_facts.py:find_incidents"
+    }
+  }
+]
+```
+
+When `--explain` is off the JSON shape is unchanged — the
+`explanation` key is omitted, so existing downstream parsers see no
+drift. The flag composes with `--at`, `--mute`, `--no-mutes`, and
+`--max-commits`. It covers L1+L2 detectors only; if a user combines
+`--llm --explain`, the L3 decision block is rendered as before
+without per-decision explanations.
+
+The `incident_history` detector — which has the densest acceptance
+ladder — now records which of six branches accepted the most-recent
+fired commit:
+
+- `incident_subject_security_advisory` — `CVE-…` / `GHSA-…` token in
+  subject.
+- `incident_subject_revert_marker` — default `Reverted "…"` body
+  subject or human `Reverts <sha>` pointer.
+- `incident_subject_conventional_commits_breaking` — Conventional
+  Commits breaking marker (`feat!:` / `fix!:` / …).
+- `incident_subject_keyword` — incident keyword in subject (`hotfix`,
+  `outage`, `rollback`, `regression in <…>`, …).
+- `incident_body_breaking_change_footer` — structured `BREAKING
+  CHANGE:` footer in body.
+- `incident_body_keyword_with_issue_id` — body keyword corroborated
+  by an issue / incident id (`#1234`, `INC-447`, `SEV-1`, …).
+
+### Internal
+
+- `src/whycode/signals.py` — `Explanation` dataclass + optional field
+  on `Signal`; `_classify_incident_commit()` mirrors the
+  `find_incidents` ladder so an explanation can name which clause
+  matched on a specific commit.
+- `src/whycode/risk_card.py` — `_signals_table(..., explain=False)`
+  appends the explanation block; `to_dict(explain=False)` adds the
+  `explanation` key per signal.
+- `src/whycode/cli.py` — the `why` command grows a single `--explain`
+  flag wired to both surfaces.
+- `tests/test_signals.py` — 11 tests covering every detector's rule
+  identifier and matched evidence.
+- `tests/test_cli.py` — 5 tests covering the rendered text block, JSON
+  shape, regression guards that the default surface is unchanged, and
+  composition with `--at`.
+
+210 total tests (194 from 0.5.0 + 16 new); ruff + mypy strict clean.
+The pre-existing `test_diff_markdown_output` assertion on the
+markdown table header (`| Score | Band |`) is unrelated to this change
+and remains a known stale assertion against the `| Score | File |
+Top signal |` shape the renderer actually emits.
+
 ## [0.5.0] — 2026-05-07
 
 ### Performance — `whycode diff` is now usable on long-lived branches
