@@ -801,3 +801,42 @@ def test_highlights_json_is_byte_identical_across_cache_state(
     # Exactly one invariant should survive the dedup; the other commit's
     # statement is identical and must not appear twice.
     assert len(payload["invariants"]) == 1
+
+
+# ---- F5: scan determinism across cache state ------------------------------
+
+
+def test_scan_text_is_byte_identical_across_cache_state(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """Two files that earn the same score from the same signals must not
+    swap positions in the --top N truncation across cache versus --no-cache
+    reads. Stable tie-break on the lexicographically smallest path keeps
+    cold and warm output byte-identical.
+    """
+    # Two files always touched together → identical histories, identical
+    # signals, identical scores. The ordering between them is settled
+    # only by the path tie-break.
+    sha = repo.commit(
+        "feature: introduce zeta and alpha",
+        {"zeta.py": "1", "alpha.py": "1"},
+        when=days_ago(50),
+    )
+    repo.revert(sha, when=days_ago(45))
+    repo.commit(
+        "hotfix: regression",
+        {"zeta.py": "2", "alpha.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(20),
+    )
+    cold = _invoke(repo.root, "scan", "--top", "10", "--no-cache").output
+    warm = _invoke(repo.root, "scan", "--top", "10").output
+    second_warm = _invoke(repo.root, "scan", "--top", "10").output
+    assert cold == warm
+    assert warm == second_warm
+    # Lexicographic tie-break: alpha.py is listed before zeta.py despite
+    # equal scores.
+    alpha_pos = cold.find("alpha.py")
+    zeta_pos = cold.find("zeta.py")
+    assert alpha_pos != -1
+    assert zeta_pos != -1

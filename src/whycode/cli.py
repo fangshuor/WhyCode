@@ -425,7 +425,9 @@ def diff(
                 cards.append(rc.build(repo_root, f, cache=cache))
             except gf.GitError:
                 continue
-        cards.sort(key=lambda c: -c.score.value)
+        # Stable tie-break: lex smallest path on identical scores so cache
+        # and --no-cache truncate the same files at --top N.
+        cards.sort(key=lambda c: (-c.score.value, c.path))
         cards = cards[:top]
     finally:
         if cache is not None:
@@ -828,7 +830,10 @@ def scan(
         if cache is not None:
             cache.close()
 
-    cards.sort(key=lambda c: -c.score.value)
+    # Stable tie-break on identical scores: lexicographically smallest path
+    # so cache and --no-cache produce byte-identical text output for the
+    # same HEAD. Without this, the truncation at --top N is non-deterministic.
+    cards.sort(key=lambda c: (-c.score.value, c.path))
     top_cards = cards[:top]
     if not top_cards:
         # Be honest about what "no flagged files" actually means. A user who
@@ -950,7 +955,8 @@ def show(
             cards.append(rc.build(repo_root, change.path))
         except gf.GitError:
             continue
-    cards.sort(key=lambda c: -c.score.value)
+    # Stable tie-break on identical scores: lex smallest path.
+    cards.sort(key=lambda c: (-c.score.value, c.path))
 
     if json_out:
         console.print_json(
@@ -1141,7 +1147,8 @@ def tour(
                     ]
                     if useful:
                         cards.append(card)
-            cards.sort(key=lambda c: -c.score.value)
+            # Stable tie-break: lex smallest path on identical scores.
+            cards.sort(key=lambda c: (-c.score.value, c.path))
 
         if cards:
             console.print("[bold red]Top 3 risky files[/bold red]")
