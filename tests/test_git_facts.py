@@ -392,3 +392,92 @@ def test_parse_log_records_irrecoverable_falls_back_to_epoch() -> None:
     assert len(commits) == 1
     # Still a tz-aware datetime so callers can compare it.
     assert commits[0].authored_at.tzinfo is not None
+
+
+# ---- DiffFacts batch loader (perf/diff-batched) ----------------------------
+
+
+def test_load_diff_facts_indexes_commits_by_path(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1", "b.py": "1"})
+    repo.commit("update a", {"a.py": "2"})
+    repo.commit("update b", {"b.py": "2"})
+    repo.commit("update both", {"a.py": "3", "b.py": "3"})
+
+    facts = gf.load_diff_facts(repo.root)
+
+    a_subjects = [c.subject for c in facts.commits_by_path["a.py"]]
+    b_subjects = [c.subject for c in facts.commits_by_path["b.py"]]
+    # newest first
+    assert a_subjects == ["update both", "update a", "init"]
+    assert b_subjects == ["update both", "update b", "init"]
+
+
+def test_load_diff_facts_co_change_index_lists_full_file_set(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1", "b.py": "1", "c.py": "1"})
+    sha = repo.commit("change a and b", {"a.py": "2", "b.py": "2"})
+
+    facts = gf.load_diff_facts(repo.root)
+
+    paths = facts.co_change_index[sha]
+    assert set(paths) == {"a.py", "b.py"}
+
+
+def test_gather_for_diff_returns_repo_facts_from_in_memory_map(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("feature: A", {"a.py": "1"}, when=days_ago(40))
+    repo.revert(sha, when=days_ago(35))
+    repo.commit(
+        "hotfix: regression in a",
+        {"a.py": "2"},
+        body="incident #42",
+        when=days_ago(5),
+    )
+
+    diff_facts = gf.load_diff_facts(repo.root)
+    facts = gf.gather_for_diff(diff_facts, "a.py")
+
+    assert len(facts.commits) == 3
+    assert len(facts.revert_pairs) == 1
+    assert any("hotfix" in c.subject for c in facts.incident_commits)
+
+
+def test_gather_for_diff_co_changes_match_per_file_pipeline(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1", "b.py": "1", "c.py": "1"})
+    repo.commit("change a and b", {"a.py": "2", "b.py": "2"})
+    repo.commit("change a and b again", {"a.py": "3", "b.py": "3"})
+    repo.commit("change a alone", {"a.py": "4"})
+
+    diff_facts = gf.load_diff_facts(repo.root)
+    batched = gf.gather_for_diff(diff_facts, "a.py")
+    legacy = gf.gather(repo.root, "a.py")
+
+    assert dict(batched.co_changed_files) == dict(legacy.co_changed_files)
+
+
+def test_gather_for_diff_for_unseen_path_returns_empty_facts(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+
+    diff_facts = gf.load_diff_facts(repo.root)
+    facts = gf.gather_for_diff(diff_facts, "never-touched.py")
+
+    assert facts.commits == []
+    assert dict(facts.co_changed_files) == {}
+
+
+def test_load_diff_facts_handles_multiline_body_then_numstat(repo) -> None:  # type: ignore[no-untyped-def]
+    body = "first paragraph\n\nsecond paragraph with: colons, commas, etc."
+    repo.commit("subject line", {"x.txt": "1"}, body=body)
+
+    facts = gf.load_diff_facts(repo.root)
+    [commit] = facts.commits_by_path["x.txt"]
+    assert commit.subject == "subject line"
+    assert "second paragraph" in commit.body
+    assert commit.files == ("x.txt",)
+
+
+def test_load_diff_facts_max_commits_caps_per_path(repo) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"})
+    for i in range(5):
+        repo.commit(f"tweak {i}", {"a.py": str(i + 2)})
+
+    facts = gf.load_diff_facts(repo.root, max_commits=2)
+    assert len(facts.commits_by_path["a.py"]) == 2
