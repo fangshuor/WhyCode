@@ -331,3 +331,178 @@ def test_signals_sorted_by_severity_desc(repo, days_ago) -> None:  # type: ignor
     signals = sig.all_signals(facts)
     severities = [s.severity for s in signals]
     assert severities == sorted(severities, reverse=True)
+
+
+# ----- Explanation: each detector names the rule branch that fired ---------
+
+
+def test_revert_chain_explanation_names_default_revert_message(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("feat: A", {"x.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    facts = _facts_for(repo, "x.py")
+    signal = sig.detect_revert_chain(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "revert_pair_default_message"
+    assert "find_revert_pairs" in signal.explanation.source_ref
+    assert signal.explanation.evidence  # at least one short SHA
+
+
+def test_incident_explanation_names_subject_keyword_branch(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"refund.py": "1"}, when=days_ago(120))
+    repo.commit(
+        "hotfix: refund double-charge",
+        {"refund.py": "2"},
+        body="See incident #INC-447",
+        when=days_ago(30),
+    )
+    facts = _facts_for(repo, "refund.py")
+    signal = sig.detect_incident_history(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "incident_subject_keyword"
+    assert "hotfix" in signal.explanation.evidence
+    assert "find_incidents" in signal.explanation.source_ref
+
+
+def test_incident_explanation_names_breaking_cc_branch(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(60))
+    repo.commit(
+        "feat!: drop legacy refund path",
+        {"a.py": "2"},
+        body="Backwards-incompatible change.",
+        when=days_ago(20),
+    )
+    facts = _facts_for(repo, "a.py")
+    signal = sig.detect_incident_history(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "incident_subject_conventional_commits_breaking"
+
+
+def test_incident_explanation_names_breaking_footer_branch(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(60))
+    repo.commit(
+        "feat: refactor refund flow",
+        {"a.py": "2"},
+        body="Body explains the change.\n\nBREAKING CHANGE: removed sync API.",
+        when=days_ago(20),
+    )
+    facts = _facts_for(repo, "a.py")
+    signal = sig.detect_incident_history(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "incident_body_breaking_change_footer"
+
+
+def test_incident_explanation_names_body_keyword_with_issue_id(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=days_ago(60))
+    repo.commit(
+        "fix: tighten input validation",
+        {"a.py": "2"},
+        body="Resolves outage observed in #INC-99.",
+        when=days_ago(10),
+    )
+    facts = _facts_for(repo, "a.py")
+    signal = sig.detect_incident_history(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "incident_body_keyword_with_issue_id"
+    # The classifier should record both the keyword and the issue id.
+    joined = " ".join(signal.explanation.evidence)
+    assert "outage" in joined
+    assert "INC-99" in joined
+
+
+def test_high_churn_explanation_names_threshold(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    for i in range(7):
+        repo.commit(f"tweak {i}", {"hot.py": str(i)}, when=days_ago(80 - i * 5))
+    facts = _facts_for(repo, "hot.py")
+    signal = sig.detect_high_churn(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "high_churn_recent_window"
+    joined = " ".join(signal.explanation.evidence)
+    assert "recent_commits=" in joined
+    assert "threshold=" in joined
+
+
+def test_coupling_explanation_names_top_co_changer(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1", "b.py": "1"}, when=days_ago(60))
+    repo.commit("change", {"a.py": "2", "b.py": "2"}, when=days_ago(50))
+    repo.commit("change", {"a.py": "3", "b.py": "3"}, when=days_ago(40))
+    repo.commit("change", {"a.py": "4", "b.py": "4"}, when=days_ago(30))
+    facts = _facts_for(repo, "a.py")
+    signal = sig.detect_coupling(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "coupling_co_change_threshold"
+    joined = " ".join(signal.explanation.evidence)
+    assert "b.py" in joined
+    assert "threshold=" in joined
+
+
+def test_silence_explanation_names_threshold(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"old.py": "1"}, when=days_ago(400))
+    facts = _facts_for(repo, "old.py")
+    signal = sig.detect_silence(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "silence_untouched_threshold"
+    joined = " ".join(signal.explanation.evidence)
+    assert "threshold=" in joined
+
+
+def test_newborn_explanation_names_window(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"new.py": "1"}, when=days_ago(2))
+    facts = _facts_for(repo, "new.py")
+    signal = sig.detect_newborn(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "newborn_first_commit_window"
+
+
+def test_invariant_quotes_explanation_records_matched_token(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "compat: keep sync",
+        {"x.py": "1"},
+        body="Do not switch to async — v1 clients break.",
+        when=days_ago(30),
+    )
+    facts = _facts_for(repo, "x.py")
+    signal = sig.detect_invariant_quotes(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule == "invariant_token_match_in_body"
+    joined = " ".join(signal.explanation.evidence).lower()
+    assert "do not" in joined
+
+
+def test_ghost_keeper_explanation_names_inactive_owner(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "init", {"legacy.py": "1"},
+        when=days_ago(800),
+        author_name="Old Owner",
+        author_email="ghost@example.com",
+    )
+    facts = _facts_for(repo, "legacy.py")
+    signal = sig.detect_ghost_keeper(facts)
+    assert signal is not None
+    assert signal.explanation is not None
+    assert signal.explanation.rule.startswith("ghost_keeper_")
+    joined = " ".join(signal.explanation.evidence)
+    assert "days_since_active=" in joined
