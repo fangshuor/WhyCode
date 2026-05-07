@@ -1152,3 +1152,40 @@ def test_tour_top_files_render_bucket_labels(repo, days_ago) -> None:  # type: i
         band in out
         for band in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK")
     ), out
+
+
+def test_why_header_demotes_score_to_dim_suffix(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The Risk Card header shows the band; the score is a dim ``· N`` suffix.
+
+    The band already names the bucket; an explicit ``score 78/100`` next to
+    it is duplication on the most prominent surface of the card. The new
+    layout keeps the band's coloured pill and demotes the score to a small
+    dim trailing suffix on the same line.
+
+    JSON output is unchanged — ``score`` stays as an integer key for tools
+    consuming the structured shape.
+    """
+    sha = repo.commit("init", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: refund regression",
+        {"refund.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "why", "refund.py")
+    assert result.exit_code == 0
+    out = result.output
+    # Old format: "score X/100" must NOT appear in the rendered text.
+    assert "score" not in out.lower() or "/100" not in out
+    # New format: a "· <int>" suffix sits next to the band on the header line.
+    import re
+
+    band_score = re.search(r"(HANDLE WITH CARE|READ HISTORY FIRST|WORTH A LOOK).*?·\s*\d+", out)
+    assert band_score is not None, out
+    # JSON output preserves the integer score field.
+    json_result = _invoke(repo.root, "why", "refund.py", "--json")
+    assert json_result.exit_code == 0
+    data = json.loads(json_result.output)
+    assert "score" in data
+    assert isinstance(data["score"], int)
