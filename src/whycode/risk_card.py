@@ -43,9 +43,7 @@ class RiskCard:
     """When set, the card was computed *as of* this commit (historical view)."""
 
     primary_author: str | None = None
-    """Dominant contributor for this file by commit count. Used in the
-    narrative summary; does NOT replace the ghost-keeper detector's blame-
-    based primary owner (which is more accurate but more expensive)."""
+    """Dominant contributor by commit count (cheaper than ghost-keeper's blame)."""
 
     decisions: tuple[Decision, ...] = ()
     """L3 — LLM-extracted structured decisions. Empty unless ``--llm`` was on."""
@@ -61,10 +59,8 @@ class RiskCard:
 
         With ``explain=True``, each signal entry grows an ``explanation``
         key carrying the rule identifier, prose, evidence, and source
-        location populated by the detector. ``None`` is emitted when a
-        signal has no explanation attached (e.g. data ingested from an
-        older cache); the key is omitted entirely when ``explain`` is
-        off, so default consumers see no shape change.
+        location. The key is omitted entirely when ``explain`` is off so
+        default consumers see no shape change.
         """
         signals_out: list[dict[str, Any]] = []
         for s in self.signals:
@@ -74,10 +70,6 @@ class RiskCard:
                 "headline": s.headline,
                 "detail": s.detail,
                 "evidence": list(s.evidence),
-                # Per-signal action populated by every detector; None for
-                # NEWBORN where there isn't enough history to recommend
-                # anything. Always present in the JSON so downstream tooling
-                # can rely on the key existing.
                 "next_step": s.next_step,
             }
             if explain:
@@ -187,10 +179,7 @@ def _from_facts(
     skip_ghost_keeper: bool = False,
 ) -> RiskCard:
     """Common tail of :func:`build` and :func:`build_from_diff_facts`."""
-    if skip_ghost_keeper:
-        signals = _all_signals_without_ghost_keeper(facts)
-    else:
-        signals = sig.all_signals(facts)
+    signals = sig.all_signals(facts, skip_ghost_keeper=skip_ghost_keeper)
     if apply_suppressions:
         suppressions = supp.load(repo_root)
         signals = supp.filter_signals(signals, suppressions, path)
@@ -212,68 +201,22 @@ def _from_facts(
 
 
 def _primary_author(commits: list[gf.Commit]) -> str | None:
-    """Return the most-frequent commit author by count.
-
-    Cheaper than the ghost-keeper detector's blame-based ownership computation
-    and good enough for the narrative summary. Ties resolve to the
-    lexicographically smallest name so cache and ``--no-cache`` produce the
-    same card byte-for-byte.
-    """
     if not commits:
         return None
     counts: dict[str, int] = {}
     for c in commits:
         counts[c.author_name] = counts.get(c.author_name, 0) + 1
-    # Sort by (-count, name) so the highest count wins; lex smallest name on tie.
     return sorted(counts, key=lambda name: (-counts[name], name))[0]
-
-
-# Detectors whose evidence is already in :class:`RepoFacts` (no git blame, no
-# follow-up shell-out). The ghost-keeper detector is the only one missing
-# here — it calls ``git blame`` per-file, which is the diff command's
-# remaining bottleneck after the log walk is shared.
-_FAST_DETECTORS = (
-    sig.detect_revert_chain,
-    sig.detect_incident_history,
-    sig.detect_invariant_quotes,
-    sig.detect_coupling,
-    sig.detect_high_churn,
-    sig.detect_silence,
-    sig.detect_newborn,
-)
-
-
-def _all_signals_without_ghost_keeper(facts: gf.RepoFacts) -> list[sig.Signal]:
-    """Re-implement the public ``all_signals`` ladder, minus ghost-keeper.
-
-    Mirrors the NEWBORN-suppression rule that ``signals.all_signals`` uses
-    so that an empty signal list collapses cleanly to NEWBORN-only when the
-    other detectors are all silent. If any other detector fires, NEWBORN is
-    dropped, exactly as the canonical helper does.
-    """
-    out: list[sig.Signal] = []
-    for detector in _FAST_DETECTORS:
-        signal = detector(facts)
-        if signal is not None:
-            out.append(signal)
-    if any(s.kind is not sig.SignalKind.NEWBORN for s in out):
-        out = [s for s in out if s.kind is not sig.SignalKind.NEWBORN]
-    out.sort(key=lambda s: (-s.severity, s.kind.value))
-    return out
 
 
 # ----- rendering ------------------------------------------------------------
 
-# Public alias so the diff command's bucket headers can reuse the same band
-# colours a reader sees on the per-file Risk Card. Keep ``_BAND_STYLE`` as a
-# back-compat reference so the rest of this module reads as before.
 BAND_STYLE: dict[Band, str] = {
     Band.HANDLE_WITH_CARE: "bold white on red",
     Band.READ_HISTORY_FIRST: "bold black on yellow",
     Band.WORTH_A_LOOK: "bold black on cyan",
     Band.NO_FLAGS: "bold black on green",
 }
-_BAND_STYLE = BAND_STYLE
 
 
 def _severity_badge(severity: int) -> Text:
@@ -286,34 +229,16 @@ def _severity_badge(severity: int) -> Text:
 
 
 def _header(card: RiskCard) -> Panel:
-    style = _BAND_STYLE[card.score.band]
+    style = BAND_STYLE[card.score.band]
     title = Text()
     title.append(" ")
     title.append(card.score.band.value, style=style)
-    # The band already names the bucket; the integer score adds little
-    # except duplication on the most prominent surface of the card. Demote
-    # it to a small dim suffix so the band is what the eye lands on.
-    # JSON output is unchanged — ``RiskCard.to_dict`` still emits ``score``
-    # as an integer for tools that consume the structured shape.
     title.append(f"  · {card.score.value}", style="dim")
     if card.as_of_sha:
         title.append(f"   as of {card.as_of_sha}", style="dim")
     body = Text()
     body.append(card.path, style="bold")
-    body.append(f"   ({card.commit_count} commits)\n", style="dim")
-    if card.most_recent_subject:
-        # Subject must fit on one line inside an 80-col Panel: 80 minus borders,
-        # padding, and the 8-char "Latest: " prefix leaves ~64 chars usable.
-        subj = card.most_recent_subject
-        if len(subj) > 64:
-            subj = subj[:63] + "…"
-        body.append("Latest: ", style="dim")
-        body.append(subj + "\n", style="")
-        body.append(
-            f"        {card.most_recent_sha}  {card.most_recent_author}  "
-            f"{(card.most_recent_at or '')[:10]}",
-            style="dim",
-        )
+    body.append(f"   ({card.commit_count} commits)", style="dim")
     return Panel(body, title=title, title_align="left", border_style="grey50")
 
 
@@ -345,30 +270,23 @@ def _signals_table(
     extra_context: str = "",
 ) -> Table | Text:
     if not signals:
-        return Text(
-            "No flags fired. The history is quiet — this is information, "
-            "not safety. Read the diff anyway.",
-            style="italic dim",
-        )
+        return Text("No flags. Read the diff anyway.", style="italic dim")
     table = Table(show_header=False, box=None, padding=(0, 1, 1, 1), expand=True)
     table.add_column(width=7, no_wrap=True)
     table.add_column(ratio=1)
     for s in signals:
         block = Text()
-        block.append(s.headline + "\n", style="bold")
-        block.append(s.detail, style="")
+        block.append(s.headline, style="bold")
+        if s.detail:
+            block.append("\n")
+            block.append(s.detail, style="")
         if s.evidence and not _evidence_redundant(
             s.evidence, s.detail, extra_context=extra_context
         ):
             block.append("\nevidence: " + ", ".join(s.evidence), style="dim")
-        if s.next_step:
-            # Per-signal next step — replaces the old global "→ git show <sha>"
-            # footer with a hint specific to what fired (e.g. honour the
-            # invariant verbatim, read both sides of a revert, surface a
-            # ghost-keeper change to the team). Each detector knows the right
-            # action better than the rendering layer can guess.
-            block.append("\n→ " + s.next_step, style="dim")
         if explain and s.explanation is not None:
+            # --explain replaces the next_step line with the rule trace, so
+            # each signal stays at one action-line regardless of mode.
             ex = s.explanation
             block.append("\n", style="")
             block.append("─ rule: ", style="dim")
@@ -380,6 +298,8 @@ def _signals_table(
             block.append(ex.why_it_fired, style="dim")
             if ex.evidence:
                 block.append("\n  evidence: " + ", ".join(ex.evidence), style="dim")
+        elif s.next_step:
+            block.append("\n→ " + s.next_step, style="dim")
         table.add_row(_severity_badge(s.severity), block)
     return table
 
@@ -412,13 +332,6 @@ def _decisions_block(decisions: tuple[Decision, ...]) -> Padding:
 
 
 def _last_touched_phrase(most_recent_at: str | None) -> str:
-    """Render the file's last activity as the same human phrase signals use.
-
-    Pulls from the ISO timestamp ``RiskCard.most_recent_at`` so the narrative
-    matches the wording detectors put into headlines. Falls back to "recently"
-    when the timestamp is missing or unparseable; the narrative still reads
-    naturally and the rest of the card has the precise date in the header.
-    """
     if not most_recent_at:
         return "recently"
     try:
@@ -432,54 +345,31 @@ def _last_touched_phrase(most_recent_at: str | None) -> str:
 
 
 def _narrative_summary(card: RiskCard) -> Text:
-    """Two sentences a careful reader wants before drilling into the card.
+    """Grounding sentence: how old the file is, who wrote it, when last touched.
 
-    Sentence 1 grounds the file: how old, who wrote it, when last touched.
-    Sentence 2 names the strongest concern and what to do about it. The
-    quiet-repo case collapses to one honest sentence — empty is allowed,
-    lying is not (per ENGINEERING.md §4).
+    The signals table below already names the strongest concern + action; the
+    narrative deliberately stops at the grounding so the user reads each fact
+    once.
     """
-    summary = Text()
-    last_touched = _last_touched_phrase(card.most_recent_at)
-    primary = card.primary_author or "an unknown author"
     n = card.commit_count
     plural = "s" if n != 1 else ""
+    summary = Text()
     summary.append(card.path, style="bold")
-    summary.append(
-        f" is {n} commit{plural} old, primarily authored by ",
-        style="",
-    )
-    summary.append(primary, style="bold")
-    summary.append(f", last touched {last_touched}.", style="")
     if card.signals:
-        top = card.signals[0]
-        summary.append("\nThe strongest concern is ", style="")
-        summary.append(top.headline, style="bold")
-        if top.next_step:
-            # Splice the detector's hint into the second sentence verbatim,
-            # but trim a trailing period so the closing "first." reads cleanly
-            # ("consider X first." instead of "consider X. first.").
-            hint = top.next_step.rstrip().rstrip(".")
-            summary.append(f"; consider {hint} first.", style="")
-        else:
-            summary.append(".", style="")
+        last_touched = _last_touched_phrase(card.most_recent_at)
+        primary = card.primary_author or "an unknown author"
+        summary.append(f" is {n} commit{plural} old, primarily authored by ", style="")
+        summary.append(primary, style="bold")
+        summary.append(f", last touched {last_touched}.", style="")
     else:
-        # NO FLAGS — replace the second sentence with one quiet honest one.
-        summary = Text()
-        summary.append(card.path, style="bold")
         summary.append(
-            f" has {n} commit{plural} and no risk signals fired. "
-            "Read the diff anyway.",
+            f": no flags fired across {n} commit{plural}. Read the diff anyway.",
             style="",
         )
     return summary
 
 
 def render_text(card: RiskCard, *, explain: bool = False) -> Group:
-    # The header already prints the most-recent SHA in dim text. Pass it to
-    # the signals table so single-SHA evidence (silence, newborn) is treated
-    # as redundant — those detectors' evidence is exactly the head-of-history
-    # commit the header just showed.
     extra_context = card.most_recent_sha or ""
     pieces: list[Any] = [
         _header(card),

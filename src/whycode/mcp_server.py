@@ -109,6 +109,13 @@ def _build_server(verbose: bool = False) -> Server:
                             "type": "integer",
                             "description": "Optional cap on commits scanned.",
                         },
+                        "explain": {
+                            "type": "boolean",
+                            "description": (
+                                "Include the rule-trace block per signal "
+                                "(rule id, why_it_fired, evidence, source_ref)."
+                            ),
+                        },
                     },
                     "required": ["path"],
                 },
@@ -158,11 +165,10 @@ def _build_server(verbose: bool = False) -> Server:
 
 
 def _summary_text(card: rc.RiskCard) -> str:
-    """One-paragraph prose summary of the card. Designed to be quotable verbatim
-    by an LLM consumer without further processing."""
+    """One-paragraph prose summary, quotable verbatim by an LLM consumer."""
     if not card.signals:
         return (
-            f"{card.path}: {card.score.band.value} ({card.score.value}/100). "
+            f"{card.path}: {card.score.band.value} ({card.score.value}). "
             f"No flagged signals across {card.commit_count} commits — but read "
             f"the diff anyway."
         )
@@ -171,7 +177,7 @@ def _summary_text(card: rc.RiskCard) -> str:
     if len(card.signals) > 1:
         extras = f" Plus {len(card.signals) - 1} more signal(s) in the full card."
     return (
-        f"{card.path}: {card.score.band.value} ({card.score.value}/100). "
+        f"{card.path}: {card.score.band.value} ({card.score.value}). "
         f"Top concern: {top.headline}.{extras}"
     )
 
@@ -179,12 +185,13 @@ def _summary_text(card: rc.RiskCard) -> str:
 def _handle_risk_profile(arguments: dict[str, Any]) -> list[TextContent]:
     path = str(arguments["path"])
     max_commits = arguments.get("max_commits")
+    explain = bool(arguments.get("explain", False))
     try:
         repo_root, rel = _resolve(path)
         card = rc.build(repo_root, rel, max_commits=max_commits)
     except gf.GitError as exc:
         return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
-    payload = card.to_dict()
+    payload = card.to_dict(explain=explain)
     payload["summary"] = _summary_text(card)
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
@@ -210,6 +217,7 @@ def _handle_file_decisions(arguments: dict[str, Any]) -> list[TextContent]:
                 "headline": s.headline,
                 "detail": s.detail,
                 "evidence": list(s.evidence),
+                "next_step": s.next_step,
             }
             for s in decisions
         ],

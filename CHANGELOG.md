@@ -5,6 +5,85 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.0] — 2026-05-07
+
+### Changed — output density audit pass
+
+Three UX features (`--explain`, bucketed `diff`, narrative + per-signal
+`next_step`) shipped via parallel branches in 3 hours and accumulated
+overlapping render layers. This release re-reads the actual output a
+tired user sees on a real Risk Card and removes what they don't need.
+
+#### Risk Card
+
+- The narrative summary keeps only sentence 1 (file age + primary author
+  + last activity). Sentence 2 ("the strongest concern is X; consider Y
+  first.") was a verbatim restatement of the strongest signal's headline
+  + next_step rendered three lines below; the user read it twice.
+  Cards with no signals collapse to one honest line: "`<path>`: no flags
+  fired across N commits. Read the diff anyway."
+- `--explain` now replaces the per-signal `next_step` line with the rule
+  trace (rule id, why_it_fired, evidence, source_ref) instead of stacking
+  both. Each signal stays at one action-line regardless of mode; a 5-signal
+  card with `--explain` is no longer a 40-line wall.
+- The header panel shows path + commit count only. The "Latest:
+  <subject>" + "<sha> <author> <date>" lines were removed — the
+  `incident_history` signal references the relevant SHA when it matters,
+  the JSON output still carries the `most_recent` block for tools that
+  consume it.
+- `detect_high_churn`'s lecturing detail line ("Code that changes this
+  often is rarely settled — read recent diffs first.") was cut. Headline
+  + next_step already say it.
+
+#### `whycode diff`
+
+- The per-row integer score column is gone, in both text and markdown
+  output. The bucket header already encodes the band; the integer added
+  visual width without information density. Markdown table is now
+  `| File | Top signal |`.
+- The `→ whycode why <path>` footer hint is gone — every user who runs
+  `diff` knows about `why`.
+- The `whycode diff --json` output drops the flat `files` array. The
+  `buckets` field (added in 0.5.3) carries the same data; clients can
+  iterate it to recover a flat sorted view if needed.
+
+#### `whycode tour`
+
+- The "Top 3 risky files" block drops the per-row integer score for the
+  same reason — bucket heading carries the band.
+
+#### MCP server
+
+- `get_risk_profile` accepts a new `explain` boolean argument (default
+  false); when true, the returned card includes the per-signal
+  `explanation` block.
+- `get_file_decisions` includes `next_step` per signal in its payload —
+  it was stale relative to the new card shape.
+- `_summary_text` drops the `/100` suffix to match the rendered header.
+
+#### Internal
+
+- `_propagate_failures` decorator removed from cli.py and from every
+  command. Typer/Click already exit non-zero on uncaught exceptions; the
+  decorator was solving a non-problem.
+- Back-compat aliases removed: `_age_phrase = age_phrase` (signals.py),
+  `_run_git = run_git` (git_facts.py), `_BAND_STYLE = BAND_STYLE`
+  (risk_card.py). Internal callsites updated.
+- `_FAST_DETECTORS` tuple + `_all_signals_without_ghost_keeper` helper
+  (risk_card.py) inlined into `signals.all_signals(skip_ghost_keeper=…)`.
+- `with_closing` helper (cache.py) and the `closing` import removed —
+  zero callers.
+- Redundant `try/except ValueError` around `_parse_iso` in
+  `_parse_log_with_files` (git_facts.py) removed — `_parse_iso` already
+  swallows ValueError and returns the epoch sentinel.
+- `LLMConfig` dropped from `llm.py`'s `__all__` — only constructed
+  internally.
+- WHAT-only and past-task-reference comments deleted.
+
+233 tests passing; ruff + mypy strict clean. No outbound calls added,
+no new dependency.
+
+
 ## [0.5.4] — 2026-05-07
 
 ### Changed — Risk Card opens with a narrative, each signal carries its own next step

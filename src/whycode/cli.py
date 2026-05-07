@@ -21,12 +21,11 @@ Commands
 from __future__ import annotations
 
 import contextlib
-import functools
 import json
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -163,37 +162,6 @@ def _memoised_is_ignored(repo_root: Path) -> Iterator[None]:
         ign.is_ignored = original
 
 
-_F = TypeVar("_F", bound=Callable[..., Any])
-
-
-def _propagate_failures(func: _F) -> _F:
-    """Convert any uncaught exception into ``typer.Exit(2)``.
-
-    A read-only field test against psf/requests caught a bug where a single
-    bad-timezone commit raised ``ValueError`` deep inside ``_parse_log_records``;
-    Rich rendered the traceback to stderr, but the process exited with status
-    0. CI integrations could not tell that the run had silently failed
-    (a ``whycode diff --fail-on history`` step was reported as green even
-    though it had crashed). We wrap each command body so any unhandled
-    exception leaves the existing rich traceback rendering in place but
-    forces a non-zero exit code (``2`` for general failure). ``typer.Exit``
-    and ``KeyboardInterrupt`` propagate untouched so explicit exit-code
-    paths and Ctrl-C still behave normally.
-    """
-
-    @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(*args, **kwargs)
-        except (typer.Exit, typer.Abort, KeyboardInterrupt):
-            raise
-        except Exception as exc:
-            err.print_exception(show_locals=False)
-            raise typer.Exit(2) from exc
-
-    return wrapper  # type: ignore[return-value]
-
-
 # --- shared: band threshold parsing ----------------------------------------
 
 _BAND_THRESHOLDS_BY_KEY: dict[str, int] = {
@@ -222,7 +190,7 @@ def _print_brief(card: rc.RiskCard) -> None:
     top = card.signals[0].headline if card.signals else "no flags"
     console.print(
         f"{card.path}: [bold]{card.score.band.value}[/bold] "
-        f"({card.score.value}/100) — {top}"
+        f"({card.score.value}) — {top}"
     )
 
 
@@ -293,7 +261,6 @@ def _bucket_header_style(bucket: str) -> str:
 
 
 @app.command()
-@_propagate_failures
 def why(
     path: str = typer.Argument(..., help="File path to inspect."),
     json_out: bool = typer.Option(
@@ -472,7 +439,6 @@ def _resolve_base_ref(repo_root: Path, requested: str | None) -> str:
 
 
 @app.command()
-@_propagate_failures
 def diff(
     base: str | None = typer.Option(
         None, "--base", help="Base ref (default: origin/main → main → HEAD~1)."
@@ -581,8 +547,6 @@ def diff(
                     )
                 except gf.GitError:
                     continue
-            # Stable tie-break (from 0.4.2): lex smallest path on identical
-            # scores so cache and --no-cache truncate the same files at --top N.
             prelim.sort(key=lambda c: (-c.score.value, c.path))
             # Second pass: re-score the top-N with the full detector ladder
             # so the rendered table includes ghost-keeper findings where
@@ -618,7 +582,6 @@ def diff(
             json.dumps(
                 {
                     "base": actual_base,
-                    "files": [c.to_dict() for c in cards],
                     "buckets": {
                         band: [c.to_dict() for c in buckets[band]]
                         for band in _BUCKET_ORDER
@@ -656,14 +619,14 @@ def diff(
                     continue
                 print(f"### {band} ({len(rows)})")
                 print()
-                print("| Score | File | Top signal |")
-                print("| ----: | ---- | ---------- |")
+                print("| File | Top signal |")
+                print("| ---- | ---------- |")
                 for c in rows:
                     if c.signals:
                         top_signal = c.signals[0].headline.replace("|", "\\|")
                     else:
                         top_signal = "no flags"
-                    print(f"| {c.score.value} | `{c.path}` | {top_signal} |")
+                    print(f"| `{c.path}` | {top_signal} |")
                 print()
             if clear_n and not show_clear:
                 print(
@@ -671,9 +634,6 @@ def diff(
                     "pass `--show-clear` to list._"
                 )
                 print()
-            print(
-                "_Run `whycode why <path>` for the full Risk Card on any of the above._"
-            )
         if threshold is not None and any(c.score.value >= threshold for c in cards):
             raise typer.Exit(1)
         return
@@ -699,20 +659,13 @@ def diff(
             console.print(f"[{style}] {band} [/{style}]  [dim]({len(rows)})[/dim]")
             for c in rows:
                 top_signal = c.signals[0].headline if c.signals else "no flags"
-                console.print(
-                    f"  [bold]{c.score.value:>3}[/bold]  "
-                    f"[cyan]{c.path}[/cyan]   [dim]{top_signal}[/dim]"
-                )
+                console.print(f"  [cyan]{c.path}[/cyan]   [dim]{top_signal}[/dim]")
             console.print()
         if clear_n and not show_clear:
             console.print(
                 f"[dim]+ {clear_n} file(s) with no risk signals — "
                 "pass --show-clear to list[/dim]"
             )
-            console.print()
-        console.print(
-            "[dim]→ whycode why <path>   for the full Risk Card on any of the above[/dim]"
-        )
 
     if threshold is not None:
         breaches = [c for c in cards if c.score.value >= threshold]
@@ -725,7 +678,6 @@ def diff(
 
 
 @app.command()
-@_propagate_failures
 def highlights(
     invariants: int = typer.Option(
         5, "--invariants", help="How many invariant lines to surface."
@@ -881,7 +833,6 @@ def _sample_indices(total: int, max_samples: int) -> list[int]:
 
 
 @app.command()
-@_propagate_failures
 def timeline(
     path: str = typer.Argument(..., help="File path to inspect."),
     samples: int = typer.Option(
@@ -966,7 +917,6 @@ def timeline(
 
 
 @app.command()
-@_propagate_failures
 def scan(
     top: int = typer.Option(10, "--top", help="How many files to list."),
     sample: int = typer.Option(
@@ -1036,9 +986,6 @@ def scan(
         if cache is not None:
             cache.close()
 
-    # Stable tie-break on identical scores: lexicographically smallest path
-    # so cache and --no-cache produce byte-identical text output for the
-    # same HEAD. Without this, the truncation at --top N is non-deterministic.
     cards.sort(key=lambda c: (-c.score.value, c.path))
     top_cards = cards[:top]
     if not top_cards:
@@ -1067,7 +1014,6 @@ def scan(
 
 
 @app.command()
-@_propagate_failures
 def honest(
     path: str = typer.Argument(..., help="File path to inspect."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of prose."),
@@ -1131,7 +1077,6 @@ def honest(
 
 
 @app.command()
-@_propagate_failures
 def show(
     sha: str = typer.Argument(..., help="Commit SHA (full or short) to inspect."),
     repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
@@ -1161,7 +1106,6 @@ def show(
             cards.append(rc.build(repo_root, change.path))
         except gf.GitError:
             continue
-    # Stable tie-break on identical scores: lex smallest path.
     cards.sort(key=lambda c: (-c.score.value, c.path))
 
     if json_out:
@@ -1240,7 +1184,6 @@ _MCP_SNIPPET = '''    {
 
 
 @app.command()
-@_propagate_failures
 def tour(
     repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
     no_cache: bool = typer.Option(
@@ -1353,7 +1296,6 @@ def tour(
                     ]
                     if useful:
                         cards.append(card)
-            # Stable tie-break: lex smallest path on identical scores.
             cards.sort(key=lambda c: (-c.score.value, c.path))
 
         if cards:
@@ -1374,10 +1316,8 @@ def tour(
                     f"  [{style}] {band} [/{style}]  [dim]({len(rows)})[/dim]"
                 )
                 for top in rows:
-                    console.print(
-                        f"    [bold]{top.score.value:>3}[/bold]  [cyan]{top.path}[/cyan]"
-                    )
-                    console.print(f"         [dim]{top.signals[0].headline}[/dim]")
+                    console.print(f"    [cyan]{top.path}[/cyan]")
+                    console.print(f"      [dim]{top.signals[0].headline}[/dim]")
             console.print()
 
         # Section 3 — MCP setup snippet (vendor-neutral phrasing).
@@ -1420,7 +1360,6 @@ def tour(
 
 
 @app.command()
-@_propagate_failures
 def init(
     force: bool = typer.Option(
         False, "--force", "-f", help="Overwrite existing files instead of skipping."
