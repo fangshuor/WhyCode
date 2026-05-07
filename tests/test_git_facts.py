@@ -186,3 +186,75 @@ def test_line_ownership_returns_email_to_line_count(repo) -> None:  # type: igno
 def test_line_ownership_empty_for_missing_file(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.txt": "1"})
     assert gf.line_ownership(repo.root, "no-such-file.py") == {}
+
+
+def test_parse_log_records_tolerates_pathological_timezone() -> None:
+    """A 2011 commit on psf/requests has tz offset ``+518:00``.
+
+    ``datetime.fromisoformat`` rejects that. The repair must normalise it
+    to ``+05:18`` so a single bad record cannot poison the whole walk.
+    """
+    raw = (
+        "abc1234"
+        + gf.UNIT_SEP
+        + "Author"
+        + gf.UNIT_SEP
+        + "a@b"
+        + gf.UNIT_SEP
+        + "2011-09-08T02:38:50+518:00"
+        + gf.UNIT_SEP
+        + "subject"
+        + gf.UNIT_SEP
+        + "body"
+        + gf.RECORD_SEP
+    )
+    # Must not raise.
+    commits = gf._parse_log_records(raw)
+    assert len(commits) == 1
+    assert commits[0].sha == "abc1234"
+    # The repaired offset is +05:18 — i.e. tz info attached.
+    assert commits[0].authored_at.utcoffset() is not None
+
+
+def test_parse_log_records_tolerates_compact_offset_form() -> None:
+    """``+51800`` (no colon) — the underlying object form — also normalises."""
+    raw = (
+        "deadbee"
+        + gf.UNIT_SEP
+        + "Author"
+        + gf.UNIT_SEP
+        + "a@b"
+        + gf.UNIT_SEP
+        + "2011-09-08T02:38:50+51800"
+        + gf.UNIT_SEP
+        + "subject"
+        + gf.UNIT_SEP
+        + "body"
+        + gf.RECORD_SEP
+    )
+    commits = gf._parse_log_records(raw)
+    assert len(commits) == 1
+    assert commits[0].authored_at.utcoffset() is not None
+
+
+def test_parse_log_records_irrecoverable_falls_back_to_epoch() -> None:
+    """A truly unrepairable timestamp falls back to the epoch sentinel
+    so the walk continues — never crashes the analysis."""
+    raw = (
+        "feedfac"
+        + gf.UNIT_SEP
+        + "Author"
+        + gf.UNIT_SEP
+        + "a@b"
+        + gf.UNIT_SEP
+        + "totally not a date"
+        + gf.UNIT_SEP
+        + "subject"
+        + gf.UNIT_SEP
+        + "body"
+        + gf.RECORD_SEP
+    )
+    commits = gf._parse_log_records(raw)
+    assert len(commits) == 1
+    # Still a tz-aware datetime so callers can compare it.
+    assert commits[0].authored_at.tzinfo is not None

@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,17 @@ if TYPE_CHECKING:
 
 UNIT_SEP = "\x1f"
 RECORD_SEP = "\x1e"
+
+# Per-process record of commits whose authored timestamp could not be parsed
+# even after defensive normalisation. We surface these once per session via
+# a single stderr line so a single bad record does not spam a per-line warning
+# — never on every read, never to a network.
+_UNPARSEABLE_TIMESTAMPS: set[str] = set()
+_BAD_TZ_WARNING_EMITTED = False
+# The Unix epoch as a tz-aware UTC datetime; used as a safe fallback when a
+# commit's authored_at is irrecoverably malformed. Picked over datetime.min
+# because callers expect a tz-aware value (signal age math compares to UTC).
+_EPOCH_FALLBACK = datetime.fromtimestamp(0, UTC)
 
 # A commit subject/body containing one of these markers is treated as evidence
 # that the original author flagged something worth carrying forward.
@@ -187,8 +199,94 @@ def is_tracked(repo_root: Path, path: str) -> bool:
     return bool(out.strip())
 
 
+def _normalise_tz_offset(timestamp: str) -> str:
+    """Repair pathological tz offsets that ``datetime.fromisoformat`` rejects.
+
+    Real-world git history contains commits authored on systems with broken
+    timezone configuration (e.g. an offset of ``+518:00`` or ``+51800`` —
+    encountered on a 2011 commit in psf/requests, where the underlying object
+    really stores ``+51800``). ``fromisoformat`` raises ``ValueError`` on
+    those, which would otherwise poison every command that walks history.
+
+    We coerce the suffix into the canonical ``[+-]HH:MM`` form when we can
+    recognise it. Anything else is left untouched and the caller falls back
+    to a safe default.
+    """
+    stripped = timestamp.strip()
+    if "T" not in stripped:
+        return stripped
+    body, _, after_t = stripped.partition("T")
+    sign_idx = -1
+    for i, ch in enumerate(after_t):
+        if ch in "+-":
+            sign_idx = i
+            break
+    if sign_idx < 0:
+        return stripped
+    prefix = body + "T" + after_t[:sign_idx]
+    sign = after_t[sign_idx]
+    rest = after_t[sign_idx + 1 :]
+    digits = rest.replace(":", "")
+    if not digits.isdigit():
+        return stripped
+    # Acceptable shapes: 4 digits → HHMM; 5 digits → HHHMM (broken, e.g.
+    # ``+51800`` → hours ``5``, minutes ``18``); 6 digits → HHMMSS (rare).
+    if len(digits) == 4:
+        hh, mm = digits[:2], digits[2:]
+    elif len(digits) == 5:
+        hh, mm = "0" + digits[0], digits[1:3]
+    elif len(digits) == 6:
+        hh, mm = digits[:2], digits[2:4]
+    elif len(digits) == 2:
+        hh, mm = digits, "00"
+    else:
+        return stripped
+    try:
+        if int(hh) > 23 or int(mm) > 59:
+            return stripped
+    except ValueError:
+        return stripped
+    return f"{prefix}{sign}{hh}:{mm}"
+
+
 def _parse_iso(timestamp: str) -> datetime:
-    return datetime.fromisoformat(timestamp.strip())
+    """Parse an ISO 8601 timestamp; tolerate malformed tz offsets.
+
+    Returns a Unix-epoch sentinel if the offset cannot be repaired so a
+    single bad record never crashes a whole-repo analysis. The bad raw
+    string is tracked in a per-session set so verbose callers can mention
+    which commits were affected.
+    """
+    raw = timestamp.strip()
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        repaired = _normalise_tz_offset(raw)
+        if repaired != raw:
+            try:
+                return datetime.fromisoformat(repaired)
+            except ValueError:
+                pass
+        _UNPARSEABLE_TIMESTAMPS.add(raw)
+        return _EPOCH_FALLBACK
+
+
+def _maybe_warn_bad_timestamps() -> None:
+    """Emit a single stderr line per session if any record fell back to epoch.
+
+    Called once at the end of a top-level read so a single bad commit never
+    spams a per-line warning. Stays purely local — no network, no telemetry.
+    """
+    global _BAD_TZ_WARNING_EMITTED
+    if _BAD_TZ_WARNING_EMITTED or not _UNPARSEABLE_TIMESTAMPS:
+        return
+    _BAD_TZ_WARNING_EMITTED = True
+    n = len(_UNPARSEABLE_TIMESTAMPS)
+    print(
+        f"warning: {n} commit{'s' if n != 1 else ''} had an unparseable "
+        f"authored timestamp; treating those as epoch for date math.",
+        file=sys.stderr,
+    )
 
 
 def _log_format() -> str:
@@ -285,6 +383,7 @@ def commits_for_path(
             cache.store_path_log(path, head_sha, [c.sha for c in commits])
     if max_count is not None and len(commits) > max_count:
         commits = commits[:max_count]
+    _maybe_warn_bad_timestamps()
     return commits
 
 
@@ -342,12 +441,15 @@ def all_commits(
     """
     if cache is not None:
         full = _all_commits_via_cache(repo_root, cache)
+        _maybe_warn_bad_timestamps()
         return full if max_count is None else full[:max_count]
     args = ["log", "--no-merges", f"--pretty=format:{_log_format()}"]
     if max_count is not None:
         args.append(f"--max-count={max_count}")
     raw = _run_git(repo_root, *args)
-    return _parse_log_records(raw)
+    out = _parse_log_records(raw)
+    _maybe_warn_bad_timestamps()
+    return out
 
 
 def _store_commits(cache: CacheStore, commits: Sequence[Commit]) -> None:
