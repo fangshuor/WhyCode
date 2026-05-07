@@ -78,6 +78,43 @@ def test_why_json_signals_carry_next_step(repo, days_ago) -> None:  # type: igno
     assert any(s["next_step"] for s in data["signals"])
 
 
+def test_why_card_band_carries_dim_score_suffix(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The header row used to print the band, the numeric score, and a
+    per-signal HIGH/MED/LOW badge — three near-redundant tags. The score
+    is now a dim ``· N`` suffix next to the band so the band carries the
+    headline word and the per-signal badges differentiate inside the
+    table. JSON output is unchanged (the score is API)."""
+    from io import StringIO
+
+    from rich.console import Console as _Console
+
+    from whycode import risk_card as rc
+
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    card = rc.build(repo.root, "refund.py")
+    buf = StringIO()
+    _Console(file=buf, width=200, force_terminal=False, color_system=None).print(
+        rc.render_text(card)
+    )
+    out = buf.getvalue()
+    # Band still appears as the headline word.
+    assert any(b in out for b in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK"))
+    # Score is rendered as "· N" (no "/100" anymore).
+    assert f"· {card.score.value}" in out
+    assert "score " not in out  # the verbose 'score 57/100' wording is gone
+    assert "/100" not in out
+    # JSON output keeps the numeric score (api compat).
+    json_data = card.to_dict()
+    assert json_data["score"] == card.score.value
+
+
 def test_why_card_renders_narrative_summary(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """The Risk Card opens with a two-sentence narrative composed entirely
     from existing facts: file age + primary author + last activity, then the
