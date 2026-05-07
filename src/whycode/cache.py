@@ -28,7 +28,6 @@ import contextlib
 import sqlite3
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -477,6 +476,4 @@ def remove(repo_root: Path) -> bool:
     return False
 
 
-def with_closing(store: CacheStore) -> closing[CacheStore]:
-    """Tiny convenience for callers that want context-managed cleanup."""
-    return closing(store)
+

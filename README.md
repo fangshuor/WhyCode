@@ -83,22 +83,26 @@ That's it. No config file, no daemon, no account, no upload.
 ```
 ╭─  READ HISTORY FIRST  · 57 ──────────────────────────────────────╮
 │ src/payment/refund.py   (24 commits)                             │
-│ Latest: hotfix: idempotency token regression                     │
-│         a3f4b2c1   Mei Chen   2025-09-14                         │
 ╰──────────────────────────────────────────────────────────────────╯
+  src/payment/refund.py is 24 commits old, primarily authored by
+  Mei Chen, last touched 12 days ago.
+
    HIGH    3 reverts touched this file
            9d2e7a1 reverts c5b81fe; bbf441c reverts 4d29ab0; …
+           → Read both sides — git show 9d2e7a1 then git show c5b81fe
+             — to learn what was tried and why it broke.
 
    MED     2 incident-flagged changes in history
            2 commits matched incident keywords (latest 12 days ago:
            'hotfix: idempotency token regression').
            evidence: a3f4b2c, 7e22a04
+           → Read git show a3f4b2c to see the incident-flavoured
+             change in context.
 
    MED     2 invariants stated by past authors
              > Do not switch to async — v1 clients break.  (4d29ab0)
              > Important: keep the legacy header in place. (c5b81fe)
-
-  → git show 9d2e7a1   to read the most relevant commit in full
+           → Honour the invariant: Do not switch to async — v1 clients break.
 ```
 
 ### What a `whycode diff` briefing looks like
@@ -107,19 +111,17 @@ That's it. No config file, no daemon, no account, no upload.
 8 file(s) changed vs origin/main
 
  HANDLE WITH CARE   (2)
-   78  src/payment/refund.py     3 reverts touched this file
-   77  src/payment/charge.py     primary author last active 1100 days ago
+   src/payment/refund.py     3 reverts touched this file
+   src/payment/charge.py     primary author last active 1100 days ago
 
  READ HISTORY FIRST   (2)
-   62  src/api/auth.py           tightly coupled to 4 other files
-   51  src/foo.py                2 invariants stated by past authors
+   src/api/auth.py           tightly coupled to 4 other files
+   src/foo.py                2 invariants stated by past authors
 
  WORTH A LOOK   (1)
-   33  src/bar.py                tightly coupled to 3 other files
+   src/bar.py                tightly coupled to 3 other files
 
 + 3 file(s) with no risk signals — pass --show-clear to list
-
-→ whycode why <path>   for the full Risk Card on any of the above
 ```
 
 The output groups files by band so a reviewer scanning a 50-file PR sees
@@ -139,9 +141,10 @@ Score interpretation:
 ### "But why exactly did this fire?" — `--explain`
 
 When a signal looks wrong (or you just want to understand the reasoning
-before trusting the tool), pass `--explain`. Each fired signal grows a
-small block naming the precise rule that produced it, the literal evidence
-the rule looked at, and the source location of the ladder branch:
+before trusting the tool), pass `--explain`. The per-signal next_step line
+is replaced by the rule trace: which branch of the ladder fired, the
+literal evidence it looked at, and the source location of the ladder
+branch:
 
 ```
 $ whycode why src/payment/refund.py --explain
@@ -156,11 +159,9 @@ $ whycode why src/payment/refund.py --explain
              evidence: hotfix
 ```
 
-Without `--explain`, output is exactly as before — this is purely an
-opt-in transparency surface. `--explain --json` adds an `explanation`
-key per signal in the JSON output, with the same fields. The flag covers
-L1+L2 detectors only; if you also pass `--llm`, the L3 decision block is
-unaffected.
+Default output is unchanged. `--explain --json` adds an `explanation`
+key per signal. The flag covers L1+L2 detectors only; if you also pass
+`--llm`, the L3 decision block is unaffected.
 
 ## The killer use case: hand it to your AI editor
 

@@ -211,13 +211,9 @@ def run_git(repo_root: Path, *args: str) -> str:
     return proc.stdout
 
 
-# Back-compat alias. Prefer ``run_git`` in new code.
-_run_git = run_git
-
-
 def discover_repo_root(start: Path) -> Path:
     """Find the enclosing git repo root for ``start``."""
-    out = _run_git(start, "rev-parse", "--show-toplevel").strip()
+    out = run_git(start, "rev-parse", "--show-toplevel").strip()
     if not out:
         raise GitError(f"{start} is not inside a git repository")
     return Path(out)
@@ -226,7 +222,7 @@ def discover_repo_root(start: Path) -> Path:
 def is_tracked(repo_root: Path, path: str) -> bool:
     """Return True if ``path`` is tracked by git in ``repo_root``."""
     try:
-        out = _run_git(repo_root, "ls-files", "--error-unmatch", "--", path)
+        out = run_git(repo_root, "ls-files", "--error-unmatch", "--", path)
     except GitError:
         return False
     return bool(out.strip())
@@ -398,7 +394,7 @@ def commits_for_path(
     if ref is not None:
         args.append(ref)
     args.extend(["--", path])
-    raw = _run_git(repo_root, *args)
+    raw = run_git(repo_root, *args)
     commits = _parse_log_records(raw)
     if cache is not None and ref is None:
         if commits:
@@ -409,7 +405,7 @@ def commits_for_path(
         # head_sha yet we skip the seal and rely on the next all_commits()
         # call to set it.
         try:
-            head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+            head_sha = run_git(repo_root, "rev-parse", "HEAD").strip()
         except GitError:
             head_sha = ""
         if head_sha and head_sha == cache.head_sha:
@@ -433,7 +429,7 @@ def _commits_for_path_via_cache(
     Any miss — unknown HEAD, no path_log row, missing commit row —
     returns None and the caller falls through to the git path.
     """
-    head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+    head_sha = run_git(repo_root, "rev-parse", "HEAD").strip()
     if cache.head_sha != head_sha:
         return None
     cached_shas = cache.fetch_path_log(path, head_sha)
@@ -479,7 +475,7 @@ def all_commits(
     args = ["log", "--no-merges", f"--pretty=format:{_log_format()}"]
     if max_count is not None:
         args.append(f"--max-count={max_count}")
-    raw = _run_git(repo_root, *args)
+    raw = run_git(repo_root, *args)
     out = _parse_log_records(raw)
     _maybe_warn_bad_timestamps()
     return out
@@ -525,14 +521,14 @@ def _all_commits_via_cache(repo_root: Path, cache: CacheStore) -> list[Commit]:
          pull only new commits. If ``last_head`` is unreachable
          (force-push, branch swap), fall back to a full rebuild.
     """
-    head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+    head_sha = run_git(repo_root, "rev-parse", "HEAD").strip()
     last_head = cache.head_sha
     if last_head == head_sha:
         return [_commit_from_row(r) for r in cache.fetch_all_commit_rows()]
 
     if last_head:
         try:
-            raw_inc = _run_git(
+            raw_inc = run_git(
                 repo_root,
                 "log",
                 "--no-merges",
@@ -552,7 +548,7 @@ def _all_commits_via_cache(repo_root: Path, cache: CacheStore) -> list[Commit]:
     # Full rebuild: clear existing rows so an unreachable branch's commits
     # don't linger after a force-push or branch swap.
     cache.clear()
-    raw = _run_git(
+    raw = run_git(
         repo_root, "log", "--no-merges", f"--pretty=format:{_log_format()}"
     )
     commits = _parse_log_records(raw)
@@ -602,7 +598,7 @@ def files_changed_in(
             )
             for row in cache.fetch_files_for_commit(sha)
         ]
-    raw = _run_git(
+    raw = run_git(
         repo_root, "show", "--no-renames", "--numstat", "--format=", sha
     )
     out: list[FileChange] = []
@@ -674,7 +670,7 @@ def _co_changes_via_git(
     """The original cache-free implementation of :func:`co_changes`."""
     args = ["log", "--no-walk", "--numstat", "--format=%x1eCOMMIT"]
     args.extend(shas)
-    raw = _run_git(repo_root, *args)
+    raw = run_git(repo_root, *args)
     counter: Counter[str] = Counter()
     for line in raw.splitlines():
         line = line.strip()
@@ -705,7 +701,7 @@ def _populate_diffstat_cache(
         return
     args = ["log", "--no-walk", "--numstat", f"--pretty=format:{RECORD_SEP}%H"]
     args.extend(shas)
-    raw = _run_git(repo_root, *args)
+    raw = run_git(repo_root, *args)
     rows: list[tuple[str, str, int, int]] = []
     for record in raw.split(RECORD_SEP):
         record = record.strip("\n")
@@ -819,7 +815,7 @@ def load_diff_facts(
         f"{RECORD_SEP}%H{UNIT_SEP}%an{UNIT_SEP}%ae{UNIT_SEP}"
         f"%aI{UNIT_SEP}%s{UNIT_SEP}%b"
     )
-    raw = _run_git(
+    raw = run_git(
         repo_root,
         "log",
         "--no-merges",
@@ -843,7 +839,7 @@ def load_diff_facts(
         if files_rows:
             cache.upsert_commit_files(files_rows)
         try:
-            head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+            head_sha = run_git(repo_root, "rev-parse", "HEAD").strip()
         except GitError:
             head_sha = ""
         if head_sha and not cache.head_sha:
@@ -912,13 +908,7 @@ def _parse_log_with_files(
                 files.append(m.group(3))
                 continue
             body_lines.append(line)
-        try:
-            authored = _parse_iso(authored_at)
-        except ValueError:
-            # Bad timestamps from a single 15-year-old commit shouldn't kill
-            # the diff command. F1 (full timezone-tolerant parser) is owned
-            # by another branch; we degrade locally rather than crash.
-            continue
+        authored = _parse_iso(authored_at)
         body = "\n".join(body_lines).strip("\n")
         commit = Commit(
             sha=sha,
@@ -1246,7 +1236,7 @@ def dedupe_invariant_lines(
 
 def author_last_activity(repo_root: Path, email: str) -> datetime | None:
     """Most recent commit timestamp by ``email`` anywhere in the repo, or None."""
-    raw = _run_git(
+    raw = run_git(
         repo_root,
         "log",
         "-1",
@@ -1279,7 +1269,7 @@ def line_ownership(
     head_sha: str | None = None
     if cache is not None:
         try:
-            head_sha = _run_git(repo_root, "rev-parse", "HEAD").strip()
+            head_sha = run_git(repo_root, "rev-parse", "HEAD").strip()
         except GitError:
             head_sha = None
         if head_sha:
@@ -1287,7 +1277,7 @@ def line_ownership(
             if cached is not None:
                 return cached
     try:
-        raw = _run_git(repo_root, "blame", "--line-porcelain", "HEAD", "--", path)
+        raw = run_git(repo_root, "blame", "--line-porcelain", "HEAD", "--", path)
     except GitError:
         if cache is not None and head_sha:
             cache.store_line_ownership(path, head_sha, {})

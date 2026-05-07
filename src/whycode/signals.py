@@ -100,12 +100,7 @@ def _short(sha: str) -> str:
 
 
 def age_phrase(days: int) -> str:
-    """Render a days count as a human phrase used in headlines.
-
-    Public so the Risk Card narrative summary can reuse the same wording
-    detectors put into their headlines (e.g. "5 weeks ago", "3 months ago",
-    "2 years ago").
-    """
+    """Human phrase for a days count, reused across headlines and the narrative."""
     if days < 14:
         return f"{days} day{'s' if days != 1 else ''} ago"
     if days < 90:
@@ -114,10 +109,6 @@ def age_phrase(days: int) -> str:
         return f"{days // 30} months ago"
     years = days // 365
     return f"{years} year{'s' if years != 1 else ''} ago"
-
-
-# Back-compat alias so internal call-sites keep working without an import churn.
-_age_phrase = age_phrase
 
 
 def _decay_severity(severity: int, days_since_most_recent: int) -> int:
@@ -220,11 +211,11 @@ def detect_revert_chain(facts: RepoFacts) -> Signal | None:
     severity = min(5, 2 + n)
     revert_shas = {sha for sha, _ in facts.revert_pairs}
     revert_commits = [c for c in facts.commits if c.sha in revert_shas]
-    age_phrase = ""
+    age_suffix = ""
     if revert_commits:
         days = _days_since(max(c.authored_at for c in revert_commits))
         severity = _decay_severity(severity, days)
-        age_phrase = f" (most recent: {_age_phrase(days)})"
+        age_suffix = f" (most recent: {age_phrase(days)})"
     evidence = tuple(_short(rev) for rev, _ in facts.revert_pairs)
     pairs_text = ", ".join(f"{_short(rev)} reverts {_short(orig)}" for rev, orig in facts.revert_pairs)
     explanation = Explanation(
@@ -257,7 +248,7 @@ def detect_revert_chain(facts: RepoFacts) -> Signal | None:
     return Signal(
         kind=SignalKind.REVERT_CHAIN,
         severity=severity,
-        headline=f"{n} revert{'s' if n != 1 else ''} touched this file{age_phrase}",
+        headline=f"{n} revert{'s' if n != 1 else ''} touched this file{age_suffix}",
         detail=f"Reverts in this file's history: {pairs_text}.",
         evidence=evidence,
         explanation=explanation,
@@ -321,7 +312,7 @@ def detect_high_churn(facts: RepoFacts) -> Signal | None:
         kind=SignalKind.HIGH_CHURN,
         severity=severity,
         headline=f"High churn: {len(recent)} commits in last {cutoff_days} days",
-        detail="Code that changes this often is rarely settled — read recent diffs first.",
+        detail="",
         evidence=tuple(_short(c.sha) for c in recent[:5]),
         explanation=explanation,
         next_step=(
@@ -587,11 +578,11 @@ def detect_invariant_quotes(facts: RepoFacts) -> Signal | None:
     # Look up the most recent invariant-bearing commit and decay severity by age.
     quote_shas = {sha for _, sha in seen.items()}
     quote_commits = [c for c in facts.commits if c.sha in quote_shas]
-    age_phrase = ""
+    age_suffix = ""
     if quote_commits:
         days = _days_since(max(c.authored_at for c in quote_commits))
         severity = _decay_severity(severity, days)
-        age_phrase = f" (most recent: {_age_phrase(days)})"
+        age_suffix = f" (most recent: {age_phrase(days)})"
     evidence_shas: list[str] = []
     seen_shas: set[str] = set()
     for _, sha in quotes:
@@ -630,7 +621,7 @@ def detect_invariant_quotes(facts: RepoFacts) -> Signal | None:
         severity=severity,
         headline=(
             f"{total} invariant{'s' if total != 1 else ''} stated by past authors"
-            + age_phrase
+            + age_suffix
         ),
         detail="Past authors used cautionary language in commit messages:\n" + rendered,
         evidence=tuple(evidence_shas),
@@ -651,15 +642,21 @@ _DETECTORS = (
 )
 
 
-def all_signals(facts: RepoFacts) -> list[Signal]:
+def all_signals(facts: RepoFacts, *, skip_ghost_keeper: bool = False) -> list[Signal]:
     """Run every detector and return signals sorted by severity (loudest first).
 
     NEWBORN is suppressed when any other signal fires: it's a "we don't have
     enough history" hedge that becomes contradictory when the file has already
     surfaced real flags.
+
+    ``skip_ghost_keeper=True`` defers the per-file ``git blame`` call the
+    ghost-keeper detector runs. The diff command uses this on its first pass
+    over every changed file, then re-evaluates the top-N with the full ladder.
     """
     out: list[Signal] = []
     for detector in _DETECTORS:
+        if skip_ghost_keeper and detector is detect_ghost_keeper:
+            continue
         signal = detector(facts)
         if signal is not None:
             out.append(signal)

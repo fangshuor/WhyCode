@@ -116,10 +116,10 @@ def test_why_card_band_carries_dim_score_suffix(repo, days_ago) -> None:  # type
 
 
 def test_why_card_renders_narrative_summary(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
-    """The Risk Card opens with a two-sentence narrative composed entirely
-    from existing facts: file age + primary author + last activity, then the
-    strongest concern + the action implied by its next_step. This is the
-    "so what?" sentence a stranger reads first."""
+    """The Risk Card opens with a one-sentence grounding narrative
+    (file age + primary author + last activity). The signals table below
+    names the strongest concern + action; the narrative deliberately stops
+    at the grounding so the user reads each fact once."""
     from io import StringIO
 
     from rich.console import Console as _Console
@@ -140,18 +140,16 @@ def test_why_card_renders_narrative_summary(repo, days_ago) -> None:  # type: ig
         rc.render_text(card)
     )
     out = buf.getvalue()
-    # Sentence 1 — opens with the file path, then the templated narrative.
     assert "refund.py is " in out
     assert "commits old" in out
-    # Sentence 2 — names the strongest concern and recommends the action.
-    assert "The strongest concern is" in out
-    assert "consider " in out
-    assert " first." in out
+    # The narrative no longer restates the strongest signal; that lives in
+    # the per-signal next_step so the user reads it once.
+    assert "The strongest concern is" not in out
+    assert " first." not in out
 
 
 def test_why_card_narrative_quiet_when_no_signals(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
-    """A NO FLAGS card collapses the second sentence to one quiet, honest
-    line — matching ENGINEERING.md §4 ("empty is allowed; lying is not")."""
+    """A NO FLAGS card collapses to one honest line."""
     from io import StringIO
 
     from rich.console import Console as _Console
@@ -161,16 +159,13 @@ def test_why_card_narrative_quiet_when_no_signals(repo, days_ago) -> None:  # ty
     repo.commit("init", {"a.py": "1"}, when=days_ago(40))
     repo.commit("docs: tweak", {"a.py": "2"}, when=days_ago(20))
     card = rc.build(repo.root, "a.py")
-    # Filter to only NEWBORN-suppression check; this test is for "no signals".
-    # If signals fire on the synthetic repo, just skip — the assertion is on
-    # the empty-state branch.
     if not card.signals:
         buf = StringIO()
         _Console(file=buf, width=200, force_terminal=False, color_system=None).print(
             rc.render_text(card)
         )
         out = buf.getvalue()
-        assert "no risk signals fired" in out
+        assert "no flags fired" in out
         assert "Read the diff anyway" in out
 
 
@@ -284,8 +279,8 @@ def test_diff_json_output(repo, days_ago) -> None:  # type: ignore[no-untyped-de
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert "base" in data
-    assert "files" in data
-    assert isinstance(data["files"], list)
+    assert "buckets" in data
+    assert isinstance(data["buckets"], dict)
 
 
 def test_why_brief_one_line_format(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
@@ -817,9 +812,7 @@ def test_diff_markdown_output(repo, days_ago) -> None:  # type: ignore[no-untype
         f"### {band} (" in out
         for band in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK")
     )
-    assert "| Score | File | Top signal |" in out
-    assert "| ----: |" in out
-    # File path appears as inline code.
+    assert "| File | Top signal |" in out
     assert "`refund.py`" in out
 
 
@@ -1001,12 +994,9 @@ def test_outside_repo_every_command_exits_non_zero(tmp_path) -> None:  # type: i
 
 
 def test_uncaught_exception_in_command_body_exits_non_zero(repo, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """F11 — a command body that raises an unexpected exception used to
-    render a Rich traceback to stderr but exit with status 0. The
-    ``_propagate_failures`` wrapper now forces ``typer.Exit(2)`` so CI
-    integrations can tell the run silently failed."""
+    """A command body that raises an unexpected exception must exit non-zero
+    so CI integrations don't report a silent failure as green."""
     repo.commit("init", {"a.txt": "1"})
-    # Force ``all_commits`` to blow up partway through tour's body.
     from whycode import git_facts as gf
 
     def _boom(*_a: object, **_kw: object) -> object:
@@ -1016,10 +1006,11 @@ def test_uncaught_exception_in_command_body_exits_non_zero(repo, monkeypatch) ->
     cwd = os.getcwd()
     os.chdir(repo.root)
     try:
-        result = runner.invoke(app, ["tour"], catch_exceptions=False)
+        result = runner.invoke(app, ["tour"])
     finally:
         os.chdir(cwd)
     assert result.exit_code != 0
+    assert isinstance(result.exception, RuntimeError)
 
 
 def test_cache_stats_before_any_run_reports_no_cache(repo) -> None:  # type: ignore[no-untyped-def]
@@ -1283,10 +1274,6 @@ def test_diff_top_caps_total_rows_across_buckets(repo, days_ago) -> None:  # typ
     result = _invoke(repo.root, "diff", "--base", "HEAD~3", "--top", "3", "--json")
     assert result.exit_code == 0
     data = json.loads(result.output)
-    # Top-3 cap means exactly 3 file entries in `files`, regardless of how
-    # those 3 split across buckets.
-    assert len(data["files"]) == 3
-    # And the bucketed view sums to the same 3.
     bucketed_total = sum(len(v) for v in data["buckets"].values())
     assert bucketed_total == 3
 
@@ -1336,9 +1323,9 @@ def test_diff_markdown_emits_section_per_bucket(repo, days_ago) -> None:  # type
         f"### {band} (" in out
         for band in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK")
     ), out
-    # The bucket-internal table no longer has a Band column (the heading
-    # already encodes the band).
-    assert "| Score | File | Top signal |" in out
+    # The bucket-internal table only carries File + Top signal — the heading
+    # already encodes the band, the integer score adds nothing per row.
+    assert "| File | Top signal |" in out
 
 
 def test_tour_top_files_render_bucket_labels(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
