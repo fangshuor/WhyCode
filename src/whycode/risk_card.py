@@ -50,7 +50,37 @@ class RiskCard:
 
         return replace(self, decisions=decisions)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, explain: bool = False) -> dict[str, Any]:
+        """Render the card as a JSON-friendly dict.
+
+        With ``explain=True``, each signal entry grows an ``explanation``
+        key carrying the rule identifier, prose, evidence, and source
+        location populated by the detector. ``None`` is emitted when a
+        signal has no explanation attached (e.g. data ingested from an
+        older cache); the key is omitted entirely when ``explain`` is
+        off, so default consumers see no shape change.
+        """
+        signals_out: list[dict[str, Any]] = []
+        for s in self.signals:
+            entry: dict[str, Any] = {
+                "kind": s.kind.value,
+                "severity": s.severity,
+                "headline": s.headline,
+                "detail": s.detail,
+                "evidence": list(s.evidence),
+            }
+            if explain:
+                entry["explanation"] = (
+                    {
+                        "rule": s.explanation.rule,
+                        "why_it_fired": s.explanation.why_it_fired,
+                        "evidence": list(s.explanation.evidence),
+                        "source_ref": s.explanation.source_ref,
+                    }
+                    if s.explanation is not None
+                    else None
+                )
+            signals_out.append(entry)
         return {
             "path": self.path,
             "score": self.score.value,
@@ -67,16 +97,7 @@ class RiskCard:
                 if self.most_recent_sha
                 else None
             ),
-            "signals": [
-                {
-                    "kind": s.kind.value,
-                    "severity": s.severity,
-                    "headline": s.headline,
-                    "detail": s.detail,
-                    "evidence": list(s.evidence),
-                }
-                for s in self.signals
-            ],
+            "signals": signals_out,
             "decisions": [d.to_dict() for d in self.decisions],
         }
 
@@ -264,7 +285,7 @@ def _evidence_redundant(evidence: tuple[str, ...], detail: str) -> bool:
     return all(token in detail for token in evidence)
 
 
-def _signals_table(signals: tuple[sig.Signal, ...]) -> Table | Text:
+def _signals_table(signals: tuple[sig.Signal, ...], *, explain: bool = False) -> Table | Text:
     if not signals:
         return Text(
             "No flags fired. The history is quiet — this is information, "
@@ -280,6 +301,18 @@ def _signals_table(signals: tuple[sig.Signal, ...]) -> Table | Text:
         block.append(s.detail, style="")
         if s.evidence and not _evidence_redundant(s.evidence, s.detail):
             block.append("\nevidence: " + ", ".join(s.evidence), style="dim")
+        if explain and s.explanation is not None:
+            ex = s.explanation
+            block.append("\n", style="")
+            block.append("─ rule: ", style="dim")
+            block.append(ex.rule, style="dim bold")
+            if ex.source_ref:
+                block.append("  ", style="dim")
+                block.append(ex.source_ref, style="dim")
+            block.append("\n  fired because: ", style="dim")
+            block.append(ex.why_it_fired, style="dim")
+            if ex.evidence:
+                block.append("\n  evidence: " + ", ".join(ex.evidence), style="dim")
         table.add_row(_severity_badge(s.severity), block)
     return table
 
@@ -324,10 +357,10 @@ def _decisions_block(decisions: tuple[Decision, ...]) -> Padding:
     return Padding(panel, (1, 1, 0, 1))
 
 
-def render_text(card: RiskCard) -> Group:
+def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     pieces: list[Any] = [
         _header(card),
-        Padding(_signals_table(card.signals), (0, 1, 0, 1)),
+        Padding(_signals_table(card.signals, explain=explain), (0, 1, 0, 1)),
     ]
     if card.decisions:
         pieces.append(_decisions_block(card.decisions))

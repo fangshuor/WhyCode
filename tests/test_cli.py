@@ -124,6 +124,101 @@ def test_why_brief_one_line_format(repo, days_ago) -> None:  # type: ignore[no-u
     assert any(band in out for band in ("HANDLE", "READ", "WORTH", "NO FLAGS"))
 
 
+def test_why_explain_text_includes_rule_line(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: refund double-charge",
+        {"refund.py": "2"},
+        body="See incident #INC-447",
+        when=days_ago(20),
+    )
+    result = _invoke(repo.root, "why", "refund.py", "--explain")
+    assert result.exit_code == 0
+    out = result.output
+    # Each fired signal should print the literal "rule:" line.
+    assert "rule:" in out
+    # And the precise rule name for the revert detector should appear.
+    assert "revert_pair_default_message" in out
+    # The incident detector should expose its branch as well.
+    assert "incident_subject_keyword" in out
+    # The "fired because" prose intro should appear at least once.
+    assert "fired because:" in out
+
+
+def test_why_without_explain_omits_rule_line(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """Regression guard: the default rendering must not leak the explain block."""
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: refund double-charge",
+        {"refund.py": "2"},
+        body="See incident #INC-447",
+        when=days_ago(20),
+    )
+    result = _invoke(repo.root, "why", "refund.py")
+    assert result.exit_code == 0
+    out = result.output
+    assert "rule:" not in out
+    assert "fired because:" not in out
+
+
+def test_why_explain_json_includes_explanation_per_signal(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: refund double-charge",
+        {"refund.py": "2"},
+        body="See incident #INC-447",
+        when=days_ago(20),
+    )
+    result = _invoke(repo.root, "why", "refund.py", "--explain", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "signals" in data
+    # At least one signal exists and has the explanation key with the expected
+    # shape.
+    fired = [s for s in data["signals"] if s.get("explanation") is not None]
+    assert fired
+    sample = fired[0]["explanation"]
+    assert {"rule", "why_it_fired", "evidence", "source_ref"}.issubset(sample.keys())
+
+
+def test_why_json_without_explain_omits_explanation_key(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    """Regression guard: --json without --explain has no 'explanation' key."""
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    result = _invoke(repo.root, "why", "refund.py", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    for s in data["signals"]:
+        assert "explanation" not in s
+
+
+def test_why_explain_with_at_renders_explanation(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    """`--explain` must compose with `--at`: the historical card gets the same
+    explanation surface, since explanations are computed from the same L1+L2
+    facts the historical view rebuilds."""
+    repo.commit("init", {"a.py": "1"}, when=days_ago(60))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(40),
+    )
+    # As of HEAD the file already has an incident; --at HEAD should still
+    # surface the same branch.
+    result = _invoke(repo.root, "why", "a.py", "--explain", "--at", "HEAD")
+    assert result.exit_code == 0
+    assert "rule:" in result.output
+
+
 def test_diff_fail_on_triggers_when_threshold_breached(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     sha = repo.commit("init", {"a.py": "1"}, when=days_ago(60))
     repo.revert(sha, when=days_ago(50))

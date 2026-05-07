@@ -277,6 +277,15 @@ def why(
         "--no-cache",
         help="Bypass the local SQLite cache at .whycode/cache.db.",
     ),
+    explain: bool = typer.Option(
+        False,
+        "--explain",
+        help=(
+            "Below each signal, print the precise rule that fired: the literal "
+            "matched tokens, threshold values, and the source location of the "
+            "ladder branch. L1+L2 only — L3 (--llm) decisions are not annotated."
+        ),
+    ),
 ) -> None:
     """Print the Risk Card for ``path``."""
     repo_root, rel = _require_tracked(path)
@@ -365,12 +374,12 @@ def why(
                 card = card.with_decisions(tuple(decisions))
 
         if json_out:
-            console.print_json(json.dumps(card.to_dict()))
+            console.print_json(json.dumps(card.to_dict(explain=explain)))
             return
         if brief:
             _print_brief(card)
             return
-        console.print(rc.render_text(card))
+        console.print(rc.render_text(card, explain=explain))
     finally:
         if cache is not None:
             cache.close()
