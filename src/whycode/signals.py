@@ -65,6 +65,16 @@ class Signal:
     explanation: Explanation | None = None
     """Per-rule trace populated when ``whycode why --explain`` is on."""
 
+    next_step: str | None = None
+    """A concrete next action a careful reader should take given this signal.
+
+    Each detector knows the right hint better than a generic footer can: a
+    ``ghost_keeper`` finding suggests who to ask, a ``revert_chain`` finding
+    suggests reading both sides of the revert, an ``invariant_quote`` finding
+    restates the constraint as the action. ``None`` is allowed (e.g. NEWBORN —
+    not enough history to recommend anything).
+    """
+
 
 # ----- thresholds -----------------------------------------------------------
 COUPLING_MIN_COCHANGES = 3
@@ -89,8 +99,13 @@ def _short(sha: str) -> str:
     return sha[:7]
 
 
-def _age_phrase(days: int) -> str:
-    """Render a days count as a human phrase used in headlines."""
+def age_phrase(days: int) -> str:
+    """Render a days count as a human phrase used in headlines.
+
+    Public so the Risk Card narrative summary can reuse the same wording
+    detectors put into their headlines (e.g. "5 weeks ago", "3 months ago",
+    "2 years ago").
+    """
     if days < 14:
         return f"{days} day{'s' if days != 1 else ''} ago"
     if days < 90:
@@ -99,6 +114,10 @@ def _age_phrase(days: int) -> str:
         return f"{days // 30} months ago"
     years = days // 365
     return f"{years} year{'s' if years != 1 else ''} ago"
+
+
+# Back-compat alias so internal call-sites keep working without an import churn.
+_age_phrase = age_phrase
 
 
 def _decay_severity(severity: int, days_since_most_recent: int) -> int:
@@ -217,6 +236,24 @@ def detect_revert_chain(facts: RepoFacts) -> Signal | None:
         evidence=evidence,
         source_ref="src/whycode/git_facts.py:find_revert_pairs",
     )
+    # Most-recent revert pair drives the suggested action. Reading both sides
+    # tells the reader what was tried and why it broke.
+    if revert_commits:
+        latest_rev = max(revert_commits, key=lambda c: c.authored_at)
+        latest_orig = next(
+            (orig for rev, orig in facts.revert_pairs if rev == latest_rev.sha),
+            facts.revert_pairs[0][1],
+        )
+        next_step = (
+            f"Read both sides — git show {_short(latest_rev.sha)} then "
+            f"git show {_short(latest_orig)} — to learn what was tried and why it broke."
+        )
+    else:
+        rev_sha, orig_sha = facts.revert_pairs[0]
+        next_step = (
+            f"Read both sides — git show {_short(rev_sha)} then git show {_short(orig_sha)} — "
+            "to learn what was tried and why it broke."
+        )
     return Signal(
         kind=SignalKind.REVERT_CHAIN,
         severity=severity,
@@ -224,6 +261,7 @@ def detect_revert_chain(facts: RepoFacts) -> Signal | None:
         detail=f"Reverts in this file's history: {pairs_text}.",
         evidence=evidence,
         explanation=explanation,
+        next_step=next_step,
     )
 
 
@@ -245,6 +283,10 @@ def detect_incident_history(facts: RepoFacts) -> Signal | None:
         evidence=tokens,
         source_ref="src/whycode/git_facts.py:find_incidents",
     )
+    next_step = (
+        f"Read git show {_short(most_recent.sha)} to see the incident-flavoured "
+        "change in context."
+    )
     return Signal(
         kind=SignalKind.INCIDENT_HISTORY,
         severity=severity,
@@ -252,6 +294,7 @@ def detect_incident_history(facts: RepoFacts) -> Signal | None:
         detail=detail,
         evidence=tuple(_short(c.sha) for c in facts.incident_commits[:5]),
         explanation=explanation,
+        next_step=next_step,
     )
 
 
@@ -281,6 +324,10 @@ def detect_high_churn(facts: RepoFacts) -> Signal | None:
         detail="Code that changes this often is rarely settled — read recent diffs first.",
         evidence=tuple(_short(c.sha) for c in recent[:5]),
         explanation=explanation,
+        next_step=(
+            "Skim recent diffs for the live design intent: "
+            f"git log -p --since='90 days' -- {facts.path}"
+        ),
     )
 
 
@@ -322,6 +369,7 @@ def detect_coupling(facts: RepoFacts) -> Signal | None:
         ),
         source_ref="src/whycode/signals.py:detect_coupling",
     )
+    top_paths = ", ".join(p for p, _ in top[:3])
     return Signal(
         kind=SignalKind.COUPLING,
         severity=severity,
@@ -329,6 +377,7 @@ def detect_coupling(facts: RepoFacts) -> Signal | None:
         detail=f"Tends to change together with: {listed}.",
         evidence=tuple(p for p, _ in top),
         explanation=explanation,
+        next_step=f"Read these too — they tend to change together: {top_paths}.",
     )
 
 
@@ -362,6 +411,10 @@ def detect_silence(facts: RepoFacts) -> Signal | None:
         ),
         evidence=(_short(most_recent.sha),),
         explanation=explanation,
+        next_step=(
+            f"Untouched for {days} days. Verify it's still exercised "
+            "(run the relevant tests) before assuming stability."
+        ),
     )
 
 
@@ -476,6 +529,11 @@ def detect_ghost_keeper(facts: RepoFacts) -> Signal | None:
         ),
         evidence=(_short(primary_commit.sha),),
         explanation=explanation,
+        next_step=(
+            f"Primary author has been gone {days_since_seen} days. "
+            "Surface the change to your team before editing; consider "
+            f"git log --author='{primary_email}' -- {facts.path}."
+        ),
     )
 
 
@@ -557,6 +615,16 @@ def detect_invariant_quotes(facts: RepoFacts) -> Signal | None:
         evidence=tuple(matched_tokens) if matched_tokens else (f"matches={total}",),
         source_ref="src/whycode/git_facts.py:extract_invariant_quotes",
     )
+    # Pick the strongest single quote — by recency, then by length so a
+    # crisper one-liner beats a meandering one — and surface it as the action.
+    best_line = quotes[0][0]
+    if quote_commits:
+        latest_sha = max(quote_commits, key=lambda c: c.authored_at).sha
+        for line, sha in quotes:
+            if sha == latest_sha:
+                best_line = line
+                break
+    invariant_text = _first_sentence(best_line, _INVARIANT_BULLET_LEN)
     return Signal(
         kind=SignalKind.INVARIANT_QUOTE,
         severity=severity,
@@ -567,6 +635,7 @@ def detect_invariant_quotes(facts: RepoFacts) -> Signal | None:
         detail="Past authors used cautionary language in commit messages:\n" + rendered,
         evidence=tuple(evidence_shas),
         explanation=explanation,
+        next_step=f"Honour the invariant: {invariant_text}",
     )
 
 

@@ -8,6 +8,7 @@ Two output modes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Group
@@ -41,6 +42,11 @@ class RiskCard:
     as_of_sha: str | None = None
     """When set, the card was computed *as of* this commit (historical view)."""
 
+    primary_author: str | None = None
+    """Dominant contributor for this file by commit count. Used in the
+    narrative summary; does NOT replace the ghost-keeper detector's blame-
+    based primary owner (which is more accurate but more expensive)."""
+
     decisions: tuple[Decision, ...] = ()
     """L3 — LLM-extracted structured decisions. Empty unless ``--llm`` was on."""
 
@@ -68,6 +74,11 @@ class RiskCard:
                 "headline": s.headline,
                 "detail": s.detail,
                 "evidence": list(s.evidence),
+                # Per-signal action populated by every detector; None for
+                # NEWBORN where there isn't enough history to recommend
+                # anything. Always present in the JSON so downstream tooling
+                # can rely on the key existing.
+                "next_step": s.next_step,
             }
             if explain:
                 entry["explanation"] = (
@@ -86,6 +97,7 @@ class RiskCard:
             "score": self.score.value,
             "band": self.score.band.value,
             "commit_count": self.commit_count,
+            "primary_author": self.primary_author,
             "as_of": self.as_of_sha,
             "most_recent": (
                 {
@@ -184,6 +196,7 @@ def _from_facts(
         signals = supp.filter_signals(signals, suppressions, path)
     s = score(signals)
     head = facts.commits[0] if facts.commits else None
+    primary = _primary_author(facts.commits)
     return RiskCard(
         path=path,
         score=s,
@@ -194,7 +207,25 @@ def _from_facts(
         most_recent_author=head.author_name if head else None,
         most_recent_at=head.authored_at.isoformat() if head else None,
         as_of_sha=ref[:12] if ref else None,
+        primary_author=primary,
     )
+
+
+def _primary_author(commits: list[gf.Commit]) -> str | None:
+    """Return the most-frequent commit author by count.
+
+    Cheaper than the ghost-keeper detector's blame-based ownership computation
+    and good enough for the narrative summary. Ties resolve to the
+    lexicographically smallest name so cache and ``--no-cache`` produce the
+    same card byte-for-byte.
+    """
+    if not commits:
+        return None
+    counts: dict[str, int] = {}
+    for c in commits:
+        counts[c.author_name] = counts.get(c.author_name, 0) + 1
+    # Sort by (-count, name) so the highest count wins; lex smallest name on tie.
+    return sorted(counts, key=lambda name: (-counts[name], name))[0]
 
 
 # Detectors whose evidence is already in :class:`RepoFacts` (no git blame, no
@@ -330,6 +361,13 @@ def _signals_table(
             s.evidence, s.detail, extra_context=extra_context
         ):
             block.append("\nevidence: " + ", ".join(s.evidence), style="dim")
+        if s.next_step:
+            # Per-signal next step — replaces the old global "→ git show <sha>"
+            # footer with a hint specific to what fired (e.g. honour the
+            # invariant verbatim, read both sides of a revert, surface a
+            # ghost-keeper change to the team). Each detector knows the right
+            # action better than the rendering layer can guess.
+            block.append("\n→ " + s.next_step, style="dim")
         if explain and s.explanation is not None:
             ex = s.explanation
             block.append("\n", style="")
@@ -344,19 +382,6 @@ def _signals_table(
                 block.append("\n  evidence: " + ", ".join(ex.evidence), style="dim")
         table.add_row(_severity_badge(s.severity), block)
     return table
-
-
-def _next_step_hint(signals: tuple[sig.Signal, ...]) -> Text | None:
-    """Suggest a single concrete next action if a SHA-shaped evidence exists."""
-    for s in signals:
-        for token in s.evidence:
-            if 7 <= len(token) <= 12 and all(c in "0123456789abcdef" for c in token):
-                hint = Text()
-                hint.append("→ ", style="bold")
-                hint.append(f"git show {token}", style="bold cyan")
-                hint.append("   to read the most relevant commit in full", style="dim")
-                return hint
-    return None
 
 
 def _decisions_block(decisions: tuple[Decision, ...]) -> Padding:
@@ -386,6 +411,70 @@ def _decisions_block(decisions: tuple[Decision, ...]) -> Padding:
     return Padding(panel, (1, 1, 0, 1))
 
 
+def _last_touched_phrase(most_recent_at: str | None) -> str:
+    """Render the file's last activity as the same human phrase signals use.
+
+    Pulls from the ISO timestamp ``RiskCard.most_recent_at`` so the narrative
+    matches the wording detectors put into headlines. Falls back to "recently"
+    when the timestamp is missing or unparseable; the narrative still reads
+    naturally and the rest of the card has the precise date in the header.
+    """
+    if not most_recent_at:
+        return "recently"
+    try:
+        when = datetime.fromisoformat(most_recent_at)
+    except ValueError:
+        return "recently"
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    days = max(0, (datetime.now(UTC) - when).days)
+    return sig.age_phrase(days)
+
+
+def _narrative_summary(card: RiskCard) -> Text:
+    """Two sentences a careful reader wants before drilling into the card.
+
+    Sentence 1 grounds the file: how old, who wrote it, when last touched.
+    Sentence 2 names the strongest concern and what to do about it. The
+    quiet-repo case collapses to one honest sentence — empty is allowed,
+    lying is not (per ENGINEERING.md §4).
+    """
+    summary = Text()
+    last_touched = _last_touched_phrase(card.most_recent_at)
+    primary = card.primary_author or "an unknown author"
+    n = card.commit_count
+    plural = "s" if n != 1 else ""
+    summary.append(card.path, style="bold")
+    summary.append(
+        f" is {n} commit{plural} old, primarily authored by ",
+        style="",
+    )
+    summary.append(primary, style="bold")
+    summary.append(f", last touched {last_touched}.", style="")
+    if card.signals:
+        top = card.signals[0]
+        summary.append("\nThe strongest concern is ", style="")
+        summary.append(top.headline, style="bold")
+        if top.next_step:
+            # Splice the detector's hint into the second sentence verbatim,
+            # but trim a trailing period so the closing "first." reads cleanly
+            # ("consider X first." instead of "consider X. first.").
+            hint = top.next_step.rstrip().rstrip(".")
+            summary.append(f"; consider {hint} first.", style="")
+        else:
+            summary.append(".", style="")
+    else:
+        # NO FLAGS — replace the second sentence with one quiet honest one.
+        summary = Text()
+        summary.append(card.path, style="bold")
+        summary.append(
+            f" has {n} commit{plural} and no risk signals fired. "
+            "Read the diff anyway.",
+            style="",
+        )
+    return summary
+
+
 def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     # The header already prints the most-recent SHA in dim text. Pass it to
     # the signals table so single-SHA evidence (silence, newborn) is treated
@@ -394,6 +483,7 @@ def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     extra_context = card.most_recent_sha or ""
     pieces: list[Any] = [
         _header(card),
+        Padding(_narrative_summary(card), (0, 2, 1, 2)),
         Padding(
             _signals_table(card.signals, explain=explain, extra_context=extra_context),
             (0, 1, 0, 1),
@@ -401,9 +491,6 @@ def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     ]
     if card.decisions:
         pieces.append(_decisions_block(card.decisions))
-    hint = _next_step_hint(card.signals)
-    if hint is not None:
-        pieces.append(Padding(hint, (0, 1, 1, 2)))
     return Group(*pieces)
 
 

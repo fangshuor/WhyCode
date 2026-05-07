@@ -506,3 +506,120 @@ def test_ghost_keeper_explanation_names_inactive_owner(
     assert signal.explanation.rule.startswith("ghost_keeper_")
     joined = " ".join(signal.explanation.evidence)
     assert "days_since_active=" in joined
+
+
+# ---------------------------------------------------------------------------
+# next_step — each detector populates a concrete action a careful reader
+# would take given the signal. Locks down the wording per kind so a future
+# refactor doesn't accidentally lose the actionable hint.
+# ---------------------------------------------------------------------------
+
+
+def test_revert_chain_next_step_names_both_sides(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    sha = repo.commit("feat: A", {"x.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    facts = _facts_for(repo, "x.py")
+    signal = sig.detect_revert_chain(facts)
+    assert signal is not None
+    assert signal.next_step is not None
+    assert "Read both sides" in signal.next_step
+    assert "git show" in signal.next_step
+    assert sha[:7] in signal.next_step
+
+
+def test_incident_history_next_step_names_most_recent(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("feat: refunds", {"refund.py": "1"}, when=days_ago(120))
+    sha = repo.commit(
+        "hotfix: refund double-charge",
+        {"refund.py": "2"},
+        body="See incident #INC-447",
+        when=days_ago(30),
+    )
+    facts = _facts_for(repo, "refund.py")
+    signal = sig.detect_incident_history(facts)
+    assert signal is not None
+    assert signal.next_step is not None
+    assert sha[:7] in signal.next_step
+    assert "incident-flavoured" in signal.next_step
+
+
+def test_invariant_quote_next_step_restates_the_constraint(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "compat: keep sync path",
+        {"x.py": "1"},
+        body="Do not switch to async — v1 clients break.",
+        when=days_ago(30),
+    )
+    facts = _facts_for(repo, "x.py")
+    signal = sig.detect_invariant_quotes(facts)
+    assert signal is not None
+    assert signal.next_step is not None
+    assert signal.next_step.startswith("Honour the invariant:")
+    assert "Do not switch to async" in signal.next_step
+
+
+def test_coupling_next_step_lists_top_coupled_paths(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1", "b.py": "1"}, when=days_ago(60))
+    repo.commit("change", {"a.py": "2", "b.py": "2"}, when=days_ago(50))
+    repo.commit("change", {"a.py": "3", "b.py": "3"}, when=days_ago(40))
+    repo.commit("change", {"a.py": "4", "b.py": "4"}, when=days_ago(30))
+    facts = _facts_for(repo, "a.py")
+    signal = sig.detect_coupling(facts)
+    assert signal is not None
+    assert signal.next_step is not None
+    assert "tend to change together" in signal.next_step
+    assert "b.py" in signal.next_step
+
+
+def test_silence_next_step_recommends_running_tests(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"old.py": "1"}, when=days_ago(400))
+    facts = _facts_for(repo, "old.py")
+    signal = sig.detect_silence(facts)
+    assert signal is not None
+    assert signal.next_step is not None
+    assert "Verify it's still exercised" in signal.next_step
+    assert "tests" in signal.next_step.lower()
+
+
+def test_high_churn_next_step_includes_path(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    for i in range(7):
+        repo.commit(f"tweak {i}", {"hot.py": str(i)}, when=days_ago(80 - i * 5))
+    facts = _facts_for(repo, "hot.py")
+    signal = sig.detect_high_churn(facts)
+    assert signal is not None
+    assert signal.next_step is not None
+    assert "git log -p" in signal.next_step
+    assert "hot.py" in signal.next_step
+
+
+def test_ghost_keeper_next_step_names_path_and_email(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    repo.commit(
+        "init",
+        {"legacy.py": "1"},
+        when=days_ago(800),
+        author_name="Old Owner",
+        author_email="ghost@example.com",
+    )
+    repo.commit(
+        "tweak",
+        {"legacy.py": "2"},
+        when=days_ago(750),
+        author_name="Old Owner",
+        author_email="ghost@example.com",
+    )
+    facts = _facts_for(repo, "legacy.py")
+    signal = sig.detect_ghost_keeper(facts)
+    assert signal is not None
+    assert signal.next_step is not None
+    assert "Surface the change to your team" in signal.next_step
+    assert "legacy.py" in signal.next_step
+    assert "ghost@example.com" in signal.next_step
+
+
+def test_newborn_has_no_next_step(repo, now) -> None:  # type: ignore[no-untyped-def]
+    repo.commit("init", {"a.py": "1"}, when=now)
+    facts = _facts_for(repo, "a.py")
+    signal = sig.detect_newborn(facts)
+    assert signal is not None
+    # Brief: not enough history to recommend anything.
+    assert signal.next_step is None

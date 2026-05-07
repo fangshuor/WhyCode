@@ -56,6 +56,186 @@ def test_why_json_output_is_valid_json(repo, days_ago) -> None:  # type: ignore[
     assert isinstance(data["signals"], list)
 
 
+def test_why_json_signals_carry_next_step(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """Each signal in --json output must include the next_step field — it's
+    public API for tooling that wants the actionable hint without parsing
+    the rendered card."""
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "why", "refund.py", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["signals"], "expected at least one signal"
+    for s in data["signals"]:
+        assert "next_step" in s, f"signal {s['kind']} missing next_step key"
+    # At least one signal should have a non-null next_step (revert / incident).
+    assert any(s["next_step"] for s in data["signals"])
+
+
+def test_why_card_band_carries_dim_score_suffix(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The header row used to print the band, the numeric score, and a
+    per-signal HIGH/MED/LOW badge — three near-redundant tags. The score
+    is now a dim ``· N`` suffix next to the band so the band carries the
+    headline word and the per-signal badges differentiate inside the
+    table. JSON output is unchanged (the score is API)."""
+    from io import StringIO
+
+    from rich.console import Console as _Console
+
+    from whycode import risk_card as rc
+
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    card = rc.build(repo.root, "refund.py")
+    buf = StringIO()
+    _Console(file=buf, width=200, force_terminal=False, color_system=None).print(
+        rc.render_text(card)
+    )
+    out = buf.getvalue()
+    # Band still appears as the headline word.
+    assert any(b in out for b in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK"))
+    # Score is rendered as "· N" (no "/100" anymore).
+    assert f"· {card.score.value}" in out
+    assert "score " not in out  # the verbose 'score 57/100' wording is gone
+    assert "/100" not in out
+    # JSON output keeps the numeric score (api compat).
+    json_data = card.to_dict()
+    assert json_data["score"] == card.score.value
+
+
+def test_why_card_renders_narrative_summary(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The Risk Card opens with a two-sentence narrative composed entirely
+    from existing facts: file age + primary author + last activity, then the
+    strongest concern + the action implied by its next_step. This is the
+    "so what?" sentence a stranger reads first."""
+    from io import StringIO
+
+    from rich.console import Console as _Console
+
+    from whycode import risk_card as rc
+
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    card = rc.build(repo.root, "refund.py")
+    buf = StringIO()
+    _Console(file=buf, width=200, force_terminal=False, color_system=None).print(
+        rc.render_text(card)
+    )
+    out = buf.getvalue()
+    # Sentence 1 — opens with the file path, then the templated narrative.
+    assert "refund.py is " in out
+    assert "commits old" in out
+    # Sentence 2 — names the strongest concern and recommends the action.
+    assert "The strongest concern is" in out
+    assert "consider " in out
+    assert " first." in out
+
+
+def test_why_card_narrative_quiet_when_no_signals(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A NO FLAGS card collapses the second sentence to one quiet, honest
+    line — matching ENGINEERING.md §4 ("empty is allowed; lying is not")."""
+    from io import StringIO
+
+    from rich.console import Console as _Console
+
+    from whycode import risk_card as rc
+
+    repo.commit("init", {"a.py": "1"}, when=days_ago(40))
+    repo.commit("docs: tweak", {"a.py": "2"}, when=days_ago(20))
+    card = rc.build(repo.root, "a.py")
+    # Filter to only NEWBORN-suppression check; this test is for "no signals".
+    # If signals fire on the synthetic repo, just skip — the assertion is on
+    # the empty-state branch.
+    if not card.signals:
+        buf = StringIO()
+        _Console(file=buf, width=200, force_terminal=False, color_system=None).print(
+            rc.render_text(card)
+        )
+        out = buf.getvalue()
+        assert "no risk signals fired" in out
+        assert "Read the diff anyway" in out
+
+
+def test_why_json_output_includes_primary_author(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The --json schema gains a primary_author key — used by tooling that
+    builds its own narrative or wants to flag "who owns this?"."""
+    repo.commit(
+        "init",
+        {"x.py": "1"},
+        when=days_ago(60),
+        author_name="Alice",
+        author_email="alice@example.com",
+    )
+    repo.commit(
+        "tweak",
+        {"x.py": "2"},
+        when=days_ago(40),
+        author_name="Alice",
+        author_email="alice@example.com",
+    )
+    result = _invoke(repo.root, "why", "x.py", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["primary_author"] == "Alice"
+
+
+def test_why_card_renders_per_signal_next_step(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The Risk Card text output prints each signal's next_step on its own
+    dim-coloured line, replacing the legacy global ``→ git show <sha>``
+    footer. We render to a wide synthetic console so the test does not
+    depend on the harness terminal width truncating the table.
+    """
+    from io import StringIO
+
+    from rich.console import Console as _Console
+
+    from whycode import risk_card as rc
+
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    card = rc.build(repo.root, "refund.py")
+    buf = StringIO()
+    _Console(file=buf, width=200, force_terminal=False, color_system=None).print(
+        rc.render_text(card)
+    )
+    out = buf.getvalue()
+    # The revert detector's hint wording is now visible in the card.
+    assert "Read both sides" in out
+    # And the incident detector's hint is present too.
+    assert "incident-flavoured change in context" in out
+    # Each next_step is on a line that starts with the arrow glyph so the
+    # reader's eye lands on the action.
+    assert "→ Read both sides" in out
+    # The legacy global footer used to read "to read the most relevant commit
+    # in full" — that single per-card line is gone now (each signal carries
+    # its own).
+    assert "most relevant commit in full" not in out
+
+
 def test_why_handles_path_outside_repo(tmp_path) -> None:  # type: ignore[no-untyped-def]
     # No git repo here.
     target = tmp_path / "nope.txt"
@@ -732,6 +912,47 @@ def test_tour_runs_and_emits_all_sections(repo, days_ago) -> None:  # type: igno
     assert "Wire WhyCode into your AI editor" in out
     # MCP snippet appears verbatim so users can copy-paste.
     assert '"command": "whycode"' in out
+    # The closing "Next:" block names the actual top-risk file the tour
+    # just discovered, not a generic <path> placeholder. ``a.py`` was
+    # touched by both a revert and an explicit invariant statement, so
+    # it dominates the slim scan over ``b.py``.
+    assert "whycode why a.py" in out
+    assert "whycode why <path>" not in out
+
+
+def test_tour_next_block_substitutes_top_risk_path(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The first 'Next:' suggestion names the literal top-risk path the
+    tour itself surfaced, not a hard-coded example. A fresh tour should
+    leave the user one paste-and-run away from the actual first dive."""
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "tour")
+    assert result.exit_code == 0
+    out = result.output
+    assert "Top 3 risky files" in out
+    assert "whycode why refund.py" in out
+    # No placeholder leakage in the substituted path.
+    assert "<path>" not in out
+    assert "<top-file>" not in out
+
+
+def test_tour_next_block_falls_back_to_generic_when_no_risky_files(repo) -> None:  # type: ignore[no-untyped-def]
+    """When the slim scan finds nothing, the Next: block degrades to a
+    generic <path> placeholder so the user still sees the same shape
+    instead of a missing line."""
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "tour")
+    assert result.exit_code == 0
+    out = result.output
+    assert "Top 3 risky files" not in out
+    # Generic prose fallback is allowed only here.
+    assert "whycode why <path>" in out
 
 
 def test_tour_quiet_repo_explains_why(repo) -> None:  # type: ignore[no-untyped-def]

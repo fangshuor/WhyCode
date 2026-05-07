@@ -5,6 +5,143 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.5.4] — 2026-05-07
+
+### Changed — Risk Card opens with a narrative, each signal carries its own next step
+
+The Risk Card was a list of facts. Real users read it, blinked, and had
+to mentally synthesise "so what?" before drilling into the per-signal
+list. This release lifts that synthesis to the top of the card and
+makes every signal carry its own concrete action — no more generic
+`→ git show <sha>` footer that ignored what the signal actually said.
+
+#### Two-sentence narrative summary
+
+A new templated narrative block opens every Risk Card, immediately
+under the header panel. It reads as one paragraph, two sentences:
+
+1. file age + primary author + last activity, and
+2. the dominant concern + the action implied by its `next_step`.
+
+NO FLAGS cards collapse to one quiet honest sentence ("`<path>` has N
+commits and no risk signals fired. Read the diff anyway.") so the
+empty case never lies and never spams.
+
+This is L1+L2 only — there is no LLM call, no new git command, no
+new dependency. The wording reuses the same `age_phrase` ("5 weeks
+ago / 3 months ago / 2 years ago") detectors already put into their
+headlines, so the card reads consistently top-to-bottom.
+
+#### Per-signal `next_step`
+
+The `Signal` dataclass gained one optional field, `next_step:
+str | None`. Each detector now populates it with the action a careful
+reader would take given that signal — and the rendering layer prints
+it on its own dim-coloured line directly under the signal detail. The
+old global `→ git show <sha>` footer (which picked "the most-relevant"
+SHA by a heuristic that ignored what the signal said) is gone.
+
+Wording per kind:
+
+| signal kind         | next_step                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| `revert_chain`      | Read both sides — `git show <revert>` then `git show <reverted>` — to learn …            |
+| `incident_history`  | Read `git show <most_recent_incident>` to see the incident-flavoured change in context.    |
+| `ghost_keeper`      | Primary author has been gone N days. Surface to your team; `git log --author='<email>' --` |
+| `invariant_quote`   | Honour the invariant: `<verbatim quote>`.                                                  |
+| `coupling`          | Read these too — they tend to change together: `<top-3 paths>`.                            |
+| `silence`           | Untouched for N days. Verify it's still exercised (run the relevant tests) …               |
+| `high_churn`        | Skim recent diffs for the live design intent: `git log -p --since='90 days' -- <path>`     |
+| `newborn`           | `None` — not enough history to recommend anything.                                         |
+
+`whycode why --json` now includes `next_step` per signal under
+`signals[]`. The schema is wider but backwards-compatible — existing
+keys are untouched.
+
+#### Trim visual redundancy
+
+The header used to compete for attention with three near-redundant
+tags: a band, a bold numeric score, and a per-signal severity badge.
+The score is now a small dim `· N` suffix on the band line; the band
+carries the headline word and the per-signal badges differentiate
+inside the table. The numeric score stays in `--json` output as it
+is public API.
+
+#### `whycode tour` ending substitutes the actual top-risk path
+
+The tour ends with a `Next:` block whose first suggestion is now the
+literal path of the file the slim scan ranked #1, so a fresh tour
+leaves the user one paste-and-run away from the actual first dive.
+When the slim scan surfaces nothing, the line degrades to a generic
+`<path>` placeholder so every tour ends with the same shape.
+
+### Before / after
+
+The same file as rendered by 0.5.2 (top of card) versus 0.5.4:
+
+```
+0.5.2:
+╭─  READ HISTORY FIRST  score 57/100 ──────────────────────────╮
+│ refund.py   (3 commits)                                       │
+│ Latest: hotfix: regression                                    │
+│         …                                                     │
+╰───────────────────────────────────────────────────────────────╯
+   HIGH    1 revert touched this file (most recent: 7 weeks ago)
+           Reverts in this file's history: 4a9ba84 reverts …
+   MED     1 incident-flagged change in history
+           …
+→ git show 4a9ba84   to read the most relevant commit in full
+```
+
+```
+0.5.4:
+╭─  READ HISTORY FIRST  · 51 ──────────────────────────────────╮
+│ refund.py   (3 commits)                                       │
+│ Latest: hotfix: regression                                    │
+│         …                                                     │
+╰───────────────────────────────────────────────────────────────╯
+  refund.py is 3 commits old, primarily authored by Kevin, last
+  touched 16 days ago.
+  The strongest concern is 1 revert touched this file (most recent:
+  7 weeks ago); consider Read both sides — git show 4a9ba84 then
+  git show 1c4d3e2 — to learn what was tried and why it broke first.
+
+   HIGH    1 revert touched this file (most recent: 7 weeks ago)
+           Reverts in this file's history: 4a9ba84 reverts …
+           → Read both sides — git show 4a9ba84 then git show 1c4d3e2
+             — to learn what was tried and why it broke.
+
+   MED     1 incident-flagged change in history
+           …
+           → Read git show 7e22a04 to see the incident-flavoured
+             change in context.
+```
+
+### Internal
+
+- `src/whycode/signals.py` — `Signal` gained `next_step: str | None`;
+  every detector populates it. `_age_phrase` is now public as
+  `age_phrase` so the rendering layer can reuse it; the old name
+  remains a back-compat alias.
+- `src/whycode/risk_card.py` — `RiskCard` gained `primary_author` (by
+  commit count, cheaper than the ghost-keeper detector's blame-based
+  primary owner). `_narrative_summary` composes the two-sentence block
+  from facts already on the card — no extra git calls. The legacy
+  `_next_step_hint` global footer was removed; per-signal hints render
+  inside `_signals_table`. The header line drops `score N/100` for a
+  dim `· N` suffix on the band.
+- `src/whycode/cli.py` — the tour's `Next:` block falls back to a
+  generic `<path>` placeholder only when the slim scan finds no
+  flagged files; otherwise the literal top-risk path is substituted.
+
+### Tests
+
+- 16 new tests cover the `next_step` wording per detector, the JSON
+  schema additions, the narrative block, the band+score format, and
+  both branches of the tour `Next:` line.
+- 226 tests passing total (210 from 0.5.2 + 16 new). ruff + mypy strict
+  clean.
+
 ## [0.5.3] — 2026-05-07
 
 ### Changed — `whycode diff` is now bucketed by band
@@ -119,6 +256,7 @@ communicate per-detector weight, not band.
 
 201 tests passing (194 from 0.5.0 + 7 new). ruff + mypy strict clean.
 Privacy contract is unchanged — bucketing is rendering-only.
+
 ## [0.5.2] — 2026-05-07
 
 ### Added — `whycode why <path> --explain` makes the rule ladder transparent
