@@ -294,13 +294,16 @@ def test_first_sentence_splits_at_real_boundary() -> None:
 
 
 def test_invariant_signal_caps_at_three_bullets(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
-    # Spread the five invariants across five separate commits so the F2
-    # per-commit cap of two does not apply (it only filters within a single
-    # commit body — commits each contribute up to two genuine constraints).
+    # Five invariants across five commits. The per-commit cap of two only
+    # applies within a single body, so each commit contributes one phrase.
+    # Tokens used: "do not", "important:", "danger:", "workaround", "tradeoff" —
+    # the loud lowercase "warning:" / "note:" tokens are deliberately excluded
+    # because real OSS history has lint-paste lines like "the warning:" that
+    # self-flag as bogus invariants.
     bodies = [
         "Do not switch to async — v1 clients break.",
         "Important: keep the legacy header in place.",
-        "Warning: idempotency token must be unique.",
+        "Danger: idempotency token must be unique.",
         "Workaround for upstream bug #5: noop when input is empty.",
         "Tradeoff: we accept ~10ms latency to keep correctness.",
     ]

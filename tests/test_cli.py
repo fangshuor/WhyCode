@@ -240,11 +240,13 @@ def test_why_handles_path_outside_repo(tmp_path) -> None:  # type: ignore[no-unt
 
 
 def test_why_warns_on_untracked_path(repo) -> None:  # type: ignore[no-untyped-def]
+    """Untracked path → exit 2 (so a CI loop running `whycode why` per file
+    fails loudly on a typo instead of silently succeeding)."""
     repo.commit("init", {"a.txt": "1"})
     result = _invoke(repo.root, "why", "phantom.txt")
-    assert result.exit_code == 1
-    assert "warning" in result.output.lower()
+    assert result.exit_code == 2
     assert "phantom.txt" in result.output
+    assert "not tracked" in result.output
 
 
 def test_diff_lists_changed_files_in_risk_order(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
