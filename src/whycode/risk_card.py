@@ -68,6 +68,11 @@ class RiskCard:
                 "headline": s.headline,
                 "detail": s.detail,
                 "evidence": list(s.evidence),
+                # Per-signal action populated by every detector; None for
+                # NEWBORN where there isn't enough history to recommend
+                # anything. Always present in the JSON so downstream tooling
+                # can rely on the key existing.
+                "next_step": s.next_step,
             }
             if explain:
                 entry["explanation"] = (
@@ -330,6 +335,13 @@ def _signals_table(
             s.evidence, s.detail, extra_context=extra_context
         ):
             block.append("\nevidence: " + ", ".join(s.evidence), style="dim")
+        if s.next_step:
+            # Per-signal next step — replaces the old global "→ git show <sha>"
+            # footer with a hint specific to what fired (e.g. honour the
+            # invariant verbatim, read both sides of a revert, surface a
+            # ghost-keeper change to the team). Each detector knows the right
+            # action better than the rendering layer can guess.
+            block.append("\n→ " + s.next_step, style="dim")
         if explain and s.explanation is not None:
             ex = s.explanation
             block.append("\n", style="")
@@ -344,19 +356,6 @@ def _signals_table(
                 block.append("\n  evidence: " + ", ".join(ex.evidence), style="dim")
         table.add_row(_severity_badge(s.severity), block)
     return table
-
-
-def _next_step_hint(signals: tuple[sig.Signal, ...]) -> Text | None:
-    """Suggest a single concrete next action if a SHA-shaped evidence exists."""
-    for s in signals:
-        for token in s.evidence:
-            if 7 <= len(token) <= 12 and all(c in "0123456789abcdef" for c in token):
-                hint = Text()
-                hint.append("→ ", style="bold")
-                hint.append(f"git show {token}", style="bold cyan")
-                hint.append("   to read the most relevant commit in full", style="dim")
-                return hint
-    return None
 
 
 def _decisions_block(decisions: tuple[Decision, ...]) -> Padding:
@@ -401,9 +400,6 @@ def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     ]
     if card.decisions:
         pieces.append(_decisions_block(card.decisions))
-    hint = _next_step_hint(card.signals)
-    if hint is not None:
-        pieces.append(Padding(hint, (0, 1, 1, 2)))
     return Group(*pieces)
 
 

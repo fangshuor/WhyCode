@@ -56,6 +56,67 @@ def test_why_json_output_is_valid_json(repo, days_ago) -> None:  # type: ignore[
     assert isinstance(data["signals"], list)
 
 
+def test_why_json_signals_carry_next_step(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """Each signal in --json output must include the next_step field — it's
+    public API for tooling that wants the actionable hint without parsing
+    the rendered card."""
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "why", "refund.py", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["signals"], "expected at least one signal"
+    for s in data["signals"]:
+        assert "next_step" in s, f"signal {s['kind']} missing next_step key"
+    # At least one signal should have a non-null next_step (revert / incident).
+    assert any(s["next_step"] for s in data["signals"])
+
+
+def test_why_card_renders_per_signal_next_step(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The Risk Card text output prints each signal's next_step on its own
+    dim-coloured line, replacing the legacy global ``→ git show <sha>``
+    footer. We render to a wide synthetic console so the test does not
+    depend on the harness terminal width truncating the table.
+    """
+    from io import StringIO
+
+    from rich.console import Console as _Console
+
+    from whycode import risk_card as rc
+
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    card = rc.build(repo.root, "refund.py")
+    buf = StringIO()
+    _Console(file=buf, width=200, force_terminal=False, color_system=None).print(
+        rc.render_text(card)
+    )
+    out = buf.getvalue()
+    # The revert detector's hint wording is now visible in the card.
+    assert "Read both sides" in out
+    # And the incident detector's hint is present too.
+    assert "incident-flavoured change in context" in out
+    # Each next_step is on a line that starts with the arrow glyph so the
+    # reader's eye lands on the action.
+    assert "→ Read both sides" in out
+    # The legacy global footer used to read "to read the most relevant commit
+    # in full" — that single per-card line is gone now (each signal carries
+    # its own).
+    assert "most relevant commit in full" not in out
+
+
 def test_why_handles_path_outside_repo(tmp_path) -> None:  # type: ignore[no-untyped-def]
     # No git repo here.
     target = tmp_path / "nope.txt"
