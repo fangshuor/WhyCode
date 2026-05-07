@@ -40,7 +40,57 @@ def test_default_patterns_do_not_match_normal_code() -> None:
     assert not is_ignored("src/whycode/cli.py", DEFAULT_IGNORE_PATTERNS)
     assert not is_ignored("README.md", DEFAULT_IGNORE_PATTERNS)
     assert not is_ignored("tests/test_cli.py", DEFAULT_IGNORE_PATTERNS)
-    assert not is_ignored("Makefile", DEFAULT_IGNORE_PATTERNS)
+    assert not is_ignored("requirements.txt", DEFAULT_IGNORE_PATTERNS)
+
+
+def test_default_patterns_match_ci_and_repo_metadata() -> None:
+    """F8 — django's top-10 risk list was dominated by .github workflows,
+    AUTHORS, .gitignore, locale ``.po`` files, and similar high-touch
+    metadata. These get filtered out by default so real code can rank."""
+    assert is_ignored(".github/workflows/tests.yml", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored(".github/workflows/linters.yml", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored(".gitignore", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored(".gitattributes", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored(".editorconfig", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored(".pre-commit-config.yaml", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored(".readthedocs.yaml", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored(".flake8", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("tox.ini", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("pytest.ini", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("Makefile", DEFAULT_IGNORE_PATTERNS)
+
+
+def test_default_patterns_match_membership_and_licensing() -> None:
+    assert is_ignored("AUTHORS", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("AUTHORS.rst", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("CONTRIBUTORS", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("LICENSE", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("LICENSE.txt", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("LICENSE.md", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("COPYING", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("NOTICE", DEFAULT_IGNORE_PATTERNS)
+
+
+def test_default_patterns_match_packaging() -> None:
+    assert is_ignored("setup.py", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("setup.cfg", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("MANIFEST.in", DEFAULT_IGNORE_PATTERNS)
+
+
+def test_default_patterns_match_translation_catalogues() -> None:
+    assert is_ignored("django/conf/locale/en/LC_MESSAGES/django.po", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("django/conf/locale/mn/LC_MESSAGES/django.mo", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("locale/messages.pot", DEFAULT_IGNORE_PATTERNS)
+
+
+def test_default_patterns_conservative_about_txt_files() -> None:
+    """Only release-notes-shaped ``*.txt`` paths are filtered; ordinary
+    ``requirements.txt`` / ``constraints.txt`` stay visible because they
+    are real dependency surfaces."""
+    assert is_ignored("docs/releases/4.2.txt", DEFAULT_IGNORE_PATTERNS)
+    assert is_ignored("release_notes/v1.txt", DEFAULT_IGNORE_PATTERNS)
+    assert not is_ignored("requirements.txt", DEFAULT_IGNORE_PATTERNS)
+    assert not is_ignored("constraints/runtime.txt", DEFAULT_IGNORE_PATTERNS)
 
 
 def test_basename_match_for_root_pattern_in_subdir() -> None:
