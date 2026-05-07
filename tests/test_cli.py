@@ -840,3 +840,31 @@ def test_scan_text_is_byte_identical_across_cache_state(
     zeta_pos = cold.find("zeta.py")
     assert alpha_pos != -1
     assert zeta_pos != -1
+    assert alpha_pos < zeta_pos
+
+
+# ---- F7: --no-cache uses an in-memory cache for amortisation -------------
+
+
+def test_no_cache_scan_matches_warm_scan_byte_for_byte(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """Cache-correctness contract: ``--no-cache`` must agree with the
+    persistent cache on the same HEAD. The in-memory ``:memory:`` store
+    backing ``--no-cache`` shares the same git-walk and dedup code paths
+    as the on-disk store; output must be byte-identical.
+    """
+    sha = repo.commit("feature", {"a.py": "1", "b.py": "1"}, when=days_ago(50))
+    repo.revert(sha, when=days_ago(45))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2", "b.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(10),
+    )
+    # Warm path first (writes the on-disk cache).
+    warm = _invoke(repo.root, "scan", "--top", "5").output
+    no_cache = _invoke(repo.root, "scan", "--top", "5", "--no-cache").output
+    warm_again = _invoke(repo.root, "scan", "--top", "5").output
+    assert warm == no_cache
+    assert warm == warm_again

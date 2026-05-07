@@ -50,18 +50,27 @@ err = Console(stderr=True)
 
 
 def _open_cache(repo_root: Path, no_cache: bool) -> ch.CacheStore | None:
-    """Open the on-disk cache for ``repo_root`` unless suppressed.
+    """Open the cache for ``repo_root`` according to the no-cache flag.
 
-    A None return means "do not pass a cache through git_facts" — every
-    git-side helper falls back to its original network-free, cache-free
-    implementation. This is the escape hatch behind ``--no-cache`` and
-    is also the default when the cache cannot be initialised at all
-    (read-only filesystem, etc.); we never want a cache failure to
-    block the main read path.
+    Modes:
+      * ``no_cache=False`` (the default): persistent on-disk SQLite at
+        ``.whycode/cache.db``.
+      * ``no_cache=True``: a transient ``:memory:`` SQLite store. The
+        same git-walk code path runs as for the cold-fill, but the
+        database is destroyed on ``close()`` — nothing lands on disk
+        and the next run starts cold. Keeping per-run amortisation
+        (one ``git log`` walk shared across files) is what makes
+        ``--no-cache`` at most as slow as a cold persistent fill;
+        the previous ``cache=None`` short-circuit lost that and so
+        ``--no-cache`` re-issued per-file walks every iteration.
+
+    A ``None`` return means "do not pass a cache through git_facts".
+    Happens only when even an in-memory open fails — very rare and
+    we never want a cache problem to block the main read path.
     """
-    if no_cache:
-        return None
     try:
+        if no_cache:
+            return ch.open_in_memory(repo_root)
         return ch.open_for(repo_root)
     except OSError:
         return None
