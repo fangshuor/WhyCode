@@ -1357,13 +1357,27 @@ def tour(
             cards.sort(key=lambda c: (-c.score.value, c.path))
 
         if cards:
+            top_cards = cards[:3]
+            # Group the top 3 under their band headings — same shape the
+            # diff command uses, applied to a much shorter list. Three rows
+            # is small enough that the bucket headers don't feel
+            # bureaucratic; the visual consistency with ``whycode diff`` is
+            # what's worth the extra line.
             console.print("[bold red]Top 3 risky files[/bold red]")
-            for top in cards[:3]:
+            top_buckets = _group_into_buckets(list(top_cards))
+            for band in _BUCKET_ORDER:
+                rows = top_buckets[band]
+                if not rows or band == "CLEAR":
+                    continue
+                style = _bucket_header_style(band)
                 console.print(
-                    f"  [bold]{top.score.value:>3}[/bold]  "
-                    f"{top.score.band.value:<20}  [cyan]{top.path}[/cyan]"
+                    f"  [{style}] {band} [/{style}]  [dim]({len(rows)})[/dim]"
                 )
-                console.print(f"       [dim]{top.signals[0].headline}[/dim]")
+                for top in rows:
+                    console.print(
+                        f"    [bold]{top.score.value:>3}[/bold]  [cyan]{top.path}[/cyan]"
+                    )
+                    console.print(f"         [dim]{top.signals[0].headline}[/dim]")
             console.print()
 
         # Section 3 — MCP setup snippet (vendor-neutral phrasing).

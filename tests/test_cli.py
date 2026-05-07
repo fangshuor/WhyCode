@@ -1118,3 +1118,37 @@ def test_diff_markdown_emits_section_per_bucket(repo, days_ago) -> None:  # type
     # The bucket-internal table no longer has a Band column (the heading
     # already encodes the band).
     assert "| Score | File | Top signal |" in out
+
+
+def test_tour_top_files_render_bucket_labels(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`whycode tour`'s Top-3 risky files block renders bucket headings.
+
+    Three rows is short, but the bucket headers give the same visual
+    mapping ``whycode diff`` uses. A reader scanning the tour sees
+    HANDLE WITH CARE files under their own heading rather than as a
+    fixed-width band column.
+    """
+    repo.commit("init", {"a.py": "0", "b.py": "0"}, when=days_ago(180))
+    repo.commit(
+        "compat: keep sync path",
+        {"a.py": "1"},
+        body="Do not switch to async.",
+        when=days_ago(60),
+    )
+    sha = repo.commit("feat: A", {"a.py": "2"}, when=days_ago(40))
+    repo.revert(sha, when=days_ago(35))
+    repo.commit(
+        "hotfix: refund regression",
+        {"a.py": "3"},
+        body="See INC-447.",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "tour")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # Top 3 block exists and at least one bucket label appears under it.
+    assert "Top 3 risky files" in out
+    assert any(
+        band in out
+        for band in ("HANDLE WITH CARE", "READ HISTORY FIRST", "WORTH A LOOK")
+    ), out
