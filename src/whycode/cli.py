@@ -1391,11 +1391,22 @@ def tour(
             "\n  [dim](See your editor's docs for the exact config-file location.)[/dim]\n"
         )
 
-        # Section 4 — what to do next.
+        # Section 4 — what to do next. The first suggestion substitutes
+        # the actual top-risk path the tour just identified so a user can
+        # paste the next command verbatim instead of hunting for one of
+        # the names in the table above. When the slim scan found nothing,
+        # we degrade to a generic ``<path>`` placeholder rather than
+        # omitting the line — every fresh tour ends with the same shape.
         console.print("[bold]Next:[/bold]")
         if cards:
             console.print(
-                f"  [dim]·[/dim] [bold]whycode why {cards[0].path}[/bold]   the full Risk Card"
+                f"  [dim]·[/dim] [bold]whycode why {cards[0].path}[/bold]"
+                "   the full Risk Card"
+            )
+        else:
+            console.print(
+                "  [dim]·[/dim] [bold]whycode why <path>[/bold]"
+                "                the Risk Card for any tracked file"
             )
         console.print(
             "  [dim]·[/dim] [bold]whycode init[/bold]                     install CI + pre-commit"

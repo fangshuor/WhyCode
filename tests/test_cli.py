@@ -875,6 +875,47 @@ def test_tour_runs_and_emits_all_sections(repo, days_ago) -> None:  # type: igno
     assert "Wire WhyCode into your AI editor" in out
     # MCP snippet appears verbatim so users can copy-paste.
     assert '"command": "whycode"' in out
+    # The closing "Next:" block names the actual top-risk file the tour
+    # just discovered, not a generic <path> placeholder. ``a.py`` was
+    # touched by both a revert and an explicit invariant statement, so
+    # it dominates the slim scan over ``b.py``.
+    assert "whycode why a.py" in out
+    assert "whycode why <path>" not in out
+
+
+def test_tour_next_block_substitutes_top_risk_path(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The first 'Next:' suggestion names the literal top-risk path the
+    tour itself surfaced, not a hard-coded example. A fresh tour should
+    leave the user one paste-and-run away from the actual first dive."""
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "tour")
+    assert result.exit_code == 0
+    out = result.output
+    assert "Top 3 risky files" in out
+    assert "whycode why refund.py" in out
+    # No placeholder leakage in the substituted path.
+    assert "<path>" not in out
+    assert "<top-file>" not in out
+
+
+def test_tour_next_block_falls_back_to_generic_when_no_risky_files(repo) -> None:  # type: ignore[no-untyped-def]
+    """When the slim scan finds nothing, the Next: block degrades to a
+    generic <path> placeholder so the user still sees the same shape
+    instead of a missing line."""
+    repo.commit("init", {"a.py": "1"})
+    result = _invoke(repo.root, "tour")
+    assert result.exit_code == 0
+    out = result.output
+    assert "Top 3 risky files" not in out
+    # Generic prose fallback is allowed only here.
+    assert "whycode why <path>" in out
 
 
 def test_tour_quiet_repo_explains_why(repo) -> None:  # type: ignore[no-untyped-def]
