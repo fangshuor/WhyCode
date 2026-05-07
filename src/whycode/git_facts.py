@@ -798,6 +798,41 @@ def _all_matches_are_quoted(line: str, regex: re.Pattern[str]) -> bool:
     return True
 
 
+# An ALLCAPS line prefix (e.g. ``WARNING:``, ``ERROR:``, ``DEBUG:``) is the
+# canonical signature of pasted compiler / linter / spell-checker output.
+# A genuine human invariant statement opens with a normal sentence ("Do
+# not...", "Important: ...") and never with two or more uppercase letters
+# followed by an immediate colon.
+_TOOL_OUTPUT_ALLCAPS_RE = re.compile(r"^[A-Z]{2,}:\s")
+# A ``path:line:`` or ``path:line:col:`` prefix near the start of a line is
+# the unmistakable shape of compiler / aspell output. We accept any path-
+# shaped token (slashes, dots, hyphens, underscores, alnum) followed by
+# ``:<digits>:`` — anchored so it also catches ``./foo/bar.py:50:``.
+_TOOL_OUTPUT_PATH_RE = re.compile(r"^[\w./-]+:\d+:")
+# Per-(commit, file) cap on invariant lines pulled from one body. A real
+# author rarely states more than two crisp invariants in a single message;
+# anything beyond is almost certainly a paste. Set deliberately low so a
+# single noisy commit can no longer dominate the "highlights" view.
+_PER_COMMIT_INVARIANT_CAP = 2
+
+
+def _is_tool_output_line(line: str, prev_line: str) -> bool:
+    """True if ``line`` looks like quoted compiler / linter / aspell output.
+
+    Heuristics:
+      - ALLCAPS followed immediately by a colon (``WARNING:``, ``ERROR:``,
+        ``DEBUG:``…) — pasted tool output.
+      - ``path/to/file:line:`` prefix near the start — clang / mypy / aspell.
+      - Preceded by a ``> `` block-quote line — markdown-style "this is
+        what the tool said" framing.
+    """
+    if _TOOL_OUTPUT_ALLCAPS_RE.match(line):
+        return True
+    if _TOOL_OUTPUT_PATH_RE.match(line):
+        return True
+    return prev_line.startswith("> ")
+
+
 def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]:
     """Pull lines from commit *bodies* that match invariant tokens.
 
@@ -808,20 +843,43 @@ def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]
     eliminates the meta-mention failure mode where a commit *about* an
     invariant token (e.g. "fix invariant matcher") would self-flag.
 
+    Two filters keep pasted tool output out of the "stated invariants"
+    surface:
+
+    1. Lines that look like quoted compiler / linter / aspell output are
+       dropped (``WARNING: …``, ``foo/bar.py:50: …``, lines preceded by a
+       ``> `` block-quote). One noisy spell-check commit on django used to
+       supply 15 of the top-20 highlights; this rule kills it at the
+       source.
+    2. A per-commit cap of two invariants. Real authors rarely state more
+       than two crisp constraints in one message; anything beyond is
+       almost certainly a paste. The first two matches are preserved
+       (most informative-looking entries rank).
+
     Lines where every matching token is wrapped in quotes (``"do not"``) are
     treated as references rather than statements and are skipped.
     """
     out: list[tuple[str, str]] = []
     for commit in commits:
+        per_commit = 0
+        prev_line = ""
         for raw_line in commit.body.splitlines():
             line = raw_line.strip()
             if not line:
+                prev_line = raw_line
                 continue
+            if _is_tool_output_line(line, prev_line):
+                prev_line = raw_line
+                continue
+            prev_line = raw_line
             if not _INVARIANT_RE.search(line):
                 continue
             if _all_matches_are_quoted(line, _INVARIANT_RE):
                 continue
+            if per_commit >= _PER_COMMIT_INVARIANT_CAP:
+                continue
             out.append((commit.sha, line[:200]))
+            per_commit += 1
     return out
 
 

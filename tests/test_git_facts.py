@@ -135,6 +135,70 @@ def test_extract_invariant_quotes_ignores_quoted_tokens(repo) -> None:  # type: 
     assert not any('"do not"' in line for line in lines)
 
 
+def test_extract_invariant_quotes_caps_a_single_paste_at_two(repo) -> None:  # type: ignore[no-untyped-def]
+    """F2 — a spell-check commit on django used to supply 12 ALLCAPS warnings
+    that all flowed through as 'invariants', dominating the highlights view.
+
+    The per-commit cap of 2 keeps the loudest noise commit from drowning
+    out genuine invariants from other commits.
+    """
+    body = "\n".join(
+        f"WARNING: spell check found misspelling number {i}" for i in range(12)
+    )
+    repo.commit("docs: fix spelling typos", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    # All twelve are tool-output ALLCAPS lines — they're filtered before the
+    # cap even applies. Total quotes from this commit: 0.
+    assert len(quotes) == 0
+
+
+def test_extract_invariant_quotes_drops_path_line_prefixed_lines(repo) -> None:  # type: ignore[no-untyped-def]
+    """A ``tools/spelling.py:50:`` linter prefix is unmistakably tool output."""
+    body = (
+        "tools/spelling.py:50: warning: misspelled 'recieve'\n"
+        "tools/spelling.py:51: warning: misspelled 'occured'\n"
+        "tools/spelling.py:52: warning: misspelled 'seperate'"
+    )
+    repo.commit("docs: fix typos", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert len(quotes) == 0
+
+
+def test_extract_invariant_quotes_keeps_real_invariant(repo) -> None:  # type: ignore[no-untyped-def]
+    """A genuine author-stated invariant is still surfaced as one entry."""
+    body = (
+        "Refactored the refund flow.\n"
+        "Do not switch to async — v1 clients break."
+    )
+    repo.commit("compat: keep sync", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert len(quotes) == 1
+    assert "Do not switch to async" in quotes[0][1]
+
+
+def test_extract_invariant_quotes_caps_at_two_real_invariants(repo) -> None:  # type: ignore[no-untyped-def]
+    """When a commit body has 5 genuine invariants, only the first 2 surface."""
+    body = "\n".join(
+        [
+            "Do not call this from threads.",
+            "Do not switch to async.",
+            "Do not bypass the rate limiter.",
+            "Do not log the auth header.",
+            "Do not delete the legacy endpoint.",
+        ]
+    )
+    repo.commit("compat: hardening", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert len(quotes) == 2
+    # First two are preserved (most informative-looking ranks).
+    assert "Do not call this from threads" in quotes[0][1]
+    assert "Do not switch to async" in quotes[1][1]
+
+
 def test_co_changes_excludes_target_file(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.txt": "1", "b.txt": "1", "c.txt": "1"})
     repo.commit("change a and b", {"a.txt": "2", "b.txt": "2"})

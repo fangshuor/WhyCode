@@ -236,16 +236,20 @@ def test_first_sentence_splits_at_real_boundary() -> None:
 
 
 def test_invariant_signal_caps_at_three_bullets(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
-    body = "\n".join(
-        [
-            "Do not switch to async — v1 clients break.",
-            "Important: keep the legacy header in place.",
-            "Warning: idempotency token must be unique.",
-            "Workaround for upstream bug #5: noop when input is empty.",
-            "Tradeoff: we accept ~10ms latency to keep correctness.",
-        ]
-    )
-    repo.commit("compat: many constraints", {"x.py": "1"}, body=body, when=days_ago(20))
+    # Spread the five invariants across five separate commits so the F2
+    # per-commit cap of two does not apply (it only filters within a single
+    # commit body — commits each contribute up to two genuine constraints).
+    bodies = [
+        "Do not switch to async — v1 clients break.",
+        "Important: keep the legacy header in place.",
+        "Warning: idempotency token must be unique.",
+        "Workaround for upstream bug #5: noop when input is empty.",
+        "Tradeoff: we accept ~10ms latency to keep correctness.",
+    ]
+    for i, body in enumerate(bodies):
+        repo.commit(
+            f"compat: constraint {i}", {"x.py": str(i)}, body=body, when=days_ago(20 + i)
+        )
     facts = _facts_for(repo, "x.py")
     signal = sig.detect_invariant_quotes(facts)
     assert signal is not None
