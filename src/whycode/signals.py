@@ -99,8 +99,13 @@ def _short(sha: str) -> str:
     return sha[:7]
 
 
-def _age_phrase(days: int) -> str:
-    """Render a days count as a human phrase used in headlines."""
+def age_phrase(days: int) -> str:
+    """Render a days count as a human phrase used in headlines.
+
+    Public so the Risk Card narrative summary can reuse the same wording
+    detectors put into their headlines (e.g. "5 weeks ago", "3 months ago",
+    "2 years ago").
+    """
     if days < 14:
         return f"{days} day{'s' if days != 1 else ''} ago"
     if days < 90:
@@ -109,6 +114,10 @@ def _age_phrase(days: int) -> str:
         return f"{days // 30} months ago"
     years = days // 365
     return f"{years} year{'s' if years != 1 else ''} ago"
+
+
+# Back-compat alias so internal call-sites keep working without an import churn.
+_age_phrase = age_phrase
 
 
 def _decay_severity(severity: int, days_since_most_recent: int) -> int:
