@@ -131,7 +131,7 @@ def build_from_diff_facts(
     changed file, then re-evaluates only the top-N with full signals.
     Without this skip, scoring 1,927 files spends ~4-5 minutes inside
     ``git blame`` even though > 95% of those files never reach the table
-    the user sees. See ``_recompute_with_ghost_keeper`` in :mod:`cli`.
+    the user sees.
     """
     facts = gf.gather_for_diff(diff_facts, path, max_commits=max_commits)
     return _from_facts(

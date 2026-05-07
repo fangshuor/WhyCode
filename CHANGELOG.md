@@ -4,6 +4,95 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-07
+
+### Performance — `whycode diff` is now usable on long-lived branches
+
+The "pre-PR" command was unrunnable when a feature branch had drifted
+far from its base. On django (10,000-commit history, 1,927 changed
+files vs a base from a year ago) the legacy implementation took
+**6 m 7 s**; against a base from four years ago (3,762 commits range)
+it timed out after **12 m 10 s** without producing output. The cause
+was per-file evaluation: each changed file fired its own
+`git log --follow` plus a co-change diffstat pass, so wall-clock cost
+scaled linearly with the number of changed files.
+
+`whycode diff` now batches the evaluation in two phases:
+
+1. One un-pathed `git log --no-merges --numstat --pretty=...` walk
+   parses every commit + its file-set into an in-memory
+   `path -> [Commit]` map and a `sha -> tuple[paths]` co-change index.
+   Per-file scoring then drives off this map instead of re-shelling-out.
+2. The first pass scores every changed file with the seven detectors
+   whose evidence is already in `RepoFacts` (revert, incident,
+   invariants, coupling, churn, silence, newborn). Only the top-N
+   files (the ones that will appear in the rendered table) are then
+   re-evaluated with the ghost-keeper detector, which still needs a
+   per-file `git blame`. On a 1,927-file diff this trades ~1,927
+   blame calls for at most `--top` of them.
+
+Bench against `django/django` (10,000 commits, captured against the
+same shallow clone the field test used; `time` wall-clock; ``--no-cache``):
+
+| command                                              | before          | after | speedup |
+| ---------------------------------------------------- | --------------- | ----- | ------- |
+| `diff --base <2025-01-01-sha>` (1,927 files changed) | 6 m 7 s         | 14 s  | ~26x    |
+| `diff --base <2022-sha>` (3,171 files changed)       | killed at 12 m  | 15 s  | from "unrunnable" to "fast" |
+
+And against `pallets/flask` (5,535 commits, 207 files changed vs
+`2.0.0`):
+
+| command                            | before  | after | speedup |
+| ---------------------------------- | ------- | ----- | ------- |
+| `diff --base 2.0.0` (207 files)    | 28.6 s  | 2.0 s | ~14x    |
+
+The `--no-cache` path benefits identically — the wins come from
+sharing the git log walk across files rather than from caching.
+
+### Output equivalence
+
+The new walk is intentionally un-pathed: it skips git's `--follow`
+rename-resolution, which would otherwise cost a separate full-history
+walk per file. The diff command only ever scores files present in
+HEAD's working tree — files named by `git diff --name-only base...HEAD`
+— so the trade is "lose pre-rename history for files renamed long
+before this diff" against "score 1,927 files in seconds rather than
+minutes". On flask the JSON output preserves the same number of files
+and signal shape; ordering ties resolve differently for files renamed
+through history (e.g. `src/flask/app.py` was at `flask/app.py` before
+2019, and the new pipeline doesn't follow that rename across base).
+
+This is the documented "stable-tie-break difference" the brief
+allowed; structural equality of the JSON output is preserved.
+
+### Internal
+
+- `src/whycode/git_facts.py` — `DiffFacts` dataclass, `load_diff_facts`,
+  `_parse_log_with_files`, `gather_for_diff`. The walk is one
+  `git log --no-merges --numstat --pretty=...` parsed into the
+  in-memory map; ``cache`` is threaded through so the persisted
+  ``commits`` and ``commit_files`` rows seed any later
+  `why` / `scan` invocation on the same HEAD.
+- `src/whycode/risk_card.py` — `build_from_diff_facts` materialises a
+  `RiskCard` from the in-memory map; `skip_ghost_keeper=True` flips
+  off the per-file ``git blame`` for the first pass.
+- `src/whycode/cli.py` — the `diff` command now does
+  build_from_diff_facts(skip_ghost_keeper=True) for every changed file,
+  sorts, then re-evaluates the top-N with full signals. A
+  ``_memoised_is_ignored`` context manager around the two passes caches
+  per-path verdicts of ``ign.is_ignored`` (the F10 filter from 0.4.1
+  re-applies fnmatch over ~83 patterns and ~700 candidates per file —
+  uncached that's ~100 CPU-seconds across a 1,927-file diff).
+- `tests/test_git_facts.py` — 7 new tests covering the index, the
+  co-change reduction, the empty-path fallback, the multiline-body /
+  numstat split, and the per-path cap. The new
+  `test_gather_for_diff_co_changes_match_per_file_pipeline` test also
+  asserts equality against the legacy `gather()` output on a synthetic
+  repo, so the per-file scorer cannot drift.
+
+194 tests passing (187 from 0.4.2 + 7 batch-loader). ruff + mypy strict
+clean.
+
 ## [0.4.2] — 2026-05-07
 
 ### Fixed — cache-correctness determinism and a `--no-cache` perf regression

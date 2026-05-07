@@ -20,10 +20,11 @@ Commands
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -124,6 +125,42 @@ def _require_tracked(path_arg: str) -> tuple[Path, str]:
         )
         raise typer.Exit(1)
     return repo_root, rel
+
+
+@contextlib.contextmanager
+def _memoised_is_ignored(repo_root: Path) -> Iterator[None]:
+    """Memoise ``ign.is_ignored`` for the duration of the ``with`` block.
+
+    The diff command's evaluation re-applies the same ``is_ignored`` test
+    against thousands of co-change candidates per file. Each call resolves
+    fnmatch over ~83 patterns; uncached, that is ~100 CPU-seconds across
+    a 1,927-file diff on django.
+
+    A path's verdict is fully determined by the path string and the
+    repo's effective ignore-pattern tuple, so we cache by ``(path,
+    patterns)`` for the duration of the diff and restore the original
+    function on exit. The cache is process-local; the rest of the CLI
+    (``why``, ``scan``, …) sees the un-memoised function. ``ign`` itself
+    is unchanged.
+    """
+    patterns = ign.effective_patterns(repo_root)
+    cache: dict[str, bool] = {}
+    original = ign.is_ignored
+
+    def memoised(path: str, patterns_arg: object = patterns) -> bool:
+        if patterns_arg is patterns:
+            cached = cache.get(path)
+            if cached is None:
+                cached = original(path, patterns)
+                cache[path] = cached
+            return cached
+        return original(path, patterns_arg)  # type: ignore[arg-type]
+
+    ign.is_ignored = memoised  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        ign.is_ignored = original
 
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -440,36 +477,45 @@ def diff(
         except gf.GitError as exc:
             err.print(f"[red]error:[/red] {exc}")
             raise typer.Exit(2) from exc
-        # First pass: every changed file is scored without the ghost-keeper
-        # detector, which would otherwise fire ``git blame`` per file. With
-        # 1,927 changed files on django this single deferral saves ~5 minutes.
-        # We then sort and re-evaluate only the top-N with full signals — at
-        # most ``top`` blame calls instead of ``len(files)``.
-        prelim: list[rc.RiskCard] = []
-        for f in files:
-            try:
-                prelim.append(
-                    rc.build_from_diff_facts(diff_facts, f, skip_ghost_keeper=True)
-                )
-            except gf.GitError:
-                continue
-        # Stable tie-break (from 0.4.2): lex smallest path on identical
-        # scores so cache and --no-cache truncate the same files at --top N.
-        prelim.sort(key=lambda c: (-c.score.value, c.path))
-        # Second pass: re-score the top-N with the full detector ladder so
-        # the rendered table includes ghost-keeper findings where they
-        # apply. Files outside the top-N keep their first-pass score; they
-        # were not going to appear in the user's view anyway.
-        refined_top: list[rc.RiskCard] = []
-        for prelim_card in prelim[:top]:
-            try:
-                refined_top.append(
-                    rc.build_from_diff_facts(diff_facts, prelim_card.path)
-                )
-            except gf.GitError:
-                refined_top.append(prelim_card)
-        cards = refined_top
-        cards.sort(key=lambda c: (-c.score.value, c.path))
+        # Pre-compute the ignore-pattern set ONCE and a verdict-per-path
+        # memo. ``signals.detect_coupling`` (re-introduced in 0.4.1 as F10)
+        # filters every coupling candidate through ``ign.is_ignored`` —
+        # without memoisation that's 83 patterns x 700 candidates x 1,927
+        # files = ~100 CPU-seconds across the diff. The memo cache turns
+        # each path's verdict into a dict lookup after the first hit.
+        with _memoised_is_ignored(repo_root):
+            # First pass: every changed file is scored without the
+            # ghost-keeper detector, which would otherwise fire ``git
+            # blame`` per file. With 1,927 changed files on django this
+            # single deferral saves ~5 minutes. We then sort and
+            # re-evaluate only the top-N with full signals — at most
+            # ``top`` blame calls instead of ``len(files)``.
+            prelim: list[rc.RiskCard] = []
+            for f in files:
+                try:
+                    prelim.append(
+                        rc.build_from_diff_facts(diff_facts, f, skip_ghost_keeper=True)
+                    )
+                except gf.GitError:
+                    continue
+            # Stable tie-break (from 0.4.2): lex smallest path on identical
+            # scores so cache and --no-cache truncate the same files at --top N.
+            prelim.sort(key=lambda c: (-c.score.value, c.path))
+            # Second pass: re-score the top-N with the full detector ladder
+            # so the rendered table includes ghost-keeper findings where
+            # they apply. Files outside the top-N keep their first-pass
+            # score; they were not going to appear in the user's view
+            # anyway.
+            refined_top: list[rc.RiskCard] = []
+            for prelim_card in prelim[:top]:
+                try:
+                    refined_top.append(
+                        rc.build_from_diff_facts(diff_facts, prelim_card.path)
+                    )
+                except gf.GitError:
+                    refined_top.append(prelim_card)
+            cards = refined_top
+            cards.sort(key=lambda c: (-c.score.value, c.path))
     finally:
         if cache is not None:
             cache.close()
