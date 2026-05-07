@@ -755,3 +755,49 @@ def test_repeat_scan_produces_identical_top_files(repo, days_ago) -> None:  # ty
     assert "refund.py" in cold
     assert "refund.py" in warm_first
     assert "refund.py" in warm_second
+
+
+# ---- F4: highlights determinism across cache state ------------------------
+
+
+def test_highlights_json_is_byte_identical_across_cache_state(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """Two commits with identical bodies and timestamps (a cherry-pick on a
+    different branch) must not flip which SHA the dedup picks across cache
+    versus --no-cache reads of the same HEAD.
+
+    Without a stable tie-breaker, the cache's authored_at-DESC walk and git
+    log's walk can disagree on the order of identical-timestamp commits, and
+    the JSON consumer sees a different SHA on the same field across runs.
+    """
+    same_time = days_ago(30)
+    repo.commit(
+        "init",
+        {"a.txt": "1", "b.txt": "1"},
+        when=days_ago(60),
+    )
+    # Two commits, identical timestamps, identical bodies — only the SHAs
+    # and the touched-file set differ. Mirrors the flask cherry-pick pattern
+    # the field test surfaced.
+    repo.commit(
+        "use global contributing guide on master",
+        {"a.txt": "2"},
+        body="Do not duplicate the contributing guide between branches.",
+        when=same_time,
+    )
+    repo.commit(
+        "use global contributing guide on stable",
+        {"b.txt": "2"},
+        body="Do not duplicate the contributing guide between branches.",
+        when=same_time,
+    )
+    cold = _invoke(repo.root, "highlights", "--no-cache", "--json").output
+    warm = _invoke(repo.root, "highlights", "--json").output
+    second_warm = _invoke(repo.root, "highlights", "--json").output
+    assert cold == warm
+    assert warm == second_warm
+    payload = json.loads(cold)
+    # Exactly one invariant should survive the dedup; the other commit's
+    # statement is identical and must not appear twice.
+    assert len(payload["invariants"]) == 1

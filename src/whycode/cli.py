@@ -565,16 +565,17 @@ def highlights(
 
     inv_pairs = gf.extract_invariant_quotes(commits)
     sha_to_commit = {c.sha: c for c in commits}
-    seen_lines: dict[str, str] = {}
-    for sha, line in inv_pairs:
-        seen_lines.setdefault(line, sha)
+    deduped = gf.dedupe_invariant_lines(inv_pairs, sha_to_commit)
     inv_records: list[tuple[str, str, gf.Commit]] = []
-    for line, sha in seen_lines.items():
+    for sha, line in deduped:
         commit = sha_to_commit.get(sha)
         if commit is None:
             continue
         inv_records.append((line, sha, commit))
-    inv_records.sort(key=lambda t: t[2].authored_at, reverse=True)
+    # Sort newest first; on identical timestamps fall back to lexicographically
+    # smallest sha so cache and --no-cache emit byte-identical output.
+    inv_records.sort(key=lambda t: t[1])  # secondary: sha asc
+    inv_records.sort(key=lambda t: t[2].authored_at, reverse=True)  # primary
     inv_records = inv_records[:invariants]
 
     incident_records = gf.find_incidents(commits)[:incidents]
@@ -1065,13 +1066,18 @@ def tour(
 
         inv_pairs = gf.extract_invariant_quotes(commits)
         sha_to_commit = {c.sha: c for c in commits}
-        seen_lines: dict[str, str] = {}
-        for sha, line in inv_pairs:
-            seen_lines.setdefault(line, sha)
+        deduped = gf.dedupe_invariant_lines(inv_pairs, sha_to_commit)
+        # Sort newest first with sha-asc tie-break so cache and --no-cache
+        # surface the same three lines in the same order.
+        deduped_sorted = sorted(
+            (p for p in deduped if p[0] in sha_to_commit),
+            key=lambda p: p[0],
+        )
+        deduped_sorted.sort(
+            key=lambda p: sha_to_commit[p[0]].authored_at, reverse=True
+        )
         invariants_top = [
-            (line, sha_to_commit[sha])
-            for line, sha in seen_lines.items()
-            if sha in sha_to_commit
+            (line, sha_to_commit[sha]) for sha, line in deduped_sorted
         ][:3]
         incidents_top = gf.find_incidents(commits)[:3]
 
