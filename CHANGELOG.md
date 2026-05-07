@@ -5,6 +5,86 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.1] — 2026-05-07
+
+### Fixed — onboarding friction + real-repo recon
+
+A read-only audit pass plus recon on three real OSS repos (click, flask,
+requests) surfaced a cluster of small UX cuts and one genuine regression
+worth shipping fast.
+
+#### Onboarding friction
+
+- ``whycode --help`` ends with ``Start here: whycode tour`` so a brand-
+  new user has a clear first command.
+- ``--mute KIND`` help now lists every kind name explicitly (was
+  truncated with ``…``); the mute confirmation suggests
+  ``--no-mutes`` as the preview path before editing the JSON.
+- Outside-a-repo error reads "not inside a git repository. → cd into a
+  git repo, or pass --repo PATH" instead of a raw ``git rev-parse
+  --show-toplevel`` traceback.
+- Missing-path error no longer claims "warning" with a successful exit
+  code — it now exits **2** so a CI loop running ``whycode why`` per
+  file fails loudly on a typo. The message keeps the "→ run whycode
+  scan --top 5" next-step.
+- ``whycode mcp`` prints one stderr line on startup (server ready,
+  version, ``-v`` hint) so a curious user doesn't see a silent block.
+- ``whycode init`` ends with "→ Run ``whycode diff --staged`` to
+  preview what the pre-commit hook will check."
+- ``whycode tour``'s MCP snippet hint mentions the typical
+  ``mcp.json`` filename so a fresh user has a concrete thing to
+  search for in their editor's docs.
+- The ``cache`` subgroup is hidden from the main help (it's a
+  diagnostic surface, not a user-facing one); ``whycode cache stats``
+  / ``cache clear`` still work.
+- ``whycode highlights`` docstring explains how it differs from
+  ``tour`` (same content minus MCP setup + risk scan).
+
+#### Real-repo correctness
+
+- **Regression fix**: ``whycode diff`` was bypassing the default ignore
+  list — on click, ``CHANGES.rst`` ranked #1 (HANDLE WITH CARE) above
+  application code. The 0.4.1 quality pass added the filter to
+  ``scan`` and ``detect_coupling`` but missed the diff command's own
+  file list. Now applied consistently.
+- ``whycode why <metadata-file>`` (a CHANGELOG, lockfile, generated
+  stub, etc.) prints a "heads up: this path matches the default
+  ignore list" advisory above the card so a user who arrived via
+  typo / LLM-suggested path doesn't read an authoritative-looking
+  100-score on a release-notes file.
+- ``examples/**``, ``example/**``, ``demo/**``, ``demos/**``,
+  ``samples/**`` added to the default ignore list. On click these
+  five-year-untouched example scripts dominated ``scan --top 15``
+  with no actionable code.
+- ``INVARIANT_TOKENS`` no longer matches the lowercase ``warning:``
+  / ``note:`` literals. On click and other Python projects, pasted
+  Ruff/lint output ("the warning:", "warning: rule X is removed")
+  was self-flagging as a quoted invariant — turning ``whycode
+  highlights`` into a wall of bogus constraints. The remaining
+  tokens (``do not`` / ``don't`` / ``must not`` / ``important:``
+  / ``danger:`` / ``invariant`` / ``workaround`` / ``tradeoff``)
+  cover the genuine "the past author left a constraint" intent
+  without aliasing tool output.
+- ``whycode tour``'s "Top 3 risky files" picker reverted to top-3 by
+  raw score (post-onboarding-audit, which had introduced a
+  distinct-by-kind picker; recon on requests showed it hid the
+  14-revert ``models.py`` core in favour of two test-server
+  fixtures). The original ranking was correct; calibration of
+  per-kind score weights is a separate follow-up.
+
+233 tests passing; ruff + mypy strict clean.
+
+Deferred to a future focused pass:
+- Coupling self-references via pre-rename paths (``click/core.py``
+  shows up as a co-changer of ``src/click/core.py``); needs
+  ``--follow`` rename-resolution threaded through co-change
+  loading.
+- Score rebalancing — coupling-only files currently top out higher
+  than reverts+incidents, an upside-down calibration.
+- Ghost-keeper mixed-signal phrasing when the line-blame primary
+  differs from the commit-count primary.
+
+
 ## [0.6.0] — 2026-05-07
 
 ### Changed — output density audit pass

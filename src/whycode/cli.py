@@ -42,6 +42,7 @@ from whycode import suppressions as supp
 app = typer.Typer(
     add_completion=False,
     help="WhyCode — tells you what to be afraid of before touching a file.",
+    epilog="Start here: whycode tour",
     no_args_is_help=True,
 )
 
@@ -83,7 +84,15 @@ def _resolve_repo_and_path(path_arg: str) -> tuple[Path, str]:
     try:
         repo_root = gf.discover_repo_root(start)
     except gf.GitError as exc:
-        err.print(f"[red]error:[/red] {exc}")
+        # Friendly framing for the most common cause; keep raw error visible
+        # for the rare disk / corrupted-repo path so users can still file a bug.
+        if "not a git repository" in str(exc).lower():
+            err.print(
+                "[red]error:[/red] not inside a git repository.\n"
+                "[dim]→ cd into a git repo, or pass --repo PATH on commands that take it.[/dim]"
+            )
+        else:
+            err.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(2) from exc
     if not p.exists():
         # Allow the user to pass a path that was deleted in HEAD but lived in
@@ -118,11 +127,15 @@ def _require_tracked(path_arg: str) -> tuple[Path, str]:
     """
     repo_root, rel = _resolve_repo_and_path(path_arg)
     if not _path_is_known_to_git(repo_root, rel):
+        # Exit 2 (not 1) so a CI loop running ``whycode why`` per file fails
+        # loudly on a typo / wrong path instead of silently succeeding.
         err.print(
-            f"[yellow]warning:[/yellow] [bold]{rel}[/bold] is not tracked by git "
-            f"and has no history in this repo. Nothing to learn from."
+            f"[red]error:[/red] [bold]{rel}[/bold] is not tracked by git "
+            f"and has no history in this repo.\n"
+            f"[dim]→ check the path, or run [bold]whycode scan --top 5[/bold] "
+            f"to see what's there.[/dim]"
         )
-        raise typer.Exit(1)
+        raise typer.Exit(2)
     return repo_root, rel
 
 
@@ -279,8 +292,9 @@ def why(
         "--mute",
         help=(
             "Suppress a signal kind for this path going forward "
-            "(stored in .whycode/suppressed.json). Accepts kind name or "
-            "unique prefix: incident, revert, ghost, coupling, silence, …"
+            "(stored in .whycode/suppressed.json). One of: "
+            "revert, incident, high_churn, coupling, silence, ghost, "
+            "invariant, newborn. Example: --mute coupling."
         ),
     ),
     no_mutes: bool = typer.Option(
@@ -322,6 +336,13 @@ def why(
 ) -> None:
     """Print the Risk Card for ``path``."""
     repo_root, rel = _require_tracked(path)
+    if not json_out and ign.is_ignored(rel, ign.effective_patterns(repo_root)):
+        err.print(
+            f"[yellow]heads up:[/yellow] [bold]{rel}[/bold] matches the default "
+            f"ignore list (changelogs, lockfiles, generated code, vendored trees, "
+            f"docs build output, etc.). Risk scoring on metadata files is mostly "
+            f"noise; treat the card below as advisory."
+        )
     resolved_ref: str | None = None
     if at is not None:
         try:
@@ -348,7 +369,8 @@ def why(
             if not json_out:
                 err.print(
                     f"[dim]muted on {rel}: {', '.join(added)}  "
-                    f"(stored in .whycode/suppressed.json — edit to undo)[/dim]"
+                    f"(undo: pass [bold]--no-mutes[/bold] to preview unmuted, "
+                    f"or delete the line in .whycode/suppressed.json)[/dim]"
                 )
     try:
         card = rc.build(
@@ -503,7 +525,16 @@ def diff(
     if fail_on is not None:
         threshold = _parse_fail_on(fail_on)
 
-    files = [line for line in raw.splitlines() if line.strip()]
+    # Apply the same ignore-pattern filter that `scan` uses so changelogs,
+    # lockfiles, generated stubs, vendored trees etc. don't dominate the
+    # ranking. The 0.4.1 quality pass added the filter to scan and to the
+    # coupling detector but the diff command's own file list was not gated.
+    diff_patterns = ign.effective_patterns(repo_root)
+    files = [
+        line
+        for line in raw.splitlines()
+        if line.strip() and not ign.is_ignored(line.strip(), diff_patterns)
+    ]
     if not files:
         if json_out:
             console.print_json(json.dumps({"base": actual_base, "files": []}))
@@ -700,11 +731,11 @@ def highlights(
         help="Bypass the local SQLite cache at .whycode/cache.db.",
     ),
 ) -> None:
-    """The first-run treasure map: top decisions and incidents across the repo.
+    """Repo-wide treasure map: top invariants + recent incidents.
 
-    Surfaces the highest-value commit-message lines (invariants stated by past
-    authors) and the most recent incident-flavoured commits — the things a
-    reader most wants to know about the codebase before touching anything.
+    Use after the first run when ``whycode tour`` is too verbose. Same
+    invariant + incident sections as ``tour``, without the slim risk scan
+    or the MCP setup snippet.
     """
     try:
         repo_root = gf.discover_repo_root(repo.resolve())
@@ -1328,7 +1359,9 @@ def tour(
         )
         console.print(_MCP_SNIPPET)
         console.print(
-            "\n  [dim](See your editor's docs for the exact config-file location.)[/dim]\n"
+            "\n  [dim]The config file is typically named ``mcp.json`` (or "
+            "the editor's main settings JSON). See your editor's MCP docs "
+            "for the exact location.[/dim]\n"
         )
 
         # Section 4 — what to do next. The first suggestion substitutes
@@ -1395,6 +1428,10 @@ def init(
     console.print()
     console.print("[bold]WhyCode is wired into this repo.[/bold]")
     console.print(
+        "[dim]→ Run [bold]whycode diff --staged[/bold] to preview what the "
+        "pre-commit hook will check.[/dim]"
+    )
+    console.print(
         "  [dim]local[/dim]  pre-commit blocks HANDLE WITH CARE commits "
         "(`git commit --no-verify` to bypass)"
     )
@@ -1422,13 +1459,18 @@ def mcp(
             "Run [bold]pip install 'whycode[mcp]'[/bold]."
         )
         raise typer.Exit(2) from exc
+    err.print(
+        f"[dim]whycode mcp: stdio server ready (v{__version__}) — "
+        f"connect from your editor. Pass [bold]-v[/bold] to log every tool call.[/dim]"
+    )
     serve(verbose=verbose)
 
 
 cache_app = typer.Typer(
     add_completion=False,
-    help="Inspect and clear the local WhyCode cache.",
+    help="Inspect and clear the local WhyCode cache (advanced).",
     no_args_is_help=True,
+    hidden=True,
 )
 app.add_typer(cache_app, name="cache")
 

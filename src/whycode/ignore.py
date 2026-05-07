@@ -95,6 +95,13 @@ DEFAULT_IGNORE_PATTERNS: tuple[str, ...] = (
     "tox.ini",
     "pytest.ini",
     "Makefile",
+    # Example / demo trees — flag-bait on any repo that ships a /examples/ dir
+    # alongside its source: untouched for years, low-stakes when they break.
+    "examples/**",
+    "example/**",
+    "demo/**",
+    "demos/**",
+    "samples/**",
     # Project-membership / licensing files — touched on every contributor add.
     "AUTHORS",
     "AUTHORS.*",
