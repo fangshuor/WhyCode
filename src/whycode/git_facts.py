@@ -967,6 +967,47 @@ def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]
     return out
 
 
+def dedupe_invariant_lines(
+    pairs: Sequence[tuple[str, str]],
+    sha_to_commit: dict[str, Commit],
+) -> list[tuple[str, str]]:
+    """Collapse identical invariant lines to one canonical (sha, line) pair.
+
+    When two commits state the same invariant line — typically a cherry-pick
+    onto a maintenance branch, or a rebase that duplicated the message — we
+    must pick exactly one to surface. Without a deterministic rule the cache
+    and ``--no-cache`` paths can disagree (their walk orders differ when
+    timestamps tie), and downstream JSON consumers see flaky output across
+    runs.
+
+    The rule:
+
+    1. Earliest ``authored_at`` wins. The original statement is canonical;
+       cherry-picks and rebases are derivatives.
+    2. Lexicographically smallest ``sha`` breaks ties on identical timestamps.
+
+    The returned list preserves first-encounter order of the (now-unique)
+    lines so downstream code that sorts by date sees a stable input.
+    Pairs whose ``sha`` is not in ``sha_to_commit`` keep their first-seen
+    record (no metadata to compare on).
+    """
+    canonical: dict[str, str] = {}
+    for sha, line in pairs:
+        existing = canonical.get(line)
+        if existing is None:
+            canonical[line] = sha
+            continue
+        old_commit = sha_to_commit.get(existing)
+        new_commit = sha_to_commit.get(sha)
+        if old_commit is None or new_commit is None:
+            continue
+        old_key = (old_commit.authored_at, existing)
+        new_key = (new_commit.authored_at, sha)
+        if new_key < old_key:
+            canonical[line] = sha
+    return [(sha, line) for line, sha in canonical.items()]
+
+
 def author_last_activity(repo_root: Path, email: str) -> datetime | None:
     """Most recent commit timestamp by ``email`` anywhere in the repo, or None."""
     raw = _run_git(

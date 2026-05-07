@@ -112,10 +112,21 @@ class CacheStore:
     cache misses; this class never invokes ``git`` itself.
     """
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, in_memory: bool = False) -> None:
+        """Open (creating if needed) the SQLite cache at ``db_path``.
+
+        ``in_memory=True`` opens a transient ``:memory:`` connection
+        instead — the disk file is never created and is never read.
+        Used by ``--no-cache`` to retain in-session amortisation
+        (matches the cold-fill code path) without persisting anything.
+        """
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
+        self._in_memory = in_memory
+        if in_memory:
+            self._conn = sqlite3.connect(":memory:")
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(self.db_path)
         # row_factory makes column access readable in tests / debug.
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -402,13 +413,18 @@ class CacheStore:
         file_row_count = int(
             self._conn.execute("SELECT COUNT(*) FROM commit_files").fetchone()[0]
         )
-        try:
-            size_bytes = self.db_path.stat().st_size
-        except OSError:
+        if self._in_memory:
             size_bytes = 0
+            exists = False
+        else:
+            try:
+                size_bytes = self.db_path.stat().st_size
+            except OSError:
+                size_bytes = 0
+            exists = self.db_path.exists()
         return CacheStats(
             path=self.db_path,
-            exists=self.db_path.exists(),
+            exists=exists,
             schema_version=self.schema_version,
             head_sha=self.head_sha,
             commit_count=commit_count,
@@ -428,6 +444,16 @@ def cache_path_for(repo_root: Path) -> Path:
 def open_for(repo_root: Path) -> CacheStore:
     """Open (creating if absent) the cache store for ``repo_root``."""
     return CacheStore(cache_path_for(repo_root))
+
+
+def open_in_memory(repo_root: Path) -> CacheStore:
+    """Open a transient in-memory cache for ``repo_root``.
+
+    Used by ``--no-cache`` to keep within-session amortisation (the same
+    cold-fill code path everything else uses) while never touching disk.
+    The store is destroyed on ``close()`` and has no after-effects.
+    """
+    return CacheStore(cache_path_for(repo_root), in_memory=True)
 
 
 def parse_authored_at(value: str) -> datetime:

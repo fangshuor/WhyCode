@@ -755,3 +755,116 @@ def test_repeat_scan_produces_identical_top_files(repo, days_ago) -> None:  # ty
     assert "refund.py" in cold
     assert "refund.py" in warm_first
     assert "refund.py" in warm_second
+
+
+# ---- F4: highlights determinism across cache state ------------------------
+
+
+def test_highlights_json_is_byte_identical_across_cache_state(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """Two commits with identical bodies and timestamps (a cherry-pick on a
+    different branch) must not flip which SHA the dedup picks across cache
+    versus --no-cache reads of the same HEAD.
+
+    Without a stable tie-breaker, the cache's authored_at-DESC walk and git
+    log's walk can disagree on the order of identical-timestamp commits, and
+    the JSON consumer sees a different SHA on the same field across runs.
+    """
+    same_time = days_ago(30)
+    repo.commit(
+        "init",
+        {"a.txt": "1", "b.txt": "1"},
+        when=days_ago(60),
+    )
+    # Two commits, identical timestamps, identical bodies — only the SHAs
+    # and the touched-file set differ. Mirrors the flask cherry-pick pattern
+    # the field test surfaced.
+    repo.commit(
+        "use global contributing guide on master",
+        {"a.txt": "2"},
+        body="Do not duplicate the contributing guide between branches.",
+        when=same_time,
+    )
+    repo.commit(
+        "use global contributing guide on stable",
+        {"b.txt": "2"},
+        body="Do not duplicate the contributing guide between branches.",
+        when=same_time,
+    )
+    cold = _invoke(repo.root, "highlights", "--no-cache", "--json").output
+    warm = _invoke(repo.root, "highlights", "--json").output
+    second_warm = _invoke(repo.root, "highlights", "--json").output
+    assert cold == warm
+    assert warm == second_warm
+    payload = json.loads(cold)
+    # Exactly one invariant should survive the dedup; the other commit's
+    # statement is identical and must not appear twice.
+    assert len(payload["invariants"]) == 1
+
+
+# ---- F5: scan determinism across cache state ------------------------------
+
+
+def test_scan_text_is_byte_identical_across_cache_state(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """Two files that earn the same score from the same signals must not
+    swap positions in the --top N truncation across cache versus --no-cache
+    reads. Stable tie-break on the lexicographically smallest path keeps
+    cold and warm output byte-identical.
+    """
+    # Two files always touched together → identical histories, identical
+    # signals, identical scores. The ordering between them is settled
+    # only by the path tie-break.
+    sha = repo.commit(
+        "feature: introduce zeta and alpha",
+        {"zeta.py": "1", "alpha.py": "1"},
+        when=days_ago(50),
+    )
+    repo.revert(sha, when=days_ago(45))
+    repo.commit(
+        "hotfix: regression",
+        {"zeta.py": "2", "alpha.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(20),
+    )
+    cold = _invoke(repo.root, "scan", "--top", "10", "--no-cache").output
+    warm = _invoke(repo.root, "scan", "--top", "10").output
+    second_warm = _invoke(repo.root, "scan", "--top", "10").output
+    assert cold == warm
+    assert warm == second_warm
+    # Lexicographic tie-break: alpha.py is listed before zeta.py despite
+    # equal scores.
+    alpha_pos = cold.find("alpha.py")
+    zeta_pos = cold.find("zeta.py")
+    assert alpha_pos != -1
+    assert zeta_pos != -1
+    assert alpha_pos < zeta_pos
+
+
+# ---- F7: --no-cache uses an in-memory cache for amortisation -------------
+
+
+def test_no_cache_scan_matches_warm_scan_byte_for_byte(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """Cache-correctness contract: ``--no-cache`` must agree with the
+    persistent cache on the same HEAD. The in-memory ``:memory:`` store
+    backing ``--no-cache`` shares the same git-walk and dedup code paths
+    as the on-disk store; output must be byte-identical.
+    """
+    sha = repo.commit("feature", {"a.py": "1", "b.py": "1"}, when=days_ago(50))
+    repo.revert(sha, when=days_ago(45))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2", "b.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(10),
+    )
+    # Warm path first (writes the on-disk cache).
+    warm = _invoke(repo.root, "scan", "--top", "5").output
+    no_cache = _invoke(repo.root, "scan", "--top", "5", "--no-cache").output
+    warm_again = _invoke(repo.root, "scan", "--top", "5").output
+    assert warm == no_cache
+    assert warm == warm_again

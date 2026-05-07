@@ -50,18 +50,27 @@ err = Console(stderr=True)
 
 
 def _open_cache(repo_root: Path, no_cache: bool) -> ch.CacheStore | None:
-    """Open the on-disk cache for ``repo_root`` unless suppressed.
+    """Open the cache for ``repo_root`` according to the no-cache flag.
 
-    A None return means "do not pass a cache through git_facts" — every
-    git-side helper falls back to its original network-free, cache-free
-    implementation. This is the escape hatch behind ``--no-cache`` and
-    is also the default when the cache cannot be initialised at all
-    (read-only filesystem, etc.); we never want a cache failure to
-    block the main read path.
+    Modes:
+      * ``no_cache=False`` (the default): persistent on-disk SQLite at
+        ``.whycode/cache.db``.
+      * ``no_cache=True``: a transient ``:memory:`` SQLite store. The
+        same git-walk code path runs as for the cold-fill, but the
+        database is destroyed on ``close()`` — nothing lands on disk
+        and the next run starts cold. Keeping per-run amortisation
+        (one ``git log`` walk shared across files) is what makes
+        ``--no-cache`` at most as slow as a cold persistent fill;
+        the previous ``cache=None`` short-circuit lost that and so
+        ``--no-cache`` re-issued per-file walks every iteration.
+
+    A ``None`` return means "do not pass a cache through git_facts".
+    Happens only when even an in-memory open fails — very rare and
+    we never want a cache problem to block the main read path.
     """
-    if no_cache:
-        return None
     try:
+        if no_cache:
+            return ch.open_in_memory(repo_root)
         return ch.open_for(repo_root)
     except OSError:
         return None
@@ -425,7 +434,9 @@ def diff(
                 cards.append(rc.build(repo_root, f, cache=cache))
             except gf.GitError:
                 continue
-        cards.sort(key=lambda c: -c.score.value)
+        # Stable tie-break: lex smallest path on identical scores so cache
+        # and --no-cache truncate the same files at --top N.
+        cards.sort(key=lambda c: (-c.score.value, c.path))
         cards = cards[:top]
     finally:
         if cache is not None:
@@ -565,16 +576,17 @@ def highlights(
 
     inv_pairs = gf.extract_invariant_quotes(commits)
     sha_to_commit = {c.sha: c for c in commits}
-    seen_lines: dict[str, str] = {}
-    for sha, line in inv_pairs:
-        seen_lines.setdefault(line, sha)
+    deduped = gf.dedupe_invariant_lines(inv_pairs, sha_to_commit)
     inv_records: list[tuple[str, str, gf.Commit]] = []
-    for line, sha in seen_lines.items():
+    for sha, line in deduped:
         commit = sha_to_commit.get(sha)
         if commit is None:
             continue
         inv_records.append((line, sha, commit))
-    inv_records.sort(key=lambda t: t[2].authored_at, reverse=True)
+    # Sort newest first; on identical timestamps fall back to lexicographically
+    # smallest sha so cache and --no-cache emit byte-identical output.
+    inv_records.sort(key=lambda t: t[1])  # secondary: sha asc
+    inv_records.sort(key=lambda t: t[2].authored_at, reverse=True)  # primary
     inv_records = inv_records[:invariants]
 
     incident_records = gf.find_incidents(commits)[:incidents]
@@ -827,7 +839,10 @@ def scan(
         if cache is not None:
             cache.close()
 
-    cards.sort(key=lambda c: -c.score.value)
+    # Stable tie-break on identical scores: lexicographically smallest path
+    # so cache and --no-cache produce byte-identical text output for the
+    # same HEAD. Without this, the truncation at --top N is non-deterministic.
+    cards.sort(key=lambda c: (-c.score.value, c.path))
     top_cards = cards[:top]
     if not top_cards:
         # Be honest about what "no flagged files" actually means. A user who
@@ -949,7 +964,8 @@ def show(
             cards.append(rc.build(repo_root, change.path))
         except gf.GitError:
             continue
-    cards.sort(key=lambda c: -c.score.value)
+    # Stable tie-break on identical scores: lex smallest path.
+    cards.sort(key=lambda c: (-c.score.value, c.path))
 
     if json_out:
         console.print_json(
@@ -1065,13 +1081,18 @@ def tour(
 
         inv_pairs = gf.extract_invariant_quotes(commits)
         sha_to_commit = {c.sha: c for c in commits}
-        seen_lines: dict[str, str] = {}
-        for sha, line in inv_pairs:
-            seen_lines.setdefault(line, sha)
+        deduped = gf.dedupe_invariant_lines(inv_pairs, sha_to_commit)
+        # Sort newest first with sha-asc tie-break so cache and --no-cache
+        # surface the same three lines in the same order.
+        deduped_sorted = sorted(
+            (p for p in deduped if p[0] in sha_to_commit),
+            key=lambda p: p[0],
+        )
+        deduped_sorted.sort(
+            key=lambda p: sha_to_commit[p[0]].authored_at, reverse=True
+        )
         invariants_top = [
-            (line, sha_to_commit[sha])
-            for line, sha in seen_lines.items()
-            if sha in sha_to_commit
+            (line, sha_to_commit[sha]) for sha, line in deduped_sorted
         ][:3]
         incidents_top = gf.find_incidents(commits)[:3]
 
@@ -1135,7 +1156,8 @@ def tour(
                     ]
                     if useful:
                         cards.append(card)
-            cards.sort(key=lambda c: -c.score.value)
+            # Stable tie-break: lex smallest path on identical scores.
+            cards.sort(key=lambda c: (-c.score.value, c.path))
 
         if cards:
             console.print("[bold red]Top 3 risky files[/bold red]")

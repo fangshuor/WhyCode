@@ -4,6 +4,65 @@ All notable changes to WhyCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] — 2026-05-07
+
+### Fixed — cache-correctness determinism and a `--no-cache` perf regression
+
+A field-test pass against `pallets/flask` and `django/django` surfaced
+three cache-layer bugs the public release shipped with. This release
+pins all three.
+
+- **F4** — `whycode highlights` (and `tour`) returned different
+  invariant SHAs for the same HEAD across cache and `--no-cache`
+  reads. Two cherry-picks of the same body with identical
+  `authored_at` timestamps could collapse to either SHA depending on
+  the unstable walk order. Now there is a documented dedup rule
+  (earliest `authored_at`, then lexicographically smallest sha) shared
+  by both the cache and the no-cache code path. JSON output for the
+  same HEAD is now byte-identical regardless of cache state.
+- **F5** — `whycode scan --top N` (and the matching truncation in
+  `diff` and `show`) swapped files at the cutoff between cache and
+  `--no-cache` runs when scores tied. Stable secondary sort on the
+  lexicographically smallest path settles the tie deterministically.
+- **F7** — `whycode scan --no-cache` was 2.4× slower than the
+  equivalent cold cache fill on a 7,043-file repo. Bypassing the
+  cache also bypassed the in-session diffstat amortisation the cold
+  path uses to share `git log --no-walk --numstat` results across
+  files. `--no-cache` now opens a transient `:memory:` SQLite store
+  so the same git walk runs in both modes; only the persistence
+  layer differs. The store is destroyed on close — nothing lands at
+  `.whycode/cache.db`, no state crosses runs.
+
+Bench against `/tmp/recon-django` (10,000 commits, 7,043 files) with
+`whycode scan --top 10`:
+
+| run        | before  | after    |
+| ---------- | ------- | -------- |
+| cold       | 2 m 43 s | 3 m  1 s |
+| warm       | 19 s    | 22 s     |
+| `--no-cache` | 6 m 26 s | 2 m 44 s |
+
+`--no-cache` is now strictly faster than the cold persistent fill
+(164 s vs 181 s), as the 0.4.0 release notes implied it should be.
+
+### Internal
+
+- `src/whycode/git_facts.py` — `dedupe_invariant_lines(pairs,
+  sha_to_commit)` is the documented home of the F4 tie-break rule.
+- `src/whycode/cache.py` — `CacheStore.__init__` accepts an
+  `in_memory` flag; `cache.open_in_memory(repo_root)` is the
+  module-level entry point used by the CLI's `--no-cache` flag.
+- `src/whycode/cli.py` — `_open_cache` routes `--no-cache` to the
+  in-memory store; every `cards.sort` site now sorts by `(-score,
+  path)` for stable truncation.
+- `tests/test_cache.py` — two new tests for the in-memory mode.
+- `tests/test_cli.py` — three new regression tests asserting
+  byte-identical output across cache states for `highlights` (F4),
+  `scan` truncation (F5), and `scan` warm vs `--no-cache` (F7).
+
+5 new regression tests; 187 tests passing total. ruff + mypy strict
+clean.
+
 ## [0.4.1] — 2026-05-07
 
 ### Fixed — quality and CI-safety pass against three real OSS repos

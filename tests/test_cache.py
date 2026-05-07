@@ -306,6 +306,57 @@ def test_open_for_idempotent_open_close(tmp_path: Path) -> None:
         store_b.close()
 
 
+# ---- F7: in-memory cache for --no-cache amortisation ---------------------
+
+
+def test_open_in_memory_does_not_touch_disk(tmp_path: Path) -> None:
+    """The `:memory:` mode must leave the filesystem completely untouched."""
+    store = ch.open_in_memory(tmp_path)
+    try:
+        # Write a few rows; nothing should land on disk.
+        store.upsert_commits([_commit(sha="a" * 40)])
+        store.upsert_commit_files([("a" * 40, "x.py", 1, 0)])
+        store.set_head_sha("deadbeef")
+        assert not (tmp_path / ch.CACHE_DIRNAME).exists()
+        # Reads still return what we wrote.
+        rows = store.fetch_all_commit_rows()
+        assert len(rows) == 1
+        assert store.head_sha == "deadbeef"
+    finally:
+        store.close()
+    # And after close there's still nothing on disk.
+    assert not (tmp_path / ch.CACHE_DIRNAME).exists()
+
+
+def test_in_memory_cache_amortises_across_files(repo) -> None:  # type: ignore[no-untyped-def]
+    """The in-memory store reuses cached diffstat rows across calls.
+
+    The cold (persistent) path's main perf advantage over a no-cache call
+    was that, after a single batched ``git log --no-walk --numstat`` for
+    file A, file B's overlapping shas were already in the cache. The
+    `:memory:` store must give --no-cache the same amortisation in-process.
+    """
+    repo.commit("init", {"a.txt": "1", "b.txt": "1"})
+    repo.commit("touch a and b", {"a.txt": "2", "b.txt": "2"})
+    repo.commit("touch only b", {"b.txt": "3"})
+    with ch.open_in_memory(repo.root) as store:
+        # First call on a.txt populates diffstat rows for both shared shas.
+        a_commits = gf.commits_for_path(repo.root, "a.txt", cache=store)
+        gf.co_changes(repo.root, a_commits, "a.txt", cache=store)
+        # All shas a.txt touched are now present.
+        a_shas = [c.sha for c in a_commits]
+        assert store.shas_missing_files(a_shas) == []
+        # When b.txt's call runs, the two shas it shares with a.txt are
+        # served from the cache; only the b-only sha is missing.
+        b_commits = gf.commits_for_path(repo.root, "b.txt", cache=store)
+        b_shas = [c.sha for c in b_commits]
+        missing_for_b = set(store.shas_missing_files(b_shas))
+        # Exactly the shas that b.txt touched but a.txt did not are missing.
+        a_set = set(a_shas)
+        expected_missing = {s for s in b_shas if s not in a_set}
+        assert missing_for_b == expected_missing
+
+
 def test_fetch_co_changes_chunked_query_handles_many_shas(tmp_path: Path) -> None:
     """SQLite limits host parameters per statement; we chunk above 500."""
     with ch.open_for(tmp_path) as store:
