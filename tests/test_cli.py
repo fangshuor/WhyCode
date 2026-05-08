@@ -1646,3 +1646,67 @@ def test_why_header_demotes_score_to_dim_suffix(repo, days_ago) -> None:  # type
     data = json.loads(json_result.output)
     assert "score" in data
     assert isinstance(data["score"], int)
+
+
+# --- whycode story ----------------------------------------------------------
+
+
+def test_cli_story_command_renders_text(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`whycode story <path>` prints role-tagged chapter blocks; the rendered
+    text must surface the role label so a reader sees the narrative position
+    of each beat at a glance."""
+    sha_a = repo.commit(
+        "feat: initial dispatch",
+        {"a.py": "1"},
+        body="No constraint stated.",
+        when=days_ago(40),
+    )
+    repo.commit(
+        "hotfix: dispatch regression",
+        {"a.py": "2"},
+        body=f"See #INC-1\n\nCross-reference: {sha_a[:10]}",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "story", "a.py")
+    assert result.exit_code == 0
+    out = result.output
+    assert "a.py" in out
+    # Role tag in brackets is the visual anchor of a chapter.
+    assert "[INCIDENT]" in out or "[RECONCILIATION]" in out
+
+
+def test_cli_story_command_emits_json_with_chapters_array(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`whycode story <path> --json` emits the documented top-level shape."""
+    repo.commit(
+        "hotfix: outage",
+        {"a.py": "1"},
+        body="See #INC-1",
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "story", "a.py", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["path"] == "a.py"
+    assert "chapters" in data
+    assert isinstance(data["chapters"], list)
+    assert "summary" in data
+    assert "commit_count" in data
+    assert "chapters_total" in data
+    assert "chapters_returned" in data
+
+
+def test_cli_story_command_emits_markdown_with_role_headings(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`--markdown` renders ``## [role] sha · date · author`` headings so
+    PR-comment readers can scan beats by eye. Output must NOT be rich-rewrapped
+    (the reviewer needs the raw markdown bytes)."""
+    repo.commit(
+        "hotfix: outage",
+        {"a.py": "1"},
+        body="See #INC-1",
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "story", "a.py", "--markdown")
+    assert result.exit_code == 0
+    out = result.output
+    assert "# story · a.py" in out
+    assert "## [incident]" in out
