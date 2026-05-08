@@ -111,13 +111,6 @@ def _build_server(verbose: bool = False) -> Server:
                             "type": "integer",
                             "description": "Optional cap on commits scanned.",
                         },
-                        "explain": {
-                            "type": "boolean",
-                            "description": (
-                                "Include the rule-trace block per signal "
-                                "(rule id, why_it_fired, evidence, source_ref)."
-                            ),
-                        },
                     },
                     "required": ["path"],
                 },
@@ -218,13 +211,12 @@ def _summary_text(card: rc.RiskCard) -> str:
 def _handle_risk_profile(arguments: dict[str, Any]) -> list[TextContent]:
     path = str(arguments["path"])
     max_commits = arguments.get("max_commits")
-    explain = bool(arguments.get("explain", False))
     try:
         repo_root, rel = _resolve(path)
         card = rc.build(repo_root, rel, max_commits=max_commits)
     except gf.GitError as exc:
         return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
-    payload = card.to_dict(explain=explain)
+    payload = card.to_dict()
     payload["summary"] = _summary_text(card)
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
