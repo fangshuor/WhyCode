@@ -778,9 +778,6 @@ def detect_body_references(facts: RepoFacts) -> Signal | None:
     )
 
 
-_PIVOT_BODY_MIN_CHARS = 200
-
-
 def detect_subject_blind_pivot(facts: RepoFacts) -> Signal | None:
     """Long-body commits whose subjects look generic — the architectural pivots
     other detectors miss.
@@ -791,18 +788,9 @@ def detect_subject_blind_pivot(facts: RepoFacts) -> Signal | None:
     marker, no Conventional Commits breaking flag — and the body explaining
     *why* the pivot happened is exactly what a careful reader needs.
 
-    Acceptance:
-      - body length >= ``_PIVOT_BODY_MIN_CHARS`` (200 chars). A pivot worth
-        flagging carries enough prose to justify the design move.
-      - subject does NOT match the incident-keyword ladder in
-        :func:`whycode.git_facts._is_subject_incident` — those commits are
-        already surfaced by the incident detector.
-      - subject does NOT start with ``"Revert "`` and is not a default revert
-        body marker (``Reverted "..."`` / ``Reverts <sha>``) — the revert
-        detector handles those.
-      - subject does NOT start with ``"Merge "`` — merge commits routinely
-        carry long bodies (PR descriptions, conflict notes) that aren't
-        narratively load-bearing on their own.
+    Per-commit acceptance lives in :func:`gf.is_subject_blind_pivot_commit`
+    so the L2 signal and ``classify_commit``'s chapter role agree on what
+    counts as a pivot.
 
     The file-count gate the brief describes was deliberately skipped: the
     standard ``commits_for_path`` walk does not populate ``Commit.files`` and
@@ -810,22 +798,9 @@ def detect_subject_blind_pivot(facts: RepoFacts) -> Signal | None:
     risk silently breaking the cache + diff paths. The body-length floor is
     weaker but still catches the patterns the spec called out.
     """
-    candidates: list[Commit] = []
-    for commit in facts.commits:
-        if len(commit.body) < _PIVOT_BODY_MIN_CHARS:
-            continue
-        subject = commit.subject
-        if subject.startswith("Revert "):
-            continue
-        if subject.startswith("Merge "):
-            continue
-        if gf._REVERTED_SUBJECT_RE.search(subject):
-            continue
-        if gf._REVERTS_SUBJECT_RE.search(subject):
-            continue
-        if gf._is_subject_incident(subject, commit.body):
-            continue
-        candidates.append(commit)
+    candidates: list[Commit] = [
+        c for c in facts.commits if gf.is_subject_blind_pivot_commit(c)
+    ]
     if not candidates:
         return None
     n = len(candidates)
@@ -847,7 +822,7 @@ def detect_subject_blind_pivot(facts: RepoFacts) -> Signal | None:
         rule="subject_blind_pivot_long_body",
         why_it_fired=(
             f"{n} commit{'s' if n != 1 else ''} carried a body of "
-            f">= {_PIVOT_BODY_MIN_CHARS} characters with a subject that did "
+            f">= {gf._PIVOT_BODY_MIN_CHARS} characters with a subject that did "
             "not match incident, revert, or merge rules"
         ),
         evidence=tuple(

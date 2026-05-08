@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from whycode import git_facts as gf
 from whycode import signals as sig
+from whycode.git_facts import Commit
 
 
 def _facts_for(repo, path: str):  # type: ignore[no-untyped-def]
@@ -332,6 +335,96 @@ def test_subject_blind_pivot_silent_on_merge(
     facts = _facts_for(repo, "core.py")
     signal = sig.detect_subject_blind_pivot(facts)
     assert signal is None
+
+
+# ---- chapter_role pivot ladder --------------------------------------------
+#
+# Synthetic Commits drive these tests directly: classify_commit's pivot slot
+# is a per-commit decision and the helper does not read the on-disk repo.
+# That keeps the ladder tests independent of the conftest RepoBuilder.
+
+
+def _synth_commit(subject: str, body: str, sha: str = "a" * 40) -> Commit:
+    return Commit(
+        sha=sha,
+        author_name="Test",
+        author_email="test@example.com",
+        authored_at=datetime(2026, 5, 1, tzinfo=UTC),
+        subject=subject,
+        body=body,
+    )
+
+
+def test_classify_commit_role_pivot_when_long_body_generic_subject() -> None:
+    """A long-body commit with a generic-looking subject — neither incident
+    keyword nor revert marker nor merge prefix — classifies as a pivot. Same
+    shape the L2 detector fires on; the chapter ladder must agree."""
+    long_body = (
+        "This change reorganises the internal layout to separate the public "
+        "façade from the private dispatch helpers. The motivation is to make "
+        "the contract explicit: callers should not depend on the private "
+        "module path, and tests should pin the public surface only. We keep "
+        "backwards compat by re-exporting the old names with a __getattr__ "
+        "shim until the next major release."
+    )
+    assert len(long_body) >= 200
+    commit = _synth_commit("Reorganize internal layout", long_body)
+    classification = gf.classify_commit(commit)
+    assert classification.is_pivot is True
+    assert classification.chapter_role == "pivot"
+
+
+def test_classify_commit_role_revert_wins_over_pivot() -> None:
+    """A long-body commit whose subject is a default revert pointer is
+    handled by the revert detector; pivot is suppressed earlier in the
+    ladder."""
+    long_body = (
+        "Reverting the prior change because the assumption baked into the "
+        "fast path turns out to be wrong on Windows: the path separator "
+        "handling collides with the cache key normalisation we introduced "
+        "two weeks ago, breaking every CI run on the win32 builders today."
+    )
+    assert len(long_body) >= 200
+    commit = _synth_commit('Revert "feat: speculative cache"', long_body)
+    classification = gf.classify_commit(commit)
+    assert classification.is_revert is True
+    assert classification.chapter_role == "revert"
+
+
+def test_classify_commit_role_incident_wins_over_pivot() -> None:
+    """A long-body commit whose subject carries an incident keyword is the
+    incident detector's territory; the chapter ladder must keep firing
+    incident first."""
+    long_body = (
+        "Hotfix details: the regression manifested at 02:00 UTC and was "
+        "rolled back within fifteen minutes after pager went off. Root cause "
+        "is the missing null-check in the decoder path, exposed by the "
+        "upstream client library upgrade in the release tag earlier today."
+    )
+    assert len(long_body) >= 200
+    commit = _synth_commit("hotfix: regression", long_body)
+    classification = gf.classify_commit(commit)
+    assert classification.incident_flavoured is True
+    assert classification.chapter_role == "incident"
+
+
+def test_classify_commit_role_pivot_above_invariant() -> None:
+    """A commit body that BOTH passes the 200-char pivot floor AND states
+    an invariant must classify as pivot, not invariant — pivot sits above
+    invariant in the priority ladder."""
+    long_body = (
+        "This change reorganises the internal dispatch so the synchronous "
+        "façade can grow without dragging the async path into every caller. "
+        "Don't switch to async — v1 clients still depend on the sync entry "
+        "and the library cannot break that contract until the next major. "
+        "The shim re-exports the existing names so reverse-compat holds."
+    )
+    assert len(long_body) >= 200
+    commit = _synth_commit("Reorganize dispatch internals", long_body)
+    classification = gf.classify_commit(commit)
+    assert classification.is_pivot is True
+    assert classification.invariant_count > 0
+    assert classification.chapter_role == "pivot"
 
 
 def test_coupling_filters_ignored_paths(repo, days_ago) -> None:  # type: ignore[no-untyped-def]

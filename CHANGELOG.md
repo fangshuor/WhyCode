@@ -5,6 +5,53 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.6] — 2026-05-08
+
+### Added — `pivot` chapter role
+
+A seventh slot in the chapter ladder, sitting between `reconciliation` and
+`invariant`. The full priority is now ``revert > incident > reconciliation
+> pivot > invariant > silence_break > edit``.
+
+A "pivot" is a long-body commit whose subject does not declare its weight:
+no incident keyword, no revert marker, no Conventional Commits breaking
+flag, no merge prefix — but the body explains a structural change the
+subject cannot. The L2 `subject_blind_pivot` signal already surfaced these
+in `whycode why` (added in 0.6.5); the chapter ladder used by
+`whycode show` did not, so the most architecturally important commits in
+a file's history (flask's sansio split, click's `default=True` sentinel
+saga) classified as the residual `edit` bucket.
+
+### Changed — refactor: shared per-commit pivot helper
+
+The per-commit acceptance condition the L2 detector applied inline
+(body length floor 200 chars; subject is not an incident keyword, revert
+marker, merge prefix, or Conventional Commits breaking flag; body has no
+`BREAKING CHANGE:` footer) now lives in `git_facts.is_subject_blind_pivot_commit`.
+Both `signals.detect_subject_blind_pivot` and `git_facts.classify_commit`
+call the same helper, so the L2 signal and the chapter ladder agree on
+what counts as a pivot. `CommitClassification` gains an `is_pivot: bool`
+field; `whycode show <sha> --json` emits it alongside `is_revert` /
+`cites_prior_sha` / `breaks_silence`.
+
+### Internal
+
+- `whycode show` rendering: `pivot` paints in bold magenta, alongside
+  `reconciliation`. Same colour family is intentional — both are
+  narrative bridge commits.
+- 5 new tests (4 on `classify_commit`'s new ladder slot using synthetic
+  Commits; 1 on `whycode show --json` end-to-end).
+
+This release is prep work for 0.7.0 `whycode story`, which will render
+chapters by role; without the pivot slot the residual `edit` bucket would
+swallow the architecturally most consequential commits.
+
+260 tests passing (was 255); ruff + mypy strict clean. No new outbound
+calls, no new dependency. Verified on flask: commit `0ec7f713`
+("Split the App and Blueprint into Sansio and IO parts") now resolves to
+`chapter_role: "pivot"` (was `edit`).
+
+
 ## [0.6.5] — 2026-05-08
 
 ### Added — detector ladder gains two new chapters
