@@ -11,6 +11,7 @@ Commands
 - ``whycode diff [--base REF]`` — risk-rank files changed against a base ref.
 - ``whycode show <sha>``        — risk-flavored summary for one commit.
 - ``whycode timeline <path>``   — risk score evolution across the file's history.
+- ``whycode story <path>``      — chronological mindflow: chapters by classified role.
 - ``whycode honest <path>``     — every invariant line, verbatim, untruncated.
 - ``whycode scan [--top N]``    — print the top-N riskiest files in the repo.
 - ``whycode init``              — install CI workflow + pre-commit risk gate.
@@ -39,6 +40,7 @@ from whycode import git_facts as gf
 from whycode import ignore as ign
 from whycode import risk_card as rc
 from whycode import signals as sig
+from whycode import story as st
 from whycode import suppressions as supp
 
 app = typer.Typer(
@@ -998,6 +1000,112 @@ def timeline(
         f"[dim]{len(commits)} commit(s) total; sampled {len(rows)}. "
         f"Use --samples N to change.[/dim]"
     )
+
+
+def _resolve_since(repo_root: Path, since: str) -> datetime:
+    """Translate a ``--since`` argument into a timezone-aware datetime.
+
+    The user can pass either an ISO date (``2024-01-01``, ``2024-01-01T00:00``,
+    or fully qualified) or a git ref (``v1.0.0``, ``HEAD~50``, a SHA…). ISO
+    parsing is tried first because pure-date strings are the common case;
+    on failure we ask git to resolve the ref and read its authored timestamp.
+    """
+    from datetime import UTC
+
+    try:
+        parsed = datetime.fromisoformat(since)
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+    commit = gf.read_commit(repo_root, since)
+    if commit is None:
+        raise typer.BadParameter(
+            f"could not parse {since!r} as an ISO date or resolve it to a git ref."
+        )
+    return commit.authored_at
+
+
+@app.command()
+def story(
+    path: str = typer.Argument(..., help="File path to render the story for."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead."
+    ),
+    markdown: bool = typer.Option(
+        False,
+        "--markdown",
+        help="Emit GitHub-flavoured markdown for PR comments.",
+    ),
+    limit: int = typer.Option(
+        12, "--top", help="Cap returned chapters (default 12)."
+    ),
+    all_chapters: bool = typer.Option(
+        False, "--all", help="Show every chapter (escape hatch)."
+    ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Drop chapters older than this ISO date (2024-01-01) or git ref.",
+    ),
+    roles: str | None = typer.Option(
+        None,
+        "--roles",
+        help="Comma-separated role allowlist (e.g. 'revert,incident').",
+    ),
+    no_collapse: bool = typer.Option(
+        False, "--no-collapse", help="Disable run-folding."
+    ),
+    body_max_chars: int = typer.Option(
+        600, "--body-chars", help="Body excerpt max length."
+    ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Bypass the local SQLite cache at .whycode/cache.db.",
+    ),
+) -> None:
+    """Render the file's mindflow — chapters in chronological order."""
+    repo_root, rel = _require_tracked(path)
+
+    since_dt: datetime | None = None
+    if since is not None:
+        since_dt = _resolve_since(repo_root, since)
+
+    role_tuple: tuple[str, ...] | None = None
+    if roles is not None:
+        role_tuple = tuple(r.strip() for r in roles.split(",") if r.strip())
+        if not role_tuple:
+            role_tuple = None
+
+    cache = _open_cache(repo_root, no_cache)
+    try:
+        facts = gf.gather(repo_root, rel, cache=cache)
+    finally:
+        if cache is not None:
+            cache.close()
+
+    s = st.build_story(
+        facts,
+        limit=None if all_chapters else limit,
+        roles=role_tuple,
+        since=since_dt,
+        no_collapse=no_collapse,
+        body_max_chars=body_max_chars,
+    )
+
+    if json_out:
+        console.print_json(json.dumps(st.to_dict(s, body_max_chars=body_max_chars)))
+        return
+    if markdown:
+        # Use plain ``print`` rather than ``console.print`` so the markdown
+        # body is not rich-rewrapped — a pasted PR comment must keep its
+        # ``## headings`` and ``> blockquotes`` byte-for-byte.
+        print(st.render_markdown(s), end="")
+        return
+    console.print(st.render_text(s))
 
 
 @app.command()
