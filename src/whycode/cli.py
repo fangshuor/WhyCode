@@ -1133,7 +1133,13 @@ def show(
         raise typer.Exit(2)
     full_sha = commit.sha
 
-    classification = gf.classify_commit(commit)
+    # Walk a recent window of commits so the cross-reference check on this
+    # commit's body finds prior SHAs that actually exist in the repo. 5000
+    # commits covers most "narrative bridge" references; on tiny repos it
+    # walks them all in milliseconds.
+    known_repo_commits = gf.all_commits(repo_root, max_count=5000)
+    known_shas = {c.sha for c in known_repo_commits}
+    classification = gf.classify_commit(commit, known_shas=known_shas)
     is_incident = classification.incident_flavoured
     invariants = gf.extract_invariant_quotes([commit])
     file_changes = gf.files_changed_in(repo_root, full_sha)
@@ -1159,6 +1165,9 @@ def show(
                     "authored_at": commit.authored_at.isoformat(),
                     "incident_flavored": is_incident,
                     "invariants_stated": len(invariants),
+                    "is_revert": classification.is_revert,
+                    "cites_prior_sha": classification.cites_prior_sha,
+                    "chapter_role": classification.chapter_role,
                     "files_changed": len(file_changes),
                     "files": [c.to_dict() for c in cards],
                 }
@@ -1172,14 +1181,26 @@ def show(
     )
     console.print(f"  {commit.subject}")
     console.print()
+    role = classification.chapter_role
+    role_style = {
+        "revert": "bold bright_red",
+        "incident": "bold red",
+        "reconciliation": "bold magenta",
+        "invariant": "bold yellow",
+        "edit": "dim",
+    }.get(role, "dim")
+    console.print(f"  [bold]Role:[/bold] [{role_style}]{role.upper()}[/{role_style}]")
     badges: list[str] = []
     if is_incident:
         badges.append("[bold red]incident-flavored[/bold red]")
     if invariants:
         badges.append(f"[yellow]states {len(invariants)} invariant(s)[/yellow]")
-    if not badges:
-        badges.append("[dim]no special classification[/dim]")
-    console.print("  " + "   ".join(badges))
+    if classification.is_revert:
+        badges.append("[bright_red]revert[/bright_red]")
+    if classification.cites_prior_sha:
+        badges.append("[magenta]cites prior SHA[/magenta]")
+    if badges:
+        console.print("  " + "   ".join(badges))
     console.print(f"  [dim]{len(file_changes)} files changed[/dim]")
 
     if not cards:
