@@ -509,10 +509,20 @@ def detect_ghost_keeper(facts: RepoFacts) -> Signal | None:
         source_ref="src/whycode/signals.py:detect_ghost_keeper",
     )
 
+    most_recent_other = (
+        facts.commits[0].author_email != primary_email if facts.commits else False
+    )
+    if most_recent_other:
+        headline = (
+            f"Line owner ({primary_commit.author_name}) inactive "
+            f"{days_since_seen} days; file recently edited by others"
+        )
+    else:
+        headline = f"Primary author last active {days_since_seen} days ago"
     return Signal(
         kind=SignalKind.GHOST_KEEPER,
         severity=severity,
-        headline=f"Primary author last active {days_since_seen} days ago",
+        headline=headline,
         detail=(
             f"{primary_commit.author_name} {ownership_phrase}, but has not "
             f"committed anywhere in this repo for {days_since_seen} days. "

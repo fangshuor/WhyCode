@@ -241,12 +241,66 @@ def test_why_handles_path_outside_repo(tmp_path) -> None:  # type: ignore[no-unt
 
 def test_why_warns_on_untracked_path(repo) -> None:  # type: ignore[no-untyped-def]
     """Untracked path → exit 2 (so a CI loop running `whycode why` per file
-    fails loudly on a typo instead of silently succeeding)."""
+    fails loudly on a typo instead of silently succeeding). The friendly
+    next-step nudges the user toward `whycode scan`."""
     repo.commit("init", {"a.txt": "1"})
     result = _invoke(repo.root, "why", "phantom.txt")
     assert result.exit_code == 2
     assert "phantom.txt" in result.output
     assert "not tracked" in result.output
+    assert "check the path" in result.output
+
+
+def test_why_heads_up_advisory_on_ignored_path(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """When the target matches the default ignore list (CHANGELOG, lockfile,
+    etc.), emit an advisory above the card so a typo / LLM-suggested path
+    doesn't read as authoritative."""
+    repo.commit(
+        "init", {"CHANGELOG.md": "## 0.1\n", "src.py": "x"}, when=days_ago(40)
+    )
+    repo.commit("docs: bump", {"CHANGELOG.md": "## 0.2\n"}, when=days_ago(20))
+    result = _invoke(repo.root, "why", "CHANGELOG.md")
+    assert result.exit_code == 0
+    assert "heads up" in result.output.lower()
+    assert "advisory" in result.output.lower()
+
+
+def test_mute_confirmation_mentions_no_mutes_reverse_path(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The mute confirmation suggests `--no-mutes` as the preview path before
+    editing the JSON — the reverse-hint added in 0.6.1."""
+    repo.commit("init", {"r.py": "1"}, when=days_ago(60))
+    repo.commit(
+        "hotfix: regression", {"r.py": "2"}, body="See #INC-1", when=days_ago(10)
+    )
+    result = _invoke(repo.root, "why", "r.py", "--mute", "incident")
+    assert result.exit_code == 0
+    assert "--no-mutes" in result.output
+
+
+def test_mcp_command_prints_stdio_ready_line(repo, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """`whycode mcp` prints a stderr 'stdio server ready' line on startup so
+    a curious user doesn't see a silent block."""
+    import os
+
+    import whycode.mcp_server
+
+    repo.commit("init", {"a.txt": "1"})
+
+    served = {"called": False}
+
+    def fake_serve(verbose: bool = False) -> None:
+        served["called"] = True
+
+    monkeypatch.setattr(whycode.mcp_server, "serve", fake_serve)
+    cwd = os.getcwd()
+    os.chdir(repo.root)
+    try:
+        result = runner.invoke(app, ["mcp"])
+    finally:
+        os.chdir(cwd)
+    assert result.exit_code == 0
+    assert "stdio server ready" in result.output
+    assert served["called"]
 
 
 def test_diff_lists_changed_files_in_risk_order(repo, days_ago) -> None:  # type: ignore[no-untyped-def]

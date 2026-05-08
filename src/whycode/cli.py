@@ -821,7 +821,7 @@ def highlights(
     else:
         console.print(
             "[dim]INVARIANTS: none found. The repo's commit bodies don't use "
-            "cautionary language like 'do not', 'must not', 'warning:', etc.[/dim]\n"
+            "cautionary language like 'do not', 'must not', 'important:', etc.[/dim]\n"
         )
 
     if incident_records:
@@ -1055,6 +1055,13 @@ def honest(
     context — e.g., a commit whose constraint is stated across two lines.
     """
     repo_root, rel = _require_tracked(path)
+    if not json_out and ign.is_ignored(rel, ign.effective_patterns(repo_root)):
+        err.print(
+            f"[yellow]heads up:[/yellow] [bold]{rel}[/bold] matches the default "
+            f"ignore list. Invariant lines extracted from a metadata file "
+            f"(changelogs, lockfiles, generated code, vendored trees, docs build "
+            f"output) are usually noise; treat the output below as advisory."
+        )
     facts = gf.gather(repo_root, rel)
     if not facts.invariant_quotes:
         if json_out:
@@ -1131,8 +1138,11 @@ def show(
     invariants = gf.extract_invariant_quotes([commit])
     file_changes = gf.files_changed_in(repo_root, full_sha)
 
+    show_patterns = ign.effective_patterns(repo_root)
     cards: list[rc.RiskCard] = []
     for change in file_changes:
+        if ign.is_ignored(change.path, show_patterns):
+            continue
         try:
             cards.append(rc.build(repo_root, change.path))
         except gf.GitError:
