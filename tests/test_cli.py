@@ -706,6 +706,32 @@ def test_show_chapter_role_silence_break(repo, days_ago) -> None:  # type: ignor
     assert data["breaks_silence"] is True
 
 
+def test_show_chapter_role_pivot_style(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A long-body commit with a generic-looking subject — the architectural
+    pivot pattern — opens with a Role: PIVOT label and JSON carries
+    is_pivot=True."""
+    long_body = (
+        "This change reorganises the internal layout to separate the public "
+        "façade from the private dispatch helpers. The motivation is to make "
+        "the contract explicit: callers should not depend on the private "
+        "module path, and tests should pin the public surface only. We keep "
+        "backwards compat by re-exporting the old names with a __getattr__ "
+        "shim until the next major release."
+    )
+    assert len(long_body) >= 200
+    sha = repo.commit(
+        "Reorganize internal layout",
+        {"core.py": "1"},
+        body=long_body,
+        when=days_ago(20),
+    )
+    result = _invoke(repo.root, "show", sha, "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["chapter_role"] == "pivot"
+    assert data["is_pivot"] is True
+
+
 def test_init_writes_workflow_and_hook(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.py": "1"})
     result = _invoke(repo.root, "init")
