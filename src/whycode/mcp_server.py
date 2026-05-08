@@ -8,6 +8,8 @@ Tools
 - ``get_risk_profile(path)`` — full Risk Card.
 - ``get_file_decisions(path, limit=5)`` — decision-flavoured signals only
   (incidents, reverts, invariants), highest severity first.
+- ``audit_signal(path, kind)`` — rule trace for one fired signal, for
+  rare false-positive audits.
 
 Prompts
 -------
@@ -109,13 +111,6 @@ def _build_server(verbose: bool = False) -> Server:
                             "type": "integer",
                             "description": "Optional cap on commits scanned.",
                         },
-                        "explain": {
-                            "type": "boolean",
-                            "description": (
-                                "Include the rule-trace block per signal "
-                                "(rule id, why_it_fired, evidence, source_ref)."
-                            ),
-                        },
                     },
                     "required": ["path"],
                 },
@@ -137,6 +132,35 @@ def _build_server(verbose: bool = False) -> Server:
                     "required": ["path"],
                 },
             ),
+            Tool(
+                name="audit_signal",
+                description=(
+                    "Return the rule trace for one fired signal — for auditing WhyCode's "
+                    "reasoning when you suspect a false positive. Returns the rule "
+                    "identifier, the matching evidence tokens / thresholds, and a "
+                    "source-location pointer into the WhyCode source. Use this RARELY; "
+                    "the default risk profile is the right tool for normal triage."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file.",
+                        },
+                        "kind": {
+                            "type": "string",
+                            "description": (
+                                "Signal kind value to audit. One of: revert_chain, "
+                                "incident_history, high_churn, coupling, silence, "
+                                "ghost_keeper, invariant_quote, body_reference, "
+                                "subject_blind_pivot, newborn."
+                            ),
+                        },
+                    },
+                    "required": ["path", "kind"],
+                },
+            ),
         ]
 
     @server.call_tool()  # type: ignore[untyped-decorator]
@@ -147,6 +171,8 @@ def _build_server(verbose: bool = False) -> Server:
             return _handle_risk_profile(arguments)
         if name == "get_file_decisions":
             return _handle_file_decisions(arguments)
+        if name == "audit_signal":
+            return _handle_audit_signal(arguments)
         raise ValueError(f"Unknown tool: {name}")
 
     @server.list_prompts()  # type: ignore[no-untyped-call,untyped-decorator]
@@ -185,13 +211,12 @@ def _summary_text(card: rc.RiskCard) -> str:
 def _handle_risk_profile(arguments: dict[str, Any]) -> list[TextContent]:
     path = str(arguments["path"])
     max_commits = arguments.get("max_commits")
-    explain = bool(arguments.get("explain", False))
     try:
         repo_root, rel = _resolve(path)
         card = rc.build(repo_root, rel, max_commits=max_commits)
     except gf.GitError as exc:
         return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
-    payload = card.to_dict(explain=explain)
+    payload = card.to_dict()
     payload["summary"] = _summary_text(card)
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
@@ -221,6 +246,37 @@ def _handle_file_decisions(arguments: dict[str, Any]) -> list[TextContent]:
             }
             for s in decisions
         ],
+    }
+    return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+
+def _handle_audit_signal(arguments: dict[str, Any]) -> list[TextContent]:
+    path = str(arguments["path"])
+    kind = str(arguments["kind"])
+    try:
+        repo_root, rel = _resolve(path)
+        card = rc.build(repo_root, rel)
+    except gf.GitError as exc:
+        return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
+    matching = [s for s in card.signals if s.kind.value == kind]
+    if not matching:
+        payload: dict[str, Any] = {
+            "path": rel,
+            "kind": kind,
+            "fired": False,
+            "message": f"No {kind} signal fired for this file.",
+        }
+        return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+    s = matching[0]
+    payload = {
+        "path": rel,
+        "kind": kind,
+        "fired": True,
+        "headline": s.headline,
+        "rule": s.explanation.rule if s.explanation else None,
+        "why_it_fired": s.explanation.why_it_fired if s.explanation else None,
+        "evidence": list(s.explanation.evidence) if s.explanation else [],
+        "source_ref": s.explanation.source_ref if s.explanation else None,
     }
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
