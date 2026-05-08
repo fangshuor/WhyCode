@@ -9,13 +9,18 @@ from enum import StrEnum
 from whycode.signals import Signal, SignalKind
 
 # Per-signal contribution at severity 1. Severity multiplies linearly up to 5.
+# Coupling weight was 5 in 0.6.1 — the recon pass on click/flask/requests showed
+# coupling-only files (CHANGES.rst, large test fixtures) topping out at 100 while
+# files with 14 reverts only reached ~70. Coupling fires liberally on monorepos
+# where every test file co-changes with every fixture; demoting the base weight
+# rebalances the band cap without affecting kind ordering.
 _BASE_WEIGHT: dict[SignalKind, int] = {
     SignalKind.REVERT_CHAIN: 9,
     SignalKind.INCIDENT_HISTORY: 8,
     SignalKind.GHOST_KEEPER: 6,
     SignalKind.INVARIANT_QUOTE: 6,
-    SignalKind.COUPLING: 5,
     SignalKind.HIGH_CHURN: 5,
+    SignalKind.COUPLING: 3,
     SignalKind.SILENCE: 3,
     SignalKind.NEWBORN: 1,
 }

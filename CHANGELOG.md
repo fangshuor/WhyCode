@@ -5,6 +5,69 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.2] — 2026-05-08
+
+### Fixed — small-version polish + 0.6.1 follow-ups
+
+A focused audit on the post-0.6.1 surfaces flagged a stale empty-state
+hint, two ignore-filter holes the recon caught (now closed), four
+missing regression tests, a scorer overweight, and a misleading
+ghost-keeper headline.
+
+#### Real-repo correctness
+
+- `whycode show <sha>` now applies the default ignore filter to the
+  per-file table — release commits no longer surface ``CHANGELOG.md``,
+  lockfiles, generated stubs alongside the source files.
+- `whycode honest <ignored-path>` prepends the same "heads up: matches
+  default ignore list" advisory ``whycode why`` already shows. Pulling
+  invariant lines from a CHANGELOG release-notes file is mostly noise;
+  the advisory makes that explicit.
+
+#### Calibration
+
+- COUPLING base weight dropped from 5 to 3 in ``scorer.py``. Recon on
+  click / flask / requests showed coupling-only files (``CHANGES.rst``,
+  test fixtures) topping out near 100 while files with 14 reverts only
+  reached ~70 — an upside-down calibration. Coupling fires liberally
+  on monorepos where every test co-changes with every fixture; the
+  rebalance shifts the band cap without changing detector ordering.
+- Ghost-keeper headline now distinguishes "primary line owner inactive
+  N days" (when the file's most recent commit is by someone else) from
+  the original "primary author last active N days ago" phrasing. The
+  detail line and severity are unchanged; the headline just stops
+  contradicting the `most_recent_at` shown in the same Risk Card
+  (recon found this on click ``shell_completion.py``).
+
+#### Consistency
+
+- The ``highlights`` empty-state hint listed ``warning:`` as an example
+  invariant token even though 0.6.1 removed it from
+  ``INVARIANT_TOKENS``. Replaced with ``important:``.
+
+#### Test surface
+
+Four regression tests added for 0.6.1 surfaces that lacked coverage:
+- ``test_why_heads_up_advisory_on_ignored_path`` — locks the advisory
+  text on metadata files.
+- ``test_mute_confirmation_mentions_no_mutes_reverse_path`` — locks
+  the discoverability of the reverse path added in 0.6.1.
+- ``test_mcp_command_prints_stdio_ready_line`` — locks the startup
+  stderr line that prevents the "looks hung" first impression.
+- ``test_why_warns_on_untracked_path`` extended to assert the friendly
+  "→ check the path" next-step.
+
+236 tests passing (was 233); ruff + mypy strict clean.
+
+#### Deferred
+
+- Coupling pre-rename self-reference (``click/core.py`` showing as a
+  co-changer of ``src/click/core.py``) — basename-only matching
+  collides with ``__init__.py``; needs more careful design than a
+  patch release allows.
+- ``--mute`` enum-vs-display naming inconsistency (cosmetic).
+
+
 ## [0.6.1] — 2026-05-07
 
 ### Fixed — onboarding friction + real-repo recon
