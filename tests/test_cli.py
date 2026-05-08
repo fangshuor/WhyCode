@@ -539,6 +539,79 @@ def test_show_unknown_sha_errors(repo) -> None:  # type: ignore[no-untyped-def]
     assert result.exit_code != 0
 
 
+def test_show_renders_chapter_role_label(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`whycode show <sha>` opens with a "Role:" line so the reader knows
+    the commit's narrative position before drilling into per-file diffs."""
+    sha = repo.commit(
+        "hotfix: regression", {"a.py": "1"}, body="See #INC-1", when=days_ago(5)
+    )
+    result = _invoke(repo.root, "show", sha)
+    assert result.exit_code == 0
+    assert "Role:" in result.output
+    assert "INCIDENT" in result.output
+
+
+def test_show_chapter_role_reconciliation_when_body_cites_prior_sha(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """A commit whose body cites another known SHA classifies as a
+    reconciliation chapter — the narrative bridge pattern the body-reference
+    detector also surfaces in `whycode why`."""
+    sha_a = repo.commit("feat: A", {"x.py": "1"}, when=days_ago(40))
+    sha_b = repo.commit(
+        "feat: reconcile",
+        {"x.py": "2"},
+        body=f"This reconsiders {sha_a[:10]} after benchmarking.",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "show", sha_b, "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["chapter_role"] == "reconciliation"
+    assert data["cites_prior_sha"] is True
+
+
+def test_show_chapter_role_revert_when_subject_starts_with_revert(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """A commit whose subject starts with `Revert ` classifies as a revert
+    chapter regardless of the body."""
+    sha_a = repo.commit("feat: try async", {"x.py": "1"}, when=days_ago(40))
+    repo.revert(sha_a, when=days_ago(30))
+    # The revert created by repo.revert has subject 'Revert "feat: try async"'
+    # — find it via git log
+    import subprocess
+
+    log = subprocess.run(
+        ["git", "log", "--format=%H", "-1", "--grep=Revert"],
+        cwd=repo.root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    revert_sha = log.stdout.strip()
+    result = _invoke(repo.root, "show", revert_sha, "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["chapter_role"] == "revert"
+    assert data["is_revert"] is True
+
+
+def test_show_chapter_role_edit_for_routine_commit(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A vanilla commit with no incident keywords / invariant tokens / SHA
+    references / revert prefix gets the lowest-priority `edit` role."""
+    sha = repo.commit(
+        "tweak: rename internal helper",
+        {"x.py": "1"},
+        body="No constraint stated; no prior SHA referenced.",
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "show", sha, "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["chapter_role"] == "edit"
+
+
 def test_init_writes_workflow_and_hook(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.py": "1"})
     result = _invoke(repo.root, "init")

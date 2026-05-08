@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1064,23 +1064,73 @@ def find_incidents(commits: Sequence[Commit]) -> list[Commit]:
     return out
 
 
+_SHA_REF_IN_BODY_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.IGNORECASE)
+
+
 @dataclass(frozen=True)
 class CommitClassification:
-    """Light-weight summary of what kind of work a single commit represents."""
+    """Light-weight summary of what kind of work a single commit represents.
+
+    ``is_revert`` and ``cites_prior_sha`` are False by default so existing
+    callers that only read ``incident_flavoured`` / ``invariant_count`` keep
+    working unchanged. ``cites_prior_sha`` is only set when ``classify_commit``
+    is called with a ``known_shas`` set — without that cross-reference set,
+    the body could match SHA-shaped tokens (version numbers etc.) that aren't
+    real commit references.
+    """
 
     incident_flavoured: bool
     invariant_count: int
+    is_revert: bool = False
+    cites_prior_sha: bool = False
+
+    @property
+    def chapter_role(self) -> str:
+        """Single-word narrative-role label used by ``whycode show`` and the
+        upcoming ``whycode story``. Priority ladder (first match wins):
+        ``revert`` > ``incident`` > ``reconciliation`` > ``invariant`` > ``edit``.
+        Reconciliation requires a body cross-reference to a prior known SHA.
+        """
+        if self.is_revert:
+            return "revert"
+        if self.incident_flavoured:
+            return "incident"
+        if self.cites_prior_sha:
+            return "reconciliation"
+        if self.invariant_count > 0:
+            return "invariant"
+        return "edit"
 
 
-def classify_commit(commit: Commit) -> CommitClassification:
+def classify_commit(
+    commit: Commit, *, known_shas: Iterable[str] | None = None
+) -> CommitClassification:
     """Classify a single commit by reusing the same rules ``find_incidents`` and
-    ``extract_invariant_quotes`` apply to a list. Public API for ``whycode show``
-    and any other surface that wants a single-commit verdict without
-    re-implementing the regex ladder.
+    ``extract_invariant_quotes`` apply to a list.
+
+    ``known_shas`` enables the ``cites_prior_sha`` cross-reference check —
+    pass the repo's commit-SHA set and the body is scanned for short SHA
+    tokens (7-40 hex chars) that match a real commit. Merge commits are
+    never flagged (their SHA mentions are routine, not narrative).
     """
+    body = commit.body or ""
+    is_revert = (
+        commit.subject.startswith("Revert ")
+        or "this reverts commit" in body.lower()
+    )
+    cites_prior = False
+    if known_shas and body and not commit.subject.startswith("Merge "):
+        known = set(known_shas)
+        for match in _SHA_REF_IN_BODY_RE.finditer(body):
+            short = match.group(1).lower()
+            if any(k != commit.sha and k.lower().startswith(short) for k in known):
+                cites_prior = True
+                break
     return CommitClassification(
         incident_flavoured=bool(find_incidents([commit])),
         invariant_count=len(extract_invariant_quotes([commit])),
+        is_revert=is_revert,
+        cites_prior_sha=cites_prior,
     )
 
 

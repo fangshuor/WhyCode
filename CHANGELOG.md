@@ -5,6 +5,60 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.4] — 2026-05-08
+
+### Added — chapter-role classifier surfaced by `whycode show`
+
+A reusable narrative-role classifier on every commit. ``whycode show
+<sha>`` now opens with a one-word ``Role:`` line so a reader knows the
+commit's position in the file's mindflow before drilling into the
+per-file diffs:
+
+```
+c653ec820093  Kevin Deldycke  2026-04-09
+  Reconcile default value passing and default activation
+
+  Role: RECONCILIATION
+  cites prior SHA
+  5 files changed
+```
+
+The role ladder (first match wins): ``revert`` > ``incident`` >
+``reconciliation`` > ``invariant`` > ``edit``. Reconciliation requires a
+body cross-reference to a prior known SHA — the same signal the 0.6.3
+``body_reference`` detector surfaces in ``whycode why``. The two
+surfaces now triangulate the same data.
+
+#### Internal
+
+- ``CommitClassification`` (``git_facts.py``) gains ``is_revert: bool``,
+  ``cites_prior_sha: bool``, and a ``chapter_role`` property. Both new
+  fields default to ``False`` so existing callers (``mcp_server.py``'s
+  postmortem prompt and the older ``whycode show`` rendering) keep
+  working unchanged.
+- ``classify_commit(commit, *, known_shas=None)`` accepts an optional
+  set of repo SHAs to enable the cross-reference check. Passing the
+  set is opt-in because the body-scan is meaningful only when the
+  caller actually has a real commit set to match against (otherwise
+  any SHA-shaped token would falsely match).
+- ``whycode show --json`` adds three keys: ``is_revert``,
+  ``cites_prior_sha``, ``chapter_role``. The existing
+  ``incident_flavored`` / ``invariants_stated`` / ``files`` keys are
+  unchanged.
+
+### Why 0.6.4 (not 0.7.0)
+
+The chapter-role classifier is the building block 0.7.0's ``whycode
+story <path>`` will reuse to label each chapter in the per-file
+narrative. Shipping it now as a patch lets users on 0.6.x see the
+upgraded ``show`` output immediately — and validates the
+classifier against real commits before the larger story rendering
+arrives.
+
+245 tests passing (was 241, +4 chapter-role coverage); ruff + mypy
+strict clean. No new outbound calls, no new dependency.
+
+
 ## [0.6.3] — 2026-05-08
 
 ### Added — body-reference detector
