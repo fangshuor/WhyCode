@@ -5,6 +5,92 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.5] — 2026-05-08
+
+### Added — detector ladder gains two new chapters
+
+- **`subject_blind_pivot`** — long-body, generic-subject commits the
+  existing ladder misses. Subject must NOT match incident keywords,
+  revert markers, or merge prefixes; body length floor 200 chars.
+  Severity 3 for 1-2 candidates, 4 for 3+. Catches the architectural
+  pivots ("Reorganize internal layout", "Merge contexts") that carry
+  their explanation in the body but not the subject. Scorer weight 5
+  (alongside `high_churn`, above `body_reference`).
+- **`silence_break`** chapter role — sixth slot in the chapter ladder
+  (``revert > incident > reconciliation > invariant > silence_break >
+  edit``). ``classify_commit`` accepts an optional ``prior_commit_at``;
+  when the gap to ``commit.authored_at`` is ≥ 180 days the commit is
+  flagged as "the file slept for half a year, then someone re-touched
+  it" — a narratively distinct beat the other roles do not capture.
+  ``whycode show`` resolves ``prior_commit_at`` from the first changed
+  file's history.
+
+### Changed — persona-driven UX
+
+A round of read-only persona simulations (solo dev / senior eng joining
+a new codebase / AI-paired editor user / tech lead reviewing a PR / 3am
+SRE) surfaced concrete gaps the existing surfaces left.
+
+- **``whycode show <sha>`` now renders the commit body** (truncated to
+  ≤12 lines / 600 chars by default; ``--full`` shows everything).
+  Three personas independently said the previous output — risk-band
+  table only — was "a worse ``git show``" because the actual reasoning
+  for the change was hidden. The body is the reasoning.
+- **Per-file diffstat column** in ``whycode show``'s file table
+  (``+24/-5``). A reviewer can now distinguish a 3-line tweak from a
+  rewrite without leaving WhyCode for git.
+- **``--diff`` flag on ``whycode show``** to include the unified diff
+  inline (truncated to 60 lines unless ``--full``).
+- **``whycode why --brief`` opens with an action verb**: ``ESCALATE``
+  (HANDLE WITH CARE or security-touched), ``CHECK`` (READ HISTORY
+  FIRST), ``SCAN`` (WORTH A LOOK), ``OK`` (NO FLAGS). The score moves
+  to supporting evidence; the band still appears for context. The 3am
+  SRE persona had to interpret a bare ``77`` to make a call — the
+  verdict is the call.
+- **``SECURITY-TOUCHED`` label** added to ``--brief`` when any signal
+  references a ``CVE-`` or ``GHSA-`` token; coerces verdict to
+  ``ESCALATE`` regardless of band. Files like a session handler with
+  a GHSA in its log no longer hide that history behind a polite
+  "HANDLE WITH CARE".
+
+### Fixed — coupling no longer points the LLM editor at dead paths
+
+- ``detect_coupling`` now drops co-changers whose path doesn't exist
+  on HEAD. On every repo that ever moved its source into ``src/``
+  (click, flask, requests …), pre-rename paths
+  (``flask/helpers.py`` for current ``src/flask/helpers.py``) appeared
+  as #2-#5 co-changers — the AI-paired editor persona feedback
+  flagged that the LLM was wasting turns trying to read those
+  non-existent files. Process-local ``functools.lru_cache`` on the
+  ``ls-files`` set so the per-call cost is one ``git`` invocation per
+  repo per CLI run.
+
+### Internal
+
+- ``--mute KIND`` help nudges the reader to use the ``kind`` value
+  shown in ``--explain`` / JSON output (``ghost_keeper``,
+  ``invariant_quote``) rather than a guessed prefix.
+- 4 new persona-feedback tests (``brief`` verdict; security-touched
+  flagging; ``show`` body rendering; per-file diffstat column) +
+  6 from the new detector additions.
+
+255 tests passing (was 245); ruff + mypy strict clean. No new outbound
+calls, no new dependency.
+
+#### Deferred
+
+- ``whycode diff --markdown`` sibling-file dedup ("4 docs/_templates/*
+  share inactive owner") — only the tech-lead persona flagged this
+  and it interacts with ``--fail-on`` thresholds; needs a focused
+  design pass.
+- Sub-file hotspots ("which functions inside ``models.py`` absorbed
+  the 14 reverts?") — senior-eng persona ask; would require new
+  per-line plumbing.
+- MCP ``--explain`` payload separation (move ``explanation`` block
+  to a dedicated ``audit_signal`` tool) — AI-paired persona ask;
+  defer until 0.7.0 when ``whycode story`` is also exposed.
+
+
 ## [0.6.4] — 2026-05-08
 
 ### Added — chapter-role classifier surfaced by `whycode show`

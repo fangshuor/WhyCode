@@ -1,3 +1,3 @@
 """WhyCode — tells you what to be afraid of before touching a file."""
 
-__version__ = "0.6.4"
+__version__ = "0.6.5"

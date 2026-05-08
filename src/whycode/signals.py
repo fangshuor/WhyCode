@@ -6,11 +6,13 @@ every one carries the SHAs that produced it, so a careful reader can verify.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from whycode import git_facts as gf
@@ -29,6 +31,7 @@ class SignalKind(StrEnum):
     GHOST_KEEPER = "ghost_keeper"
     INVARIANT_QUOTE = "invariant_quote"
     BODY_REFERENCE = "body_reference"
+    SUBJECT_BLIND_PIVOT = "subject_blind_pivot"
     NEWBORN = "newborn"
 
 
@@ -324,6 +327,27 @@ def detect_high_churn(facts: RepoFacts) -> Signal | None:
     )
 
 
+@functools.lru_cache(maxsize=8)
+def _tracked_paths_at_head(repo_root: Path) -> frozenset[str]:
+    """Cached ``git ls-files`` set for the given repo, scoped to one process.
+
+    Used by ``detect_coupling`` to filter out co-change candidates whose path
+    no longer exists on HEAD. Without this filter, the LLM-paired persona
+    feedback flagged that pre-``src/`` paths (``flask/helpers.py`` when the
+    real path is now ``src/flask/helpers.py``) appear as #2-#5 co-changers
+    and the editor LLM wastes turns trying to read non-existent files.
+
+    The cache size is small because a single CLI invocation typically only
+    sees one or two repos, and stale entries are invalidated by process
+    exit anyway.
+    """
+    try:
+        out = gf.run_git(repo_root, "ls-files")
+    except gf.GitError:
+        return frozenset()
+    return frozenset(line for line in out.splitlines() if line.strip())
+
+
 def _is_likely_self_reference(target: str, candidate: str) -> bool:
     """True if ``candidate`` looks like the same file as ``target`` under a
     different historical path (e.g. ``src/click/core.py`` vs ``click/core.py``).
@@ -352,14 +376,20 @@ def detect_coupling(facts: RepoFacts) -> Signal | None:
     ``.whycodeignore``). Pre-rename self-references (the file under its
     historical path, e.g. ``click/core.py`` for current ``src/click/core.py``)
     are dropped so a renamed file doesn't appear as its own loudest coupler.
+    Co-change paths that no longer exist on HEAD are also dropped, so an
+    LLM editor reading the signal doesn't burn turns trying to open paths
+    that disappeared in a long-ago ``src/`` move (``flask/helpers.py`` for
+    a project whose source now lives at ``src/flask/helpers.py``).
     """
     patterns = ign.effective_patterns(facts.repo_root)
+    tracked = _tracked_paths_at_head(facts.repo_root)
     paired = [
         (p, n)
         for p, n in facts.co_changed_files.items()
         if n >= COUPLING_MIN_COCHANGES
         and not ign.is_ignored(p, patterns)
         and not _is_likely_self_reference(facts.path, p)
+        and (not tracked or p in tracked)
     ]
     if not paired:
         return None
@@ -748,6 +778,98 @@ def detect_body_references(facts: RepoFacts) -> Signal | None:
     )
 
 
+_PIVOT_BODY_MIN_CHARS = 200
+
+
+def detect_subject_blind_pivot(facts: RepoFacts) -> Signal | None:
+    """Long-body commits whose subjects look generic — the architectural pivots
+    other detectors miss.
+
+    A commit can be the most consequential decision in a file's history yet
+    fly under every other rule: a subject like ``"Merge contexts"`` or
+    ``"Reorganize internal layout"`` carries no incident keyword, no revert
+    marker, no Conventional Commits breaking flag — and the body explaining
+    *why* the pivot happened is exactly what a careful reader needs.
+
+    Acceptance:
+      - body length >= ``_PIVOT_BODY_MIN_CHARS`` (200 chars). A pivot worth
+        flagging carries enough prose to justify the design move.
+      - subject does NOT match the incident-keyword ladder in
+        :func:`whycode.git_facts._is_subject_incident` — those commits are
+        already surfaced by the incident detector.
+      - subject does NOT start with ``"Revert "`` and is not a default revert
+        body marker (``Reverted "..."`` / ``Reverts <sha>``) — the revert
+        detector handles those.
+      - subject does NOT start with ``"Merge "`` — merge commits routinely
+        carry long bodies (PR descriptions, conflict notes) that aren't
+        narratively load-bearing on their own.
+
+    The file-count gate the brief describes was deliberately skipped: the
+    standard ``commits_for_path`` walk does not populate ``Commit.files`` and
+    splicing ``--name-only`` into the existing record-separated parser would
+    risk silently breaking the cache + diff paths. The body-length floor is
+    weaker but still catches the patterns the spec called out.
+    """
+    candidates: list[Commit] = []
+    for commit in facts.commits:
+        if len(commit.body) < _PIVOT_BODY_MIN_CHARS:
+            continue
+        subject = commit.subject
+        if subject.startswith("Revert "):
+            continue
+        if subject.startswith("Merge "):
+            continue
+        if gf._REVERTED_SUBJECT_RE.search(subject):
+            continue
+        if gf._REVERTS_SUBJECT_RE.search(subject):
+            continue
+        if gf._is_subject_incident(subject, commit.body):
+            continue
+        candidates.append(commit)
+    if not candidates:
+        return None
+    n = len(candidates)
+    severity = 4 if n >= 3 else 3
+    headline = (
+        f"{n} architectural pivot{'s' if n != 1 else ''} "
+        "(long-body, non-incident, non-revert)"
+    )
+    most_recent = max(candidates, key=lambda c: c.authored_at)
+    bullets = [
+        f"  > {_short(c.sha)} {c.subject[:60].rstrip()}"
+        for c in candidates[:3]
+    ]
+    detail = (
+        "Generic-looking subjects can hide the load-bearing decisions "
+        "other detectors skip:\n" + "\n".join(bullets)
+    )
+    explanation = Explanation(
+        rule="subject_blind_pivot_long_body",
+        why_it_fired=(
+            f"{n} commit{'s' if n != 1 else ''} carried a body of "
+            f">= {_PIVOT_BODY_MIN_CHARS} characters with a subject that did "
+            "not match incident, revert, or merge rules"
+        ),
+        evidence=tuple(
+            f"{_short(c.sha)} body_len={len(c.body)}" for c in candidates[:5]
+        ),
+        source_ref="src/whycode/signals.py:detect_subject_blind_pivot",
+    )
+    next_step = (
+        f"Read git show {_short(most_recent.sha)} — these are the "
+        "load-bearing decisions other detectors miss."
+    )
+    return Signal(
+        kind=SignalKind.SUBJECT_BLIND_PIVOT,
+        severity=severity,
+        headline=headline,
+        detail=detail,
+        evidence=tuple(_short(c.sha) for c in candidates[:5]),
+        explanation=explanation,
+        next_step=next_step,
+    )
+
+
 _DETECTORS = (
     detect_revert_chain,
     detect_incident_history,
@@ -755,8 +877,9 @@ _DETECTORS = (
     detect_ghost_keeper,
     detect_coupling,
     detect_high_churn,
-    detect_silence,
     detect_body_references,
+    detect_subject_blind_pivot,
+    detect_silence,
     detect_newborn,
 )
 
@@ -799,6 +922,7 @@ __all__ = [
     "detect_newborn",
     "detect_revert_chain",
     "detect_silence",
+    "detect_subject_blind_pivot",
 ]
 
 

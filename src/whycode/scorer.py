@@ -20,6 +20,7 @@ _BASE_WEIGHT: dict[SignalKind, int] = {
     SignalKind.GHOST_KEEPER: 6,
     SignalKind.INVARIANT_QUOTE: 6,
     SignalKind.HIGH_CHURN: 5,
+    SignalKind.SUBJECT_BLIND_PIVOT: 5,
     SignalKind.BODY_REFERENCE: 4,
     SignalKind.COUPLING: 3,
     SignalKind.SILENCE: 3,
