@@ -10,6 +10,8 @@ Tools
   (incidents, reverts, invariants), highest severity first.
 - ``audit_signal(path, kind)`` — rule trace for one fired signal, for
   rare false-positive audits.
+- ``get_file_story(path, limit=12)`` — chronological narrative of the file's
+  history: chapters keyed by classified role.
 
 Prompts
 -------
@@ -161,6 +163,30 @@ def _build_server(verbose: bool = False) -> Server:
                     "required": ["path", "kind"],
                 },
             ),
+            Tool(
+                name="get_file_story",
+                description=(
+                    "Return the chronological narrative of a file's history: "
+                    "chapters keyed by classified role (revert / incident / "
+                    "reconciliation / pivot / invariant / silence_break / edit). "
+                    "Use BEFORE refactoring an unfamiliar file to read the chain "
+                    "of decisions that produced its current shape. Pair with "
+                    "get_risk_profile for the 'should I be careful here' framing."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "limit": {"type": "integer", "default": 12},
+                        "body_max_chars": {"type": "integer", "default": 600},
+                        "roles": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["path"],
+                },
+            ),
         ]
 
     @server.call_tool()  # type: ignore[untyped-decorator]
@@ -173,6 +199,8 @@ def _build_server(verbose: bool = False) -> Server:
             return _handle_file_decisions(arguments)
         if name == "audit_signal":
             return _handle_audit_signal(arguments)
+        if name == "get_file_story":
+            return _handle_file_story(arguments)
         raise ValueError(f"Unknown tool: {name}")
 
     @server.list_prompts()  # type: ignore[no-untyped-call,untyped-decorator]
@@ -279,6 +307,37 @@ def _handle_audit_signal(arguments: dict[str, Any]) -> list[TextContent]:
         "source_ref": s.explanation.source_ref if s.explanation else None,
     }
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+
+def _handle_file_story(arguments: dict[str, Any]) -> list[TextContent]:
+    # Imported lazily so a packaging environment that only installs the
+    # MCP extras (without the full whycode dist) still loads the module.
+    from whycode import story as story_mod
+
+    path = str(arguments["path"])
+    limit_arg = int(arguments.get("limit", 12))
+    body_max = int(arguments.get("body_max_chars", 600))
+    role_filter_in = arguments.get("roles") or ()
+    role_filter: tuple[str, ...] | None = (
+        tuple(str(r) for r in role_filter_in) if role_filter_in else None
+    )
+    try:
+        repo_root, rel = _resolve(path)
+        facts = gf.gather(repo_root, rel)
+    except gf.GitError as exc:
+        return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
+    s = story_mod.build_story(
+        facts,
+        limit=limit_arg,
+        roles=role_filter,
+        body_max_chars=body_max,
+    )
+    return [
+        TextContent(
+            type="text",
+            text=json.dumps(story_mod.to_dict(s, body_max_chars=body_max), indent=2),
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
