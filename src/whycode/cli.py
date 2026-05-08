@@ -295,7 +295,8 @@ def why(
             "Suppress a signal kind for this path going forward "
             "(stored in .whycode/suppressed.json). One of: "
             "revert, incident, high_churn, coupling, silence, ghost, "
-            "invariant, newborn. Example: --mute coupling."
+            "invariant, newborn. Example: --mute coupling. "
+            "(Use the `kind` value shown in --explain output / JSON.)"
         ),
     ),
     no_mutes: bool = typer.Option(
