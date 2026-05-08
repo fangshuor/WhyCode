@@ -221,7 +221,7 @@ Tune the thresholds inside those two files for your repo. Re-run with
 | Layer | What                                                                     | Network? | API key? |
 | ----- | ------------------------------------------------------------------------ | -------- | -------- |
 | 1     | Deterministic git facts (log, diffstat, revert pairs, author activity)   | no       | no       |
-| 2     | Heuristic signals (reverts, incidents, silence, ghost keeper, coupling, invariants, churn, newborn) | no | no |
+| 2     | Heuristic signals (reverts, incidents, silence, ghost keeper, coupling, invariants, churn, body-references, newborn) | no | no |
 | 3     | LLM-extracted structured decisions (optional, opt-in, never on by default) | yes      | yes      |
 
 **Layer 1 + Layer 2 produce the Risk Card by default. No model calls, no

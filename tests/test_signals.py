@@ -116,6 +116,113 @@ def test_coupling_fires_when_files_co_change_often(repo, days_ago) -> None:  # t
     assert "b.py" in signal.detail
 
 
+def test_is_likely_self_reference_helper_path_normalisation() -> None:
+    """Pre-rename self-reference detection rules.
+
+    A renamed file (``src/click/core.py`` was once ``click/core.py``) shouldn't
+    appear as its own #1 co-changer. Also: same-basename files in unrelated
+    dirs (``a/b/__init__.py`` vs ``c/d/__init__.py``) must NOT collide.
+    """
+    is_self = sig._is_likely_self_reference
+    assert is_self("src/click/core.py", "src/click/core.py") is True
+    assert is_self("src/click/core.py", "click/core.py") is True
+    assert is_self("click/core.py", "src/click/core.py") is True
+    assert is_self("cli.py", "src/cli.py") is True
+
+    assert is_self("src/whycode/cli.py", "tests/test_cli/cli.py") is False
+    assert is_self("a/b/__init__.py", "c/d/__init__.py") is False
+    assert is_self("src/click/core.py", "src/click/types.py") is False
+    assert is_self("src/click/core.py", "tests/test_basic.py") is False
+
+
+def test_coupling_excludes_pre_rename_self_reference(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """When the same physical file appears under multiple historical paths
+    in the co-change index (a real ``src/`` move pattern), the coupling
+    detector must not list it as its own loudest co-changer.
+
+    We can't easily replay a real git rename in a synthetic test, so we
+    exercise the public ``detect_coupling`` against a co-change map that
+    includes the target's own path — which is what the diff command's
+    in-memory load does until rename-resolution is threaded through.
+    """
+    # Five commits touching both a real co-changer and the target file,
+    # plus a synthesised pre-rename self-reference seeded by hand below.
+    for i in range(5):
+        repo.commit(
+            f"step {i}",
+            {"src/x/core.py": str(i), "src/x/types.py": str(i)},
+            when=days_ago(60 - i * 5),
+        )
+    facts = _facts_for(repo, "src/x/core.py")
+    # Manually inject a pre-rename self-reference into the co-change map.
+    facts = gf.RepoFacts(
+        path=facts.path,
+        repo_root=facts.repo_root,
+        commits=facts.commits,
+        co_changed_files={
+            "x/core.py": 7,
+            "src/x/types.py": facts.co_changed_files.get("src/x/types.py", 4),
+        },
+        revert_pairs=facts.revert_pairs,
+        incident_commits=facts.incident_commits,
+        invariant_quotes=facts.invariant_quotes,
+        cache=facts.cache,
+    )
+    signal = sig.detect_coupling(facts)
+    assert signal is not None
+    # The pre-rename self path must NOT appear in coupling output.
+    assert "x/core.py" not in signal.detail.replace("src/x/core.py", "")
+    assert "src/x/types.py" in signal.detail
+
+
+def test_body_references_fires_when_body_cites_prior_sha(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A commit body that cites another SHA from this file's history is the
+    narrative bridge linking past decisions to present ones."""
+    sha_a = repo.commit("feat: A", {"x.py": "1"}, when=days_ago(60))
+    repo.commit("feat: B", {"x.py": "2"}, when=days_ago(40))
+    repo.commit(
+        "feat: reconciliation",
+        {"x.py": "3"},
+        body=f"This reconsiders the approach in {sha_a[:10]} after benchmarking.",
+        when=days_ago(20),
+    )
+    facts = _facts_for(repo, "x.py")
+    signal = sig.detect_body_references(facts)
+    assert signal is not None
+    assert signal.kind is sig.SignalKind.BODY_REFERENCE
+    assert sha_a[:7] in signal.detail
+
+
+def test_body_references_silent_when_no_cross_reference(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A body that mentions an unrelated SHA-shaped string (e.g. a
+    version number, an unrelated repo's SHA) must not fire."""
+    repo.commit("init", {"x.py": "1"}, when=days_ago(40))
+    repo.commit(
+        "follow up",
+        {"x.py": "2"},
+        body="Bumps version from 1234567 to abcdef9 — unrelated.",
+        when=days_ago(20),
+    )
+    facts = _facts_for(repo, "x.py")
+    signal = sig.detect_body_references(facts)
+    assert signal is None
+
+
+def test_body_references_skips_merge_commits(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`Merge ...` commits routinely include SHA mentions that are not
+    narrative bridges; they must be ignored."""
+    sha_a = repo.commit("feat: A", {"x.py": "1"}, when=days_ago(60))
+    repo.commit(
+        f"Merge branch 'feature' — fast-forward of {sha_a[:7]}",
+        {"x.py": "2"},
+        body=f"Merge commit referencing {sha_a[:8]} routinely.",
+        when=days_ago(20),
+    )
+    facts = _facts_for(repo, "x.py")
+    signal = sig.detect_body_references(facts)
+    assert signal is None
+
+
 def test_coupling_filters_ignored_paths(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """F10 — co-change candidates that scan would hide must not appear in
     the per-file coupling signal either. ``CHANGELOG.md`` is in the default
