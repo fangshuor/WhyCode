@@ -6,11 +6,13 @@ every one carries the SHAs that produced it, so a careful reader can verify.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from whycode import git_facts as gf
@@ -325,6 +327,27 @@ def detect_high_churn(facts: RepoFacts) -> Signal | None:
     )
 
 
+@functools.lru_cache(maxsize=8)
+def _tracked_paths_at_head(repo_root: Path) -> frozenset[str]:
+    """Cached ``git ls-files`` set for the given repo, scoped to one process.
+
+    Used by ``detect_coupling`` to filter out co-change candidates whose path
+    no longer exists on HEAD. Without this filter, the LLM-paired persona
+    feedback flagged that pre-``src/`` paths (``flask/helpers.py`` when the
+    real path is now ``src/flask/helpers.py``) appear as #2-#5 co-changers
+    and the editor LLM wastes turns trying to read non-existent files.
+
+    The cache size is small because a single CLI invocation typically only
+    sees one or two repos, and stale entries are invalidated by process
+    exit anyway.
+    """
+    try:
+        out = gf.run_git(repo_root, "ls-files")
+    except gf.GitError:
+        return frozenset()
+    return frozenset(line for line in out.splitlines() if line.strip())
+
+
 def _is_likely_self_reference(target: str, candidate: str) -> bool:
     """True if ``candidate`` looks like the same file as ``target`` under a
     different historical path (e.g. ``src/click/core.py`` vs ``click/core.py``).
@@ -353,14 +376,20 @@ def detect_coupling(facts: RepoFacts) -> Signal | None:
     ``.whycodeignore``). Pre-rename self-references (the file under its
     historical path, e.g. ``click/core.py`` for current ``src/click/core.py``)
     are dropped so a renamed file doesn't appear as its own loudest coupler.
+    Co-change paths that no longer exist on HEAD are also dropped, so an
+    LLM editor reading the signal doesn't burn turns trying to open paths
+    that disappeared in a long-ago ``src/`` move (``flask/helpers.py`` for
+    a project whose source now lives at ``src/flask/helpers.py``).
     """
     patterns = ign.effective_patterns(facts.repo_root)
+    tracked = _tracked_paths_at_head(facts.repo_root)
     paired = [
         (p, n)
         for p, n in facts.co_changed_files.items()
         if n >= COUPLING_MIN_COCHANGES
         and not ign.is_ignored(p, patterns)
         and not _is_likely_self_reference(facts.path, p)
+        and (not tracked or p in tracked)
     ]
     if not paired:
         return None

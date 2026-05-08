@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import sys
 from collections.abc import Iterator
 from datetime import datetime
@@ -199,12 +200,62 @@ def _parse_fail_on(value: str) -> int:
     return threshold
 
 
+_SECURITY_HINT_RE = re.compile(r"\b(?:CVE-\d{4}-\d+|GHSA-[a-z0-9-]+)\b", re.IGNORECASE)
+
+
+def _security_touched(card: rc.RiskCard) -> bool:
+    """True if any signal references a CVE or GHSA advisory token.
+
+    The 3am SRE persona feedback called for an unmistakable label on files
+    whose history mentions a security advisory; the score alone hides it.
+    """
+    for s in card.signals:
+        haystack = " ".join((s.headline, s.detail, *s.evidence))
+        if _SECURITY_HINT_RE.search(haystack):
+            return True
+    return False
+
+
+def _brief_verdict(card: rc.RiskCard, security: bool) -> str:
+    """Map score band + security flag to a single action verb.
+
+    Three personas read ``--brief`` looking for an action ("edit / escalate /
+    page owner") rather than a number. The verdict ladder turns the band into
+    that verb so a tired reader at 3am gets a directive, not arithmetic.
+    """
+    if security:
+        return "ESCALATE"
+    band = card.score.band.value
+    if band == "HANDLE WITH CARE":
+        return "ESCALATE"
+    if band == "READ HISTORY FIRST":
+        return "CHECK"
+    if band == "WORTH A LOOK":
+        return "SCAN"
+    return "OK"
+
+
 def _print_brief(card: rc.RiskCard) -> None:
-    """Print a one-line summary suitable for grep/awk and 3am triage."""
+    """Print a one-line summary suitable for grep/awk and 3am triage.
+
+    Format: ``<path>: <VERDICT> [SECURITY-TOUCHED] (<band>, <score>) — <top>``.
+    The verdict (ESCALATE / CHECK / SCAN / OK) is the action verb the reader
+    can act on without interpreting the score; the band + score follow as
+    supporting evidence; the top headline names the most pressing concern.
+    """
     top = card.signals[0].headline if card.signals else "no flags"
+    security = _security_touched(card)
+    verdict = _brief_verdict(card, security)
+    verdict_style = {
+        "ESCALATE": "bold red",
+        "CHECK": "bold yellow",
+        "SCAN": "bold cyan",
+        "OK": "bold green",
+    }[verdict]
+    sec_tag = " [bold red]SECURITY-TOUCHED[/bold red]" if security else ""
     console.print(
-        f"{card.path}: [bold]{card.score.band.value}[/bold] "
-        f"({card.score.value}) — {top}"
+        f"{card.path}: [{verdict_style}]{verdict}[/{verdict_style}]{sec_tag} "
+        f"([bold]{card.score.band.value}[/bold], {card.score.value}) — {top}"
     )
 
 
@@ -1121,6 +1172,16 @@ def show(
     sha: str = typer.Argument(..., help="Commit SHA (full or short) to inspect."),
     repo: Path = typer.Option(Path("."), "--repo", help="Path inside the repo."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of a card."),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help="Show the entire commit body and the full diff instead of truncating.",
+    ),
+    show_diff: bool = typer.Option(
+        False,
+        "--diff",
+        help="Include the unified diff (truncated unless --full is also set).",
+    ),
 ) -> None:
     """Risk-flavored summary for a single commit: classification + per-file risk."""
     try:
@@ -1236,17 +1297,67 @@ def show(
         console.print("  " + "   ".join(badges))
     console.print(f"  [dim]{len(file_changes)} files changed[/dim]")
 
-    if not cards:
-        return
-    table = Table(title="Files in this commit, by current risk")
-    table.add_column("score", justify="right", style="bold")
-    table.add_column("band")
-    table.add_column("path")
-    table.add_column("top signal")
-    for c in cards[:20]:
-        top = c.signals[0].headline if c.signals else "—"
-        table.add_row(str(c.score.value), c.score.band.value, c.path, top)
-    console.print(table)
+    body = (commit.body or "").strip("\n")
+    if body:
+        console.print()
+        body_lines = body.splitlines()
+        if not full and (len(body_lines) > 12 or len(body) > 600):
+            visible = body_lines[:12]
+            shown = "\n".join(visible)
+            if len(shown) > 600:
+                shown = shown[:600].rstrip() + "…"
+            console.print("  [bold]Body:[/bold]")
+            for line in shown.splitlines():
+                console.print(f"    {line}")
+            remaining_lines = len(body_lines) - len(visible)
+            if remaining_lines > 0:
+                console.print(
+                    f"    [dim]…{remaining_lines} more line(s) — pass --full to see them.[/dim]"
+                )
+        else:
+            console.print("  [bold]Body:[/bold]")
+            for line in body.splitlines():
+                console.print(f"    {line}")
+
+    if cards:
+        console.print()
+        table = Table(title="Files in this commit, by current risk")
+        table.add_column("score", justify="right", style="bold")
+        table.add_column("band")
+        table.add_column("path")
+        table.add_column("+/-", justify="right")
+        table.add_column("top signal")
+        change_by_path = {fc.path: fc for fc in file_changes}
+        for c in cards[:20]:
+            top = c.signals[0].headline if c.signals else "—"
+            ch = change_by_path.get(c.path)
+            churn = (
+                f"[green]+{ch.insertions}[/green]/[red]-{ch.deletions}[/red]"
+                if ch is not None
+                else "—"
+            )
+            table.add_row(str(c.score.value), c.score.band.value, c.path, churn, top)
+        console.print(table)
+
+    if show_diff:
+        console.print()
+        try:
+            diff_text = gf.run_git(repo_root, "show", "--no-color", "--format=", full_sha)
+        except gf.GitError as exc:
+            err.print(f"[dim]could not read diff: {exc}[/dim]")
+        else:
+            diff_lines = diff_text.splitlines()
+            if not full and len(diff_lines) > 60:
+                console.print("[bold]Diff (first 60 lines):[/bold]")
+                for line in diff_lines[:60]:
+                    console.print(f"  {line}")
+                console.print(
+                    f"  [dim]…{len(diff_lines) - 60} more line(s) — pass --full to see them.[/dim]"
+                )
+            else:
+                console.print("[bold]Diff:[/bold]")
+                for line in diff_lines:
+                    console.print(f"  {line}")
 
 
 def _install_template(

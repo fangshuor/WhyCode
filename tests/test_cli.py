@@ -352,7 +352,78 @@ def test_why_brief_one_line_format(repo, days_ago) -> None:  # type: ignore[no-u
     out = result.output.strip()
     assert "\n" not in out  # one line, no rich panels
     assert "a.py" in out
-    assert any(band in out for band in ("HANDLE", "READ", "WORTH", "NO FLAGS"))
+
+
+def test_why_brief_emits_action_verdict(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """Persona feedback (Mei + Alex): score alone is unanchored at 3am.
+    `--brief` must lead with an ESCALATE / CHECK / SCAN / OK action verb so
+    a tired reader can act without interpreting the number."""
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="See #INC-1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "why", "refund.py", "--brief")
+    assert result.exit_code == 0
+    out = result.output
+    assert any(verdict in out for verdict in ("ESCALATE", "CHECK", "SCAN", "OK"))
+
+
+def test_why_brief_flags_security_touched_when_history_cites_advisory(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """A file whose history mentions a CVE/GHSA token gets a SECURITY-TOUCHED
+    label so a 3am SRE doesn't bypass a security control without seeing it."""
+    repo.commit("init", {"sess.py": "1"}, when=days_ago(120))
+    repo.commit(
+        "fix: GHSA-j8r2-6x86-q33q address advisory",
+        {"sess.py": "2"},
+        body="incident #SEC-1",
+        when=days_ago(30),
+    )
+    result = _invoke(repo.root, "why", "sess.py", "--brief")
+    assert result.exit_code == 0
+    assert "SECURITY-TOUCHED" in result.output
+    assert "ESCALATE" in result.output
+
+
+def test_show_renders_commit_body(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """Persona feedback (Mei, David, Alex): `whycode show` opening with risk
+    cards but hiding the commit body is a worse `git show`. The body must
+    appear so the reader can read the actual reasoning without falling back
+    to git."""
+    sha = repo.commit(
+        "fix: subtle bug",
+        {"x.py": "1"},
+        body=(
+            "We tried option A but it broke v1 clients. After conversations "
+            "in #INC-42, we decided to keep the existing behaviour because "
+            "the alternative would require a breaking schema migration."
+        ),
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "show", sha)
+    assert result.exit_code == 0
+    out = result.output
+    assert "Body:" in out
+    assert "v1 clients" in out
+    assert "schema migration" in out
+
+
+def test_show_renders_per_file_diffstat(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The per-file table includes a +/- column so a reviewer can tell a
+    3-line tweak from a rewrite without leaving WhyCode for git."""
+    sha = repo.commit(
+        "feat: tweak",
+        {"a.py": "v2 with one new line\n", "b.py": "two\nlines\n"},
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "show", sha)
+    assert result.exit_code == 0
+    assert "+/-" in result.output
 
 
 def test_why_explain_text_includes_rule_line(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
