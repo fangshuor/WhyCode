@@ -70,6 +70,7 @@ whycode diff                        # rank everything you changed vs origin/main
 whycode diff --staged               # ditto, for files staged for commit
 whycode diff --fail-on history      # CI gate: exit 1 if any file is ≥ READ HISTORY FIRST
 whycode show <sha>                  # classification + per-file risk for one commit
+whycode story src/some/file.py      # the file's mindflow: chapters by chapter_role
 whycode timeline src/some/file.py   # risk score evolution across the file's history
 whycode honest src/some/file.py     # every invariant line, verbatim, untruncated
 whycode scan --top 10               # the riskiest files in the whole repo

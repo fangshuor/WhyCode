@@ -5,6 +5,98 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.7.0] — 2026-05-08
+
+### Added — `whycode story <path>` and the mindflow surface
+
+The terminal goal of the iteration since 0.5.x: read a file's history as a
+narrative rather than as a list of fired signals. Built entirely on the
+chapter-role classifier shipped in 0.6.4 → 0.6.6 — no new detector work.
+
+#### CLI: `whycode story <path>`
+
+Renders the file's history as chronological chapters. Each chapter is one
+commit (or a folded "N routine edits" run) tagged with a chapter role:
+
+```
+story · src/click/core.py
+406 commits · 12 chapters · primary: Armin Ronacher
+
+  …3 edit commits by Kevin Deldycke (folded)
+
+[RECONCILIATION]  c653ec8  ·  2026-04-09  ·  Kevin Deldycke
+"Reconcile default value passing and default activation"
+  Fix pallets#3111
+  Reintroduce a commit pushed by mistake in 6c4a77b… and reverted in
+  bb7be1f…
+  → cites chapter 4
+
+[REVERT]  bb7be1f  ·  2026-03-02  ·  Kevin Deldycke
+"Revert \"Use `default=True` as a sentinel for non-boolean flags\""
+  → cites sha 6c4a77b
+```
+
+Default behaviour drops ``edit``-role chapters, collapses runs of ≥3
+same-role same-author dropped edits into one marker, and truncates to
+``--top 12``. Reconciliation chapters resolve their cited prior SHAs
+to chapter indices when those chapters survived truncation
+(``→ cites chapter 4``); fall back to the literal SHA otherwise.
+
+Flags: ``--json`` / ``--markdown`` / ``--top N`` / ``--all`` /
+``--since <date|ref>`` / ``--roles revert,incident,…`` /
+``--no-collapse`` / ``--body-chars N``.
+
+#### MCP: `get_file_story`
+
+The MCP surface gains ``get_file_story(path, limit, body_max_chars,
+roles)`` returning the same Story payload as JSON. Pairs with the
+existing ``get_risk_profile`` and ``get_file_decisions``. Per-chapter
+shape includes ``cited_prior_indices`` so an editor LLM can refer to
+"chapter 3" instead of re-emitting SHAs.
+
+#### MCP: `audit_signal(path, kind)` + `get_risk_profile` simplification
+
+Split the rule-trace surface out of ``get_risk_profile`` into a
+dedicated ``audit_signal(path, kind)`` tool. ``get_risk_profile``'s
+``explain`` parameter is gone from both the input schema and the
+handler — the default payload no longer carries debug provenance an
+editor LLM doesn't need but DOES pay context budget for. Humans
+auditing a flag call ``audit_signal`` explicitly.
+
+``risk_card.RiskCard.to_dict(explain=…)`` is unchanged so the CLI's
+``whycode why --explain`` keeps working.
+
+#### New module
+
+``src/whycode/story.py`` — ``Chapter`` / ``Story`` dataclasses +
+``build_story``, ``render_text``, ``to_dict``, ``render_markdown``.
+~250 LOC, no new dependency, no outbound network calls.
+
+### Internal
+
+- 16 new tests for the story surface (11 unit + 3 CLI + 2 MCP).
+- 6 new tests for the audit/explain split (4 ``audit_signal`` + 2
+  schema/payload regression).
+- 282 tests passing (was 260 on 0.6.6); ruff + mypy strict clean.
+
+### Why 0.7.0 (minor bump, not patch)
+
+First release that answers a fundamentally new question. The 0.6.x
+line answered "should I be careful here?"; 0.7.0 adds "what was the
+journey that produced this file's current shape?". New public CLI
+command + new MCP tools + a public module is more than a patch.
+
+### Deferred
+
+- ``cited_prior_indices`` only resolves to indices for chapters that
+  survived the ``--top`` truncation; cited SHA is shown for chapters
+  pruned out (the fallback reads cleanly).
+- ``--since <ref>`` resolves via ``git rev-parse`` + ``authored_at``;
+  ISO dates parsed via ``datetime.fromisoformat``. Natural-language
+  ("2 months ago") considered and skipped.
+- Sub-file hotspots stay deferred — per-line plumbing is a 0.8+ effort.
+
+
 ## [0.6.6] — 2026-05-08
 
 ### Added — `pivot` chapter role
