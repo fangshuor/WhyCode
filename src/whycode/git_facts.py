@@ -1067,28 +1067,38 @@ def find_incidents(commits: Sequence[Commit]) -> list[Commit]:
 _SHA_REF_IN_BODY_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.IGNORECASE)
 
 
+_SILENCE_BREAK_DAYS = 180
+
+
 @dataclass(frozen=True)
 class CommitClassification:
     """Light-weight summary of what kind of work a single commit represents.
 
-    ``is_revert`` and ``cites_prior_sha`` are False by default so existing
-    callers that only read ``incident_flavoured`` / ``invariant_count`` keep
-    working unchanged. ``cites_prior_sha`` is only set when ``classify_commit``
-    is called with a ``known_shas`` set — without that cross-reference set,
-    the body could match SHA-shaped tokens (version numbers etc.) that aren't
-    real commit references.
+    ``is_revert``, ``cites_prior_sha`` and ``breaks_silence`` are False by
+    default so existing callers that only read ``incident_flavoured`` /
+    ``invariant_count`` keep working unchanged. ``cites_prior_sha`` is only
+    set when ``classify_commit`` is called with a ``known_shas`` set —
+    without that cross-reference set, the body could match SHA-shaped tokens
+    (version numbers etc.) that aren't real commit references.
+    ``breaks_silence`` is only set when ``classify_commit`` is given a
+    ``prior_commit_at`` to compare against; otherwise the gap is unknown
+    and the field stays False.
     """
 
     incident_flavoured: bool
     invariant_count: int
     is_revert: bool = False
     cites_prior_sha: bool = False
+    breaks_silence: bool = False
 
     @property
     def chapter_role(self) -> str:
         """Single-word narrative-role label used by ``whycode show`` and the
         upcoming ``whycode story``. Priority ladder (first match wins):
-        ``revert`` > ``incident`` > ``reconciliation`` > ``invariant`` > ``edit``.
+        ``revert`` > ``incident`` > ``reconciliation`` > ``invariant`` >
+        ``silence_break`` > ``edit``. ``silence_break`` is the "the file
+        slept for half a year, then someone re-touched it" chapter — a
+        narratively distinct beat the other roles do not capture.
         Reconciliation requires a body cross-reference to a prior known SHA.
         """
         if self.is_revert:
@@ -1099,11 +1109,16 @@ class CommitClassification:
             return "reconciliation"
         if self.invariant_count > 0:
             return "invariant"
+        if self.breaks_silence:
+            return "silence_break"
         return "edit"
 
 
 def classify_commit(
-    commit: Commit, *, known_shas: Iterable[str] | None = None
+    commit: Commit,
+    *,
+    known_shas: Iterable[str] | None = None,
+    prior_commit_at: datetime | None = None,
 ) -> CommitClassification:
     """Classify a single commit by reusing the same rules ``find_incidents`` and
     ``extract_invariant_quotes`` apply to a list.
@@ -1112,6 +1127,13 @@ def classify_commit(
     pass the repo's commit-SHA set and the body is scanned for short SHA
     tokens (7-40 hex chars) that match a real commit. Merge commits are
     never flagged (their SHA mentions are routine, not narrative).
+
+    ``prior_commit_at`` enables the ``breaks_silence`` chapter check —
+    pass the authored timestamp of the file's previous commit (the one
+    immediately before this SHA in the file's history). If the gap to
+    ``commit.authored_at`` is at least ``_SILENCE_BREAK_DAYS`` (180), the
+    classification carries ``breaks_silence=True``. Without a
+    ``prior_commit_at`` the gap is unknown and the field stays False.
     """
     body = commit.body or ""
     is_revert = (
@@ -1126,11 +1148,23 @@ def classify_commit(
             if any(k != commit.sha and k.lower().startswith(short) for k in known):
                 cites_prior = True
                 break
+    breaks_silence = False
+    if prior_commit_at is not None:
+        prior = prior_commit_at
+        if prior.tzinfo is None:
+            prior = prior.replace(tzinfo=UTC)
+        current = commit.authored_at
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        gap_days = (current - prior).days
+        if gap_days >= _SILENCE_BREAK_DAYS:
+            breaks_silence = True
     return CommitClassification(
         incident_flavoured=bool(find_incidents([commit])),
         invariant_count=len(extract_invariant_quotes([commit])),
         is_revert=is_revert,
         cites_prior_sha=cites_prior,
+        breaks_silence=breaks_silence,
     )
 
 

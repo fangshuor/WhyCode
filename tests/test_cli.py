@@ -612,6 +612,29 @@ def test_show_chapter_role_edit_for_routine_commit(repo, days_ago) -> None:  # t
     assert data["chapter_role"] == "edit"
 
 
+def test_show_chapter_role_silence_break(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A commit that follows a long quiet period in the file's history is a
+    distinct narrative beat — "the file slept for over a year, then someone
+    re-touched it" — and gets the `silence_break` chapter role."""
+    repo.commit(
+        "init: long ago",
+        {"sleeper.py": "1"},
+        body="No constraint stated; first commit.",
+        when=days_ago(400),
+    )
+    sha_recent = repo.commit(
+        "tweak: re-touch after a long quiet",
+        {"sleeper.py": "2"},
+        body="No constraint stated; routine follow-up after silence.",
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "show", sha_recent, "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["chapter_role"] == "silence_break"
+    assert data["breaks_silence"] is True
+
+
 def test_init_writes_workflow_and_hook(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.py": "1"})
     result = _invoke(repo.root, "init")

@@ -24,6 +24,7 @@ import contextlib
 import json
 import sys
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -1139,10 +1140,39 @@ def show(
     # walks them all in milliseconds.
     known_repo_commits = gf.all_commits(repo_root, max_count=5000)
     known_shas = {c.sha for c in known_repo_commits}
-    classification = gf.classify_commit(commit, known_shas=known_shas)
+    file_changes = gf.files_changed_in(repo_root, full_sha)
+    # Look up the file's previous commit so the silence_break chapter check
+    # can compute the gap. We reuse the first changed (tracked) file as the
+    # representative — for the bulk of "single-file commit" cases that's
+    # exact; for multi-file pivots it's an approximation that still answers
+    # the question "did this file's history just wake up after a long
+    # quiet?". A commit that touches no file at all (rare; pure --allow-empty)
+    # leaves ``prior_commit_at`` as None.
+    prior_commit_at: datetime | None = None
+    for change in file_changes:
+        try:
+            history = gf.commits_for_path(repo_root, change.path)
+        except gf.GitError:
+            continue
+        prior: gf.Commit | None = None
+        seen_target = False
+        for past in history:
+            if past.sha == full_sha:
+                seen_target = True
+                continue
+            if seen_target:
+                prior = past
+                break
+        if prior is not None:
+            prior_commit_at = prior.authored_at
+            break
+    classification = gf.classify_commit(
+        commit,
+        known_shas=known_shas,
+        prior_commit_at=prior_commit_at,
+    )
     is_incident = classification.incident_flavoured
     invariants = gf.extract_invariant_quotes([commit])
-    file_changes = gf.files_changed_in(repo_root, full_sha)
 
     show_patterns = ign.effective_patterns(repo_root)
     cards: list[rc.RiskCard] = []
@@ -1167,6 +1197,7 @@ def show(
                     "invariants_stated": len(invariants),
                     "is_revert": classification.is_revert,
                     "cites_prior_sha": classification.cites_prior_sha,
+                    "breaks_silence": classification.breaks_silence,
                     "chapter_role": classification.chapter_role,
                     "files_changed": len(file_changes),
                     "files": [c.to_dict() for c in cards],
@@ -1187,6 +1218,7 @@ def show(
         "incident": "bold red",
         "reconciliation": "bold magenta",
         "invariant": "bold yellow",
+        "silence_break": "bold cyan",
         "edit": "dim",
     }.get(role, "dim")
     console.print(f"  [bold]Role:[/bold] [{role_style}]{role.upper()}[/{role_style}]")
