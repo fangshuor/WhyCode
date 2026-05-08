@@ -29,6 +29,7 @@ class SignalKind(StrEnum):
     GHOST_KEEPER = "ghost_keeper"
     INVARIANT_QUOTE = "invariant_quote"
     BODY_REFERENCE = "body_reference"
+    SUBJECT_BLIND_PIVOT = "subject_blind_pivot"
     NEWBORN = "newborn"
 
 
@@ -748,6 +749,98 @@ def detect_body_references(facts: RepoFacts) -> Signal | None:
     )
 
 
+_PIVOT_BODY_MIN_CHARS = 200
+
+
+def detect_subject_blind_pivot(facts: RepoFacts) -> Signal | None:
+    """Long-body commits whose subjects look generic — the architectural pivots
+    other detectors miss.
+
+    A commit can be the most consequential decision in a file's history yet
+    fly under every other rule: a subject like ``"Merge contexts"`` or
+    ``"Reorganize internal layout"`` carries no incident keyword, no revert
+    marker, no Conventional Commits breaking flag — and the body explaining
+    *why* the pivot happened is exactly what a careful reader needs.
+
+    Acceptance:
+      - body length >= ``_PIVOT_BODY_MIN_CHARS`` (200 chars). A pivot worth
+        flagging carries enough prose to justify the design move.
+      - subject does NOT match the incident-keyword ladder in
+        :func:`whycode.git_facts._is_subject_incident` — those commits are
+        already surfaced by the incident detector.
+      - subject does NOT start with ``"Revert "`` and is not a default revert
+        body marker (``Reverted "..."`` / ``Reverts <sha>``) — the revert
+        detector handles those.
+      - subject does NOT start with ``"Merge "`` — merge commits routinely
+        carry long bodies (PR descriptions, conflict notes) that aren't
+        narratively load-bearing on their own.
+
+    The file-count gate the brief describes was deliberately skipped: the
+    standard ``commits_for_path`` walk does not populate ``Commit.files`` and
+    splicing ``--name-only`` into the existing record-separated parser would
+    risk silently breaking the cache + diff paths. The body-length floor is
+    weaker but still catches the patterns the spec called out.
+    """
+    candidates: list[Commit] = []
+    for commit in facts.commits:
+        if len(commit.body) < _PIVOT_BODY_MIN_CHARS:
+            continue
+        subject = commit.subject
+        if subject.startswith("Revert "):
+            continue
+        if subject.startswith("Merge "):
+            continue
+        if gf._REVERTED_SUBJECT_RE.search(subject):
+            continue
+        if gf._REVERTS_SUBJECT_RE.search(subject):
+            continue
+        if gf._is_subject_incident(subject, commit.body):
+            continue
+        candidates.append(commit)
+    if not candidates:
+        return None
+    n = len(candidates)
+    severity = 4 if n >= 3 else 3
+    headline = (
+        f"{n} architectural pivot{'s' if n != 1 else ''} "
+        "(long-body, non-incident, non-revert)"
+    )
+    most_recent = max(candidates, key=lambda c: c.authored_at)
+    bullets = [
+        f"  > {_short(c.sha)} {c.subject[:60].rstrip()}"
+        for c in candidates[:3]
+    ]
+    detail = (
+        "Generic-looking subjects can hide the load-bearing decisions "
+        "other detectors skip:\n" + "\n".join(bullets)
+    )
+    explanation = Explanation(
+        rule="subject_blind_pivot_long_body",
+        why_it_fired=(
+            f"{n} commit{'s' if n != 1 else ''} carried a body of "
+            f">= {_PIVOT_BODY_MIN_CHARS} characters with a subject that did "
+            "not match incident, revert, or merge rules"
+        ),
+        evidence=tuple(
+            f"{_short(c.sha)} body_len={len(c.body)}" for c in candidates[:5]
+        ),
+        source_ref="src/whycode/signals.py:detect_subject_blind_pivot",
+    )
+    next_step = (
+        f"Read git show {_short(most_recent.sha)} — these are the "
+        "load-bearing decisions other detectors miss."
+    )
+    return Signal(
+        kind=SignalKind.SUBJECT_BLIND_PIVOT,
+        severity=severity,
+        headline=headline,
+        detail=detail,
+        evidence=tuple(_short(c.sha) for c in candidates[:5]),
+        explanation=explanation,
+        next_step=next_step,
+    )
+
+
 _DETECTORS = (
     detect_revert_chain,
     detect_incident_history,
@@ -755,8 +848,9 @@ _DETECTORS = (
     detect_ghost_keeper,
     detect_coupling,
     detect_high_churn,
-    detect_silence,
     detect_body_references,
+    detect_subject_blind_pivot,
+    detect_silence,
     detect_newborn,
 )
 
@@ -799,6 +893,7 @@ __all__ = [
     "detect_newborn",
     "detect_revert_chain",
     "detect_silence",
+    "detect_subject_blind_pivot",
 ]
 
 

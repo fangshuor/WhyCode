@@ -223,6 +223,117 @@ def test_body_references_skips_merge_commits(repo, days_ago) -> None:  # type: i
     assert signal is None
 
 
+def test_subject_blind_pivot_fires_on_long_body_non_incident_commit(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    """An architectural pivot — generic subject, long explanatory body — is
+    invisible to the incident / revert / merge ladders but is exactly the
+    load-bearing decision a careful reader needs to find."""
+    long_body = (
+        "This change reorganises the internal layout to separate the public "
+        "façade from the private dispatch helpers. The motivation is to make "
+        "the contract explicit: callers should not depend on the private "
+        "module path, and tests should pin the public surface only. We keep "
+        "backwards compat by re-exporting the old names with a __getattr__ "
+        "shim until the next major release."
+    )
+    assert len(long_body) >= 200
+    repo.commit(
+        "Reorganize internal layout",
+        {"core.py": "1"},
+        body=long_body,
+        when=days_ago(20),
+    )
+    facts = _facts_for(repo, "core.py")
+    signal = sig.detect_subject_blind_pivot(facts)
+    assert signal is not None
+    assert signal.kind is sig.SignalKind.SUBJECT_BLIND_PIVOT
+    assert "pivot" in signal.headline.lower()
+
+
+def test_subject_blind_pivot_silent_on_short_body(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    """A short-body commit doesn't pass the floor — could be just a tweak."""
+    repo.commit(
+        "Reorganize internal layout",
+        {"core.py": "1"},
+        body="small refactor; see notes.",  # ~26 chars, well below floor
+        when=days_ago(20),
+    )
+    facts = _facts_for(repo, "core.py")
+    signal = sig.detect_subject_blind_pivot(facts)
+    assert signal is None
+
+
+def test_subject_blind_pivot_silent_on_incident_subject(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    """An incident-keyword subject with a long body must NOT fire — the
+    incident detector already surfaces it; firing twice would double-count."""
+    long_body = (
+        "Hotfix details: the regression manifested at 02:00 UTC and was "
+        "rolled back within fifteen minutes after pager went off. Root cause "
+        "is the missing null-check in the decoder path, exposed by the "
+        "upstream client library upgrade in the release tag earlier today."
+    )
+    assert len(long_body) >= 200
+    repo.commit(
+        "hotfix: regression",
+        {"core.py": "1"},
+        body=long_body,
+        when=days_ago(10),
+    )
+    facts = _facts_for(repo, "core.py")
+    signal = sig.detect_subject_blind_pivot(facts)
+    assert signal is None
+
+
+def test_subject_blind_pivot_silent_on_revert(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    """A revert subject with a long body is the revert detector's territory."""
+    long_body = (
+        "Reverting the prior change because the assumption baked into the "
+        "fast path turns out to be wrong on Windows: the path separator "
+        "handling collides with the cache key normalisation we introduced "
+        "two weeks ago, breaking every CI run on the win32 builders today."
+    )
+    assert len(long_body) >= 200
+    repo.commit(
+        "Revert \"feat: speculative cache\"",
+        {"core.py": "1"},
+        body=long_body,
+        when=days_ago(10),
+    )
+    facts = _facts_for(repo, "core.py")
+    signal = sig.detect_subject_blind_pivot(facts)
+    assert signal is None
+
+
+def test_subject_blind_pivot_silent_on_merge(
+    repo, days_ago,
+) -> None:  # type: ignore[no-untyped-def]
+    """Merge commits routinely carry long bodies (PR descriptions, conflict
+    notes); they aren't narratively load-bearing on their own."""
+    long_body = (
+        "Merging the long-running branch back into main. Includes the "
+        "rebased commits from the contributor PR plus two CI fixes the "
+        "reviewer requested in line with the new style guide; conflict "
+        "resolution was straightforward, all tests pass on the local box."
+    )
+    assert len(long_body) >= 200
+    repo.commit(
+        "Merge branch 'feature/restructure'",
+        {"core.py": "1"},
+        body=long_body,
+        when=days_ago(10),
+    )
+    facts = _facts_for(repo, "core.py")
+    signal = sig.detect_subject_blind_pivot(facts)
+    assert signal is None
+
+
 def test_coupling_filters_ignored_paths(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """F10 — co-change candidates that scan would hide must not appear in
     the per-file coupling signal either. ``CHANGELOG.md`` is in the default
