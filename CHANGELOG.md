@@ -5,6 +5,60 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.3] — 2026-05-08
+
+### Added — body-reference detector
+
+A new L2 signal: ``body_reference``. Fires when one commit's body cites
+another SHA from this file's history — the "this fixes the regression
+introduced in abc1234" / "as decided in def5678" / "reconsidered after
+xyz" pattern. These are the **narrative bridges** other detectors miss
+because they don't read commit bodies for cross-references.
+
+The recon pass on click identified a specific load-bearing example: the
+``c653ec8`` commit ("Reconcile default value passing and default
+activation") cites both ``6c4a77b`` and ``bb7be1f`` in its body — closing
+the sentinel-war revert loop. Without this detector that commit was
+invisible; with it, it surfaces as the first narrative chapter of
+``src/click/core.py``.
+
+Implementation:
+- Only references to SHAs **also present in this file's commit history**
+  are counted, so the signal is per-file storytelling rather than
+  repo-wide chatter.
+- Merge commits (``Merge ...``) are skipped — their SHA mentions are
+  routine, not narrative.
+- Severity scales: 1 citing commit → MED (sev 2), 2-3 → MED (sev 3),
+  ≥4 → HIGH (sev 4).
+- Scorer base weight 4 (between coupling and high_churn).
+
+### Fixed — coupling pre-rename self-reference
+
+A genuine recon bug deferred from 0.6.2. On every repo that ever moved
+its source into ``src/`` (click, flask, requests, …), the file appeared
+as its own #1 co-changer because pre-rename and post-rename paths were
+indexed separately in the co-change map. ``src/click/core.py``'s top
+co-changer was ``click/core.py`` (x175); after the fix it's
+``tests/test_options.py`` (x89).
+
+Implementation: a ``_is_likely_self_reference`` helper does
+basename-equality + path-suffix containment with separator alignment. So
+``src/click/core.py`` ↔ ``click/core.py`` is True, but
+``a/b/__init__.py`` ↔ ``c/d/__init__.py`` is False (no false positives
+on shared basename in unrelated trees).
+
+### Why 0.6.3 (not 0.7.0)
+
+Both changes strengthen the detector base that 0.7.0's ``whycode story``
+will consume. Body-reference findings are the highest-information
+chapters in the narrative ladder; coupling without self-noise lets
+"Refactor period" detection key on real co-change clusters. Shipping
+them as a patch lets users on 0.6.x see the upgraded ``why`` output now.
+
+241 tests passing (was 236); ruff + mypy strict clean. No new outbound
+calls, no new dependency.
+
+
 ## [0.6.2] — 2026-05-08
 
 ### Fixed — small-version polish + 0.6.1 follow-ups

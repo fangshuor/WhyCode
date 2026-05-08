@@ -6,6 +6,7 @@ every one carries the SHAs that produced it, so a careful reader can verify.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ class SignalKind(StrEnum):
     SILENCE = "silence"
     GHOST_KEEPER = "ghost_keeper"
     INVARIANT_QUOTE = "invariant_quote"
+    BODY_REFERENCE = "body_reference"
     NEWBORN = "newborn"
 
 
@@ -322,23 +324,42 @@ def detect_high_churn(facts: RepoFacts) -> Signal | None:
     )
 
 
+def _is_likely_self_reference(target: str, candidate: str) -> bool:
+    """True if ``candidate`` looks like the same file as ``target`` under a
+    different historical path (e.g. ``src/click/core.py`` vs ``click/core.py``).
+
+    Path-suffix containment with separator alignment so two different files
+    that share a basename (``a/b/__init__.py`` vs ``c/d/__init__.py``) are
+    NOT conflated. Without this, on every repo that ever moved its source
+    into ``src/``, the file appears to be its own #1 co-changer.
+    """
+    if candidate == target:
+        return True
+    target_basename = target.rsplit("/", 1)[-1]
+    candidate_basename = candidate.rsplit("/", 1)[-1]
+    if target_basename != candidate_basename:
+        return False
+    sep_target = "/" + target
+    sep_candidate = "/" + candidate
+    return sep_target.endswith(sep_candidate) or sep_candidate.endswith(sep_target)
+
+
 def detect_coupling(facts: RepoFacts) -> Signal | None:
     """Files that change together with the target file, ranked by frequency.
 
     Co-change candidates are filtered through the same ignore list that
     powers ``whycode scan`` (built-in defaults plus an optional repo-local
-    ``.whycodeignore``). Without this filter, a per-file coupling signal
-    would surface ``CHANGELOG``, ``.github/workflows/*.yml``, ``AUTHORS``
-    and similar high-touch metadata as the file's "tight coupling" — the
-    field-test report flagged ``flask/app.py``'s top co-changers as 60%
-    metadata, leaving only two genuinely informative entries. Applying
-    the same filter here keeps the most-shown signal honest.
+    ``.whycodeignore``). Pre-rename self-references (the file under its
+    historical path, e.g. ``click/core.py`` for current ``src/click/core.py``)
+    are dropped so a renamed file doesn't appear as its own loudest coupler.
     """
     patterns = ign.effective_patterns(facts.repo_root)
     paired = [
         (p, n)
         for p, n in facts.co_changed_files.items()
-        if n >= COUPLING_MIN_COCHANGES and not ign.is_ignored(p, patterns)
+        if n >= COUPLING_MIN_COCHANGES
+        and not ign.is_ignored(p, patterns)
+        and not _is_likely_self_reference(facts.path, p)
     ]
     if not paired:
         return None
@@ -640,6 +661,93 @@ def detect_invariant_quotes(facts: RepoFacts) -> Signal | None:
     )
 
 
+_SHA_REF_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.IGNORECASE)
+
+
+def detect_body_references(facts: RepoFacts) -> Signal | None:
+    """Commits whose body cites another SHA from this file's history.
+
+    These are narrative bridges — the "this fixes the regression introduced
+    in abc1234" / "as decided in def5678" / "reconsidered after xyz" commits
+    that explicitly link a decision to a past one. They're the load-bearing
+    "we tried X, broke Y, so we chose Z" moments other detectors miss.
+
+    Only references to SHAs also present in this file's commit history are
+    counted, so the signal is per-file storytelling rather than repo-wide
+    chatter. Merge commits ("Merge ...") are excluded — their SHA mentions
+    are routine, not narrative.
+    """
+    if len(facts.commits) < 2:
+        return None
+    own_shas = {c.sha for c in facts.commits}
+    short_to_full: dict[str, str] = {}
+    for own_sha in own_shas:
+        for n in range(7, len(own_sha) + 1):
+            short_to_full.setdefault(own_sha[:n].lower(), own_sha)
+
+    references: list[tuple[Commit, list[str]]] = []
+    for c in facts.commits:
+        if c.subject.startswith("Merge "):
+            continue
+        if not c.body:
+            continue
+        cited_seen: set[str] = set()
+        cited: list[str] = []
+        for match in _SHA_REF_RE.finditer(c.body):
+            cited_full = short_to_full.get(match.group(1).lower())
+            if cited_full is not None and cited_full != c.sha and cited_full not in cited_seen:
+                cited_seen.add(cited_full)
+                cited.append(cited_full)
+        if cited:
+            references.append((c, cited))
+
+    if not references:
+        return None
+
+    n_citing = len(references)
+    if n_citing >= 4:
+        severity = 4
+    elif n_citing >= 2:
+        severity = 3
+    else:
+        severity = 2
+
+    bullets: list[str] = []
+    for citing, cited in references[:3]:
+        cited_short = ", ".join(_short(s) for s in cited[:2])
+        subject_clip = citing.subject[:60].rstrip()
+        bullets.append(f"  > {_short(citing.sha)} {subject_clip} → cites {cited_short}")
+
+    explanation = Explanation(
+        rule="body_reference_to_prior_sha",
+        why_it_fired=(
+            f"{n_citing} commit body{'ies' if n_citing != 1 else 'y'} cite earlier "
+            f"SHAs from this file's history (likely narrative bridges)"
+        ),
+        evidence=(f"references_count={n_citing}",),
+        source_ref="src/whycode/signals.py:detect_body_references",
+    )
+    most_recent = references[0][0]
+    return Signal(
+        kind=SignalKind.BODY_REFERENCE,
+        severity=severity,
+        headline=(
+            f"{n_citing} commit{'s' if n_citing != 1 else ''} explicitly reference "
+            f"earlier history"
+        ),
+        detail=(
+            "These commits cite past SHAs in their bodies — read them to follow "
+            "the chain of intent:\n" + "\n".join(bullets)
+        ),
+        evidence=tuple(_short(c.sha) for c, _ in references[:5]),
+        explanation=explanation,
+        next_step=(
+            f"Read git show {_short(most_recent.sha)} to see how the past decision "
+            "was reconsidered."
+        ),
+    )
+
+
 _DETECTORS = (
     detect_revert_chain,
     detect_incident_history,
@@ -648,6 +756,7 @@ _DETECTORS = (
     detect_coupling,
     detect_high_churn,
     detect_silence,
+    detect_body_references,
     detect_newborn,
 )
 
@@ -681,6 +790,7 @@ __all__ = [
     "Signal",
     "SignalKind",
     "all_signals",
+    "detect_body_references",
     "detect_coupling",
     "detect_ghost_keeper",
     "detect_high_churn",
