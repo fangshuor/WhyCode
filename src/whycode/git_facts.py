@@ -1064,6 +1064,39 @@ def find_incidents(commits: Sequence[Commit]) -> list[Commit]:
     return out
 
 
+# Body-length floor below which a commit is too terse to be a pivot. A real
+# pivot worth flagging carries enough prose to justify the design move; the
+# 200-char floor is shared with the L2 ``subject_blind_pivot`` detector so
+# the signal and the chapter ladder agree on what counts.
+_PIVOT_BODY_MIN_CHARS = 200
+
+
+def is_subject_blind_pivot_commit(commit: Commit) -> bool:
+    """True if a commit body explains a structural change the subject does not.
+
+    Long body + generic-looking subject + neither incident keyword nor revert
+    marker. Used by the L2 signal detector AND ``classify_commit``'s chapter
+    role so the signal and the chapter agree on what counts as a pivot.
+    """
+    body = commit.body or ""
+    if len(body) < _PIVOT_BODY_MIN_CHARS:
+        return False
+    subject = commit.subject
+    if subject.startswith("Revert "):
+        return False
+    if subject.startswith("Merge "):
+        return False
+    if _REVERTED_SUBJECT_RE.search(subject):
+        return False
+    if _REVERTS_SUBJECT_RE.search(subject):
+        return False
+    if _BREAKING_CC_RE.search(subject):
+        return False
+    if _BREAKING_FOOTER_RE.search(body):
+        return False
+    return not _is_subject_incident(subject, body)
+
+
 _SHA_REF_IN_BODY_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.IGNORECASE)
 
 
@@ -1074,15 +1107,15 @@ _SILENCE_BREAK_DAYS = 180
 class CommitClassification:
     """Light-weight summary of what kind of work a single commit represents.
 
-    ``is_revert``, ``cites_prior_sha`` and ``breaks_silence`` are False by
-    default so existing callers that only read ``incident_flavoured`` /
-    ``invariant_count`` keep working unchanged. ``cites_prior_sha`` is only
-    set when ``classify_commit`` is called with a ``known_shas`` set —
-    without that cross-reference set, the body could match SHA-shaped tokens
-    (version numbers etc.) that aren't real commit references.
-    ``breaks_silence`` is only set when ``classify_commit`` is given a
-    ``prior_commit_at`` to compare against; otherwise the gap is unknown
-    and the field stays False.
+    ``is_revert``, ``cites_prior_sha``, ``breaks_silence`` and ``is_pivot``
+    are False by default so existing callers that only read
+    ``incident_flavoured`` / ``invariant_count`` keep working unchanged.
+    ``cites_prior_sha`` is only set when ``classify_commit`` is called with
+    a ``known_shas`` set — without that cross-reference set, the body could
+    match SHA-shaped tokens (version numbers etc.) that aren't real commit
+    references. ``breaks_silence`` is only set when ``classify_commit`` is
+    given a ``prior_commit_at`` to compare against; otherwise the gap is
+    unknown and the field stays False.
     """
 
     incident_flavoured: bool
@@ -1090,13 +1123,17 @@ class CommitClassification:
     is_revert: bool = False
     cites_prior_sha: bool = False
     breaks_silence: bool = False
+    is_pivot: bool = False
 
     @property
     def chapter_role(self) -> str:
         """Single-word narrative-role label used by ``whycode show`` and the
         upcoming ``whycode story``. Priority ladder (first match wins):
-        ``revert`` > ``incident`` > ``reconciliation`` > ``invariant`` >
-        ``silence_break`` > ``edit``. ``silence_break`` is the "the file
+        ``revert`` > ``incident`` > ``reconciliation`` > ``pivot`` >
+        ``invariant`` > ``silence_break`` > ``edit``. ``pivot`` is the
+        "long body explains a structural change the subject does not"
+        chapter — the architectural decisions other detectors miss because
+        the subject reads generic. ``silence_break`` is the "the file
         slept for half a year, then someone re-touched it" chapter — a
         narratively distinct beat the other roles do not capture.
         Reconciliation requires a body cross-reference to a prior known SHA.
@@ -1107,6 +1144,8 @@ class CommitClassification:
             return "incident"
         if self.cites_prior_sha:
             return "reconciliation"
+        if self.is_pivot:
+            return "pivot"
         if self.invariant_count > 0:
             return "invariant"
         if self.breaks_silence:
@@ -1165,6 +1204,7 @@ def classify_commit(
         is_revert=is_revert,
         cites_prior_sha=cites_prior,
         breaks_silence=breaks_silence,
+        is_pivot=is_subject_blind_pivot_commit(commit),
     )
 
 
