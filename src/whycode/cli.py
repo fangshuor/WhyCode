@@ -1094,6 +1094,7 @@ def story(
         since=since_dt,
         no_collapse=no_collapse,
         body_max_chars=body_max_chars,
+        all_chapters=all_chapters,
     )
 
     if json_out:

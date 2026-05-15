@@ -167,3 +167,23 @@ def test_list_tools_includes_audit_signal() -> None:
     schema = tools["audit_signal"].inputSchema
     assert set(schema["required"]) == {"path", "kind"}
     assert set(schema["properties"]) == {"path", "kind"}
+
+
+def test_audit_signal_tool_description_warns_against_speculative_use() -> None:
+    """The MCP description for ``audit_signal`` must gate against speculative
+    calls. An over-eager editor LLM that calls it on every signal "to be
+    thorough" turns it into context-budget noise — the default risk profile
+    already names the rule kind. The tool description is the only place a
+    host sees the contract before it dispatches the call, so the warning
+    has to live there."""
+    tools = {t.name: t for t in _list_tools()}
+    description = tools["audit_signal"].description
+    assert description is not None
+    # The capitalised gate must be present — a soft-cased "only" would slip
+    # past an editor heuristic that scans for emphasis.
+    assert "ONLY" in description
+    # And the explicit do-not-speculate sentence.
+    assert "Do NOT call this speculatively" in description
+    # Input shape stays unchanged so existing callers keep working.
+    schema = tools["audit_signal"].inputSchema
+    assert set(schema["required"]) == {"path", "kind"}
