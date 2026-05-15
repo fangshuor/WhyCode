@@ -668,6 +668,36 @@ def test_show_chapter_role_revert_when_subject_starts_with_revert(
     assert data["is_revert"] is True
 
 
+def test_show_chapter_role_deprecate_emits_pivot_kind_in_json(
+    repo, days_ago
+) -> None:  # type: ignore[no-untyped-def]
+    """A commit whose subject opens with the numpy ``DEP:`` prefix and
+    carries a substantive body classifies as the dedicated ``deprecate``
+    chapter role, and the JSON view exposes the matching ``pivot_kind`` so
+    downstream consumers can discriminate sub-roles without re-parsing the
+    subject."""
+    long_body = (
+        "Deprecate the legacy iterator interface. The public surface has "
+        "been re-exported via the modern entry point for several releases; "
+        "this change schedules removal in the next major. Callers still on "
+        "the old names will start seeing a DeprecationWarning at import "
+        "time, with a pointer to the documented migration path."
+    )
+    assert len(long_body) >= 200
+    sha = repo.commit(
+        "DEP: remove legacy iterator interface",
+        {"legacy.py": "1"},
+        body=long_body,
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "show", sha, "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["chapter_role"] == "deprecate"
+    assert data["pivot_kind"] == "deprecate"
+    assert data["is_pivot"] is True
+
+
 def test_show_chapter_role_edit_for_routine_commit(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """A vanilla commit with no incident keywords / invariant tokens / SHA
     references / revert prefix gets the lowest-priority `edit` role."""

@@ -1370,6 +1370,7 @@ def show(
                     "cites_prior_sha": classification.cites_prior_sha,
                     "breaks_silence": classification.breaks_silence,
                     "is_pivot": classification.is_pivot,
+                    "pivot_kind": classification.pivot_kind,
                     "chapter_role": classification.chapter_role,
                     "files_changed": len(file_changes),
                     "files": [c.to_dict() for c in cards],
@@ -1388,6 +1389,7 @@ def show(
     role_style = {
         "revert": "bold bright_red",
         "incident": "bold red",
+        "deprecate": "bold yellow",
         "reconciliation": "bold magenta",
         "pivot": "bold magenta",
         "invariant": "bold yellow",
