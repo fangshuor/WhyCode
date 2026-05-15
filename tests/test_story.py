@@ -317,6 +317,47 @@ def test_to_dict_emits_documented_top_level_keys(
             assert key in first, f"missing per-chapter key {key!r}"
 
 
+def test_to_dict_chapters_returned_excludes_collapse_markers(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """``chapters_returned`` describes real chapters surfaced to the consumer,
+    not the raw array length. Synthetic collapse markers (folded edit runs)
+    are surfaced separately as ``collapse_markers`` so an allocator gets the
+    right slot count by reading ``chapters_returned`` alone."""
+    repo.commit(
+        "hotfix: prior outage",
+        {"a.py": "0"},
+        body="See #INC-1",
+        when=days_ago(60),
+    )
+    for i, n in enumerate([50, 45, 40, 35]):
+        repo.commit(
+            f"tweak: refactor pass {i}",
+            {"a.py": str(i + 1)},
+            body="No constraint stated.",
+            when=days_ago(n),
+        )
+    repo.commit(
+        "hotfix: newer outage",
+        {"a.py": "5"},
+        body="See #INC-2",
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts)
+    payload = st.to_dict(story)
+    # Guard: this test is only meaningful when a collapse marker actually
+    # appears, so flag a regression in collapse emission rather than letting
+    # the assertion below trivially pass.
+    assert any(c.get("is_collapse") for c in payload["chapters"])
+    real = sum(1 for c in payload["chapters"] if not c.get("is_collapse"))
+    assert payload["chapters_returned"] == real
+    assert payload["chapters_returned"] == payload["chapters_total"]
+    assert payload["collapse_markers"] == sum(
+        1 for c in payload["chapters"] if c.get("is_collapse")
+    )
+
+
 def test_render_markdown_emits_role_headings(
     repo: RepoBuilder, days_ago: Callable[[int], datetime]
 ) -> None:
