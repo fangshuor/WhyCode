@@ -94,7 +94,12 @@ def repo(tmp_path: Path) -> Iterator[RepoBuilder]:
 
 @pytest.fixture()
 def now() -> datetime:
-    return datetime(2026, 5, 1, tzinfo=UTC)
+    # Anchor on the real wall clock so detector logic that calls
+    # ``signals._now()`` — which also uses ``datetime.now(UTC)`` — stays
+    # aligned with fixture commits placed at ``days_ago(N)``. A frozen
+    # anchor (e.g. 2026-05-01) drifts past windowed thresholds
+    # (NEWBORN_DAYS=14 etc.) as real time moves forward.
+    return datetime.now(UTC)
 
 
 @pytest.fixture()

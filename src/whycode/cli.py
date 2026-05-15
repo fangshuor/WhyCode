@@ -26,6 +26,7 @@ import json
 import re
 import sys
 from collections.abc import Iterator
+from dataclasses import replace as dc_replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1066,6 +1067,20 @@ def story(
         "--no-cache",
         help="Bypass the local SQLite cache at .whycode/cache.db.",
     ),
+    oldest_first: bool = typer.Option(
+        False,
+        "--oldest-first",
+        help="Render chapters oldest first (causality reads forward).",
+    ),
+    decisions_only: bool = typer.Option(
+        False,
+        "--decisions",
+        help=(
+            "Show only decision-grade chapters: revert, incident, deprecate, "
+            "reconciliation, pivot, invariant. Equivalent to "
+            "--roles revert,incident,deprecate,reconciliation,pivot,invariant."
+        ),
+    ),
 ) -> None:
     """Render the file's mindflow — chapters in chronological order."""
     repo_root, rel = _require_tracked(path)
@@ -1079,6 +1094,11 @@ def story(
         role_tuple = tuple(r.strip() for r in roles.split(",") if r.strip())
         if not role_tuple:
             role_tuple = None
+    # ``--decisions`` is a shortcut for the canonical decision-grade
+    # allowlist; explicit ``--roles`` always wins so a user can narrow the
+    # set further (e.g. ``--decisions --roles invariant``).
+    if decisions_only and role_tuple is None:
+        role_tuple = ("revert", "incident", "deprecate", "reconciliation", "pivot", "invariant")
 
     cache = _open_cache(repo_root, no_cache)
     try:
@@ -1098,8 +1118,16 @@ def story(
     )
 
     if json_out:
-        console.print_json(json.dumps(st.to_dict(s, body_max_chars=body_max_chars)))
+        payload = st.to_dict(s, body_max_chars=body_max_chars)
+        # ``index`` on each chapter retains its newest-first meaning so
+        # cross-references (``cited_prior_indices`` / ``cited_by_indices``)
+        # still point at the same chapter regardless of array order.
+        if oldest_first:
+            payload["chapters"] = list(reversed(payload["chapters"]))
+        console.print_json(json.dumps(payload))
         return
+    if oldest_first:
+        s = dc_replace(s, chapters=tuple(reversed(s.chapters)))
     if markdown:
         # Use plain ``print`` rather than ``console.print`` so the markdown
         # body is not rich-rewrapped — a pasted PR comment must keep its
