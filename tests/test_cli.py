@@ -1791,3 +1791,39 @@ def test_story_nonexistent_path_exits_2(repo) -> None:  # type: ignore[no-untype
     assert "phantom.py" in result.output
     assert "not tracked" in result.output
     assert "check the path" in result.output
+
+
+def test_story_oldest_first_reverses_chapter_order(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """``--oldest-first`` flips the chapter array so consumers reading the
+    story top-down see causality forward (cause → consequence). The first
+    chapter's ``authored_at`` must be the oldest and the last must be the
+    newest; ``index`` field stays in newest-first space so cross-references
+    keep pointing at the same chapter."""
+    sha_a = repo.commit(
+        "feat: initial dispatch",
+        {"a.py": "1"},
+        body="Initial.",
+        when=days_ago(60),
+    )
+    repo.revert(sha_a, when=days_ago(45))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2"},
+        body="See #INC-1",
+        when=days_ago(20),
+    )
+    repo.commit(
+        "hotfix: another outage",
+        {"a.py": "3"},
+        body=f"See #INC-2\n\nCross-reference: {sha_a[:10]}",
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "story", "a.py", "--oldest-first", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    real = [c for c in data["chapters"] if not c["is_collapse"]]
+    assert len(real) >= 2, "need at least two real chapters to test ordering"
+    timestamps = [c["authored_at"] for c in real if c["authored_at"]]
+    assert timestamps == sorted(timestamps), (
+        "with --oldest-first the chapter array must be sorted ascending by authored_at"
+    )
