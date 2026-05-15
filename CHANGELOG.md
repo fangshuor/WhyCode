@@ -5,6 +5,98 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.7.2] — 2026-05-15
+
+### Changed — Top-N ranking is no longer pure newest-first
+
+0.7.0 stress-tested on a 915-commit numpy file returned twelve 2025-Q4
+DOC/typo chapters at the top — recency alone outranked every pre-2024
+architectural decision. 0.7.2 replaces newest-first slicing with a
+weighted ranking step:
+
+```
+score = role_weight × time_decay × body_boost × files_boost
+```
+
+- `role_weight` favours decision-grade chapters: ``revert`` (100) >
+  ``incident`` (90) > ``deprecate`` (80) > ``reconciliation`` (75) >
+  ``invariant`` (60) > ``pivot`` (50) > ``silence_break`` (40) >
+  ``edit`` (5; surfaces only via pin-by-citation).
+- ``pivot_kind`` (new from Phase 1) modulates pivot base: ``feature``
+  (55) / ``bugfix`` (45) / ``refactor`` (50) / ``perf`` (45) score
+  above ``doc`` (15) / ``style`` (10) / ``test`` (15) / ``chore`` (10).
+  So a 2026 typo (DOC: pivot) no longer outranks a 2019 refactor.
+- ``time_decay`` is exponential with half-life ≈ 3.5 years, floored at
+  0.1. A 5-year-old revert still beats a recent chore.
+- ``body_boost`` (cap +50%) and ``files_boost`` (cap +30%) lift
+  substantive commits without letting either dominate.
+- Pinned-by-citation chapters bypass scoring (CRIT-D from 0.7.1).
+- ``--all`` / ``all_chapters=True`` bypasses scoring entirely; full
+  chronological view is still available.
+
+On numpy ``numpy/lib/_function_base_impl.py`` the default ``--top 12``
+now surfaces 1 DEPRECATE + 2 REVERTs + pre-2024 pinned ancestors that
+were buried on 0.7.0.
+
+### Added — pivot sub-role split + `deprecate` chapter role
+
+The classifier now parses commit-subject prefix tokens into a
+``pivot_kind`` field on ``CommitClassification``. Both Conventional
+Commits (``feat:`` / ``fix:`` / ``refactor:`` / ``perf:`` / ``docs:`` /
+``style:`` / ``test:`` / ``chore:`` / ``build:`` / ``ci:``) and the
+numpy/scipy ALL-CAPS style (``BUG:`` / ``ENH:`` / ``DEP:`` / ``DOC:`` /
+``STY:`` / ``MAINT:`` / ``MNT:`` / ``BLD:`` / ``TST:`` / ``REL:``) are
+mapped to a normalised kind: ``feature`` / ``bugfix`` / ``refactor`` /
+``perf`` / ``doc`` / ``style`` / ``test`` / ``chore`` / ``deprecate``.
+
+A commit with ``pivot_kind == "deprecate"`` is promoted to its own
+``deprecate`` chapter role (between ``incident`` and ``reconciliation``
+in the ladder). David persona had explicitly asked for this — a
+``chardet → charset_normalizer`` style swap is a decision-grade move
+that no longer hides inside the generic ``pivot`` bucket.
+
+The chapter-role ladder is now:
+``revert > incident > deprecate > reconciliation > pivot > invariant >
+silence_break > edit``.
+
+### Added — CLI conveniences
+
+- ``whycode story <path> --oldest-first`` reverses the chapter list so
+  causality reads forward (Mei persona: "newest-first fights the word
+  'story'").
+- ``whycode story <path> --decisions`` is a shortcut for
+  ``--roles revert,incident,deprecate,reconciliation,pivot,invariant``
+  (David persona). Explicit ``--roles`` still wins over the shortcut.
+
+### Changed — JSON / MCP surface polish
+
+- ``story.to_dict()`` drops ``body_full_chars`` per chapter (Sara
+  persona: an LLM consumer would treat the field as an importance
+  proxy and over-index on long bodies). ``body_truncated: bool`` is
+  retained.
+- Each chapter gains a ``cited_by_indices: tuple[int, ...]`` reverse
+  pointer (Sara persona: chapter 4 should know chapter 3 cites it
+  without a forward-scan). Set at the same post-pinning pass that
+  resolves ``cited_prior_indices``.
+- ``--roles`` filter now drops synthetic collapse markers from the
+  output. Refactor-bound LLM consumers no longer pay ~120 tokens for
+  ``is_collapse: true`` entries they cannot act on.
+
+### Fixed — `tests/conftest.py` `now` fixture wall-clock drift
+
+The fixture had ``datetime(2026, 5, 1, tzinfo=UTC)`` hardcoded, but
+``signals._now()`` uses the real wall clock — so the gap drifted with
+time and ``test_newborn_explanation_names_window`` started failing
+when the wall clock advanced past mid-May. Fixture now returns
+``datetime.now(UTC)``; relative ``days_ago(N)`` deltas are preserved.
+
+### Tests
+
+307 tests passing (was 287 on 0.7.1, +13 new across Phase 1 and
+Phase 2 + 1 previously-flaky newborn test stabilised). ruff + mypy
+strict clean.
+
+
 ## [0.7.1] — 2026-05-15
 
 ### Fixed — five bugs surfaced by 0.7.0 capability audits
