@@ -134,6 +134,14 @@ _INVARIANT_RE = re.compile(
     ),
     re.IGNORECASE,
 )
+# A commit body line citing an RFC, PEP, or other standards document is
+# strong evidence of an "honour this spec" constraint — even when no
+# free-form invariant token appears alongside. These cites are the explicit
+# "we follow standard X" decisions whose deviation would be a real bug.
+_STANDARDS_CITE_RE = re.compile(
+    r"\b(?:RFC|PEP|ISO|IEEE|W3C|GHSA|CVE)[\s\-]?\d{2,6}\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -1069,6 +1077,47 @@ def find_incidents(commits: Sequence[Commit]) -> list[Commit]:
 # 200-char floor is shared with the L2 ``subject_blind_pivot`` detector so
 # the signal and the chapter ladder agree on what counts.
 _PIVOT_BODY_MIN_CHARS = 200
+# Lower floor used when the subject already names a security- or auth-class
+# concern. The substance of those commits often lives in the diff (a CVE fix,
+# a cookie-signing tweak, a TLS verify flag toggle) rather than in long prose,
+# so the default 200-char floor silences narratively load-bearing changes.
+_PIVOT_BODY_MIN_CHARS_SECURITY: int = 80
+
+# Subject tokens that signal a security- or auth-relevant change. When any
+# of these appear in a commit subject, the body-length floor for the
+# subject_blind_pivot detector is lowered: the commit deserves a chapter
+# even when the body is terse, because the substance lives in the diff
+# (a CVE fix, a cookie-signing tweak, a TLS verify flag toggle).
+_SECURITY_SUBJECT_TOKENS: tuple[str, ...] = (
+    "security",
+    "auth",
+    "authentic",
+    "crypto",
+    "cookie",
+    "signed",
+    "signing",
+    "password",
+    "secret",
+    "token",
+    "cert",
+    "tls",
+    "ssl",
+    "proxy",
+    "redirect",
+    "header",
+)
+_SECURITY_SUBJECT_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(tok) for tok in _SECURITY_SUBJECT_TOKENS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _subject_has_security_signal(subject: str) -> bool:
+    return (
+        bool(_SECURITY_SUBJECT_RE.search(subject))
+        or bool(_CVE_RE.search(subject))
+        or bool(_GHSA_RE.search(subject))
+    )
 
 
 def is_subject_blind_pivot_commit(commit: Commit) -> bool:
@@ -1077,10 +1126,13 @@ def is_subject_blind_pivot_commit(commit: Commit) -> bool:
     Long body + generic-looking subject + neither incident keyword nor revert
     marker. Used by the L2 signal detector AND ``classify_commit``'s chapter
     role so the signal and the chapter agree on what counts as a pivot.
+
+    Security- and auth-class subjects ("fix cookie signing", "tighten TLS
+    verify") use a lower body-length floor because the substance of those
+    changes lives in the diff rather than in long explanatory prose; the
+    default 200-char floor silences narratively load-bearing security work.
     """
     body = commit.body or ""
-    if len(body) < _PIVOT_BODY_MIN_CHARS:
-        return False
     subject = commit.subject
     if subject.startswith("Revert "):
         return False
@@ -1094,7 +1146,12 @@ def is_subject_blind_pivot_commit(commit: Commit) -> bool:
         return False
     if _BREAKING_FOOTER_RE.search(body):
         return False
-    return not _is_subject_incident(subject, body)
+    if _is_subject_incident(subject, body):
+        return False
+    floor = _PIVOT_BODY_MIN_CHARS
+    if _subject_has_security_signal(subject):
+        floor = _PIVOT_BODY_MIN_CHARS_SECURITY
+    return len(body) >= floor
 
 
 _SHA_REF_IN_BODY_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.IGNORECASE)
@@ -1342,6 +1399,11 @@ def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]
     eliminates the meta-mention failure mode where a commit *about* an
     invariant token (e.g. "fix invariant matcher") would self-flag.
 
+    A line also qualifies when it cites a standards document (RFC, PEP, ISO,
+    IEEE, W3C, GHSA, CVE). These cites are the explicit "we honour spec X"
+    decisions whose deviation would be a real bug; firing on them catches
+    the constraints that the free-form token list misses.
+
     Two filters keep pasted tool output out of the "stated invariants"
     surface:
 
@@ -1371,9 +1433,17 @@ def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]
                 prev_line = raw_line
                 continue
             prev_line = raw_line
-            if not _INVARIANT_RE.search(line):
+            invariant_hit = _INVARIANT_RE.search(line)
+            standards_hit = _STANDARDS_CITE_RE.search(line)
+            if not invariant_hit and not standards_hit:
                 continue
-            if _all_matches_are_quoted(line, _INVARIANT_RE):
+            # If the only signal is a free-form invariant token AND every
+            # such token is wrapped in quotes, treat it as a meta-mention.
+            # A standards cite alone is never a quote-only reference: it
+            # is unambiguous evidence by itself.
+            if invariant_hit and not standards_hit and _all_matches_are_quoted(
+                line, _INVARIANT_RE
+            ):
                 continue
             if per_commit >= _PER_COMMIT_INVARIANT_CAP:
                 continue

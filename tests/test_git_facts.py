@@ -269,6 +269,105 @@ def test_extract_invariant_quotes_caps_at_two_real_invariants(repo) -> None:  # 
     assert "Do not switch to async" in quotes[1][1]
 
 
+def test_extract_invariant_quotes_recognises_rfc_cite_in_body(repo) -> None:  # type: ignore[no-untyped-def]
+    """A body that cites an RFC is an explicit "honour this spec" decision
+    even when no free-form invariant token appears alongside."""
+    body = "Strip Authorization header per RFC 7235 scheme+authority rule."
+    repo.commit("auth: drop header on redirect", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert len(quotes) == 1
+    assert "RFC 7235" in quotes[0][1]
+
+
+def test_extract_invariant_quotes_recognises_pep_and_cve_cites(repo) -> None:  # type: ignore[no-untyped-def]
+    """PEP and CVE cites also fire — both are standards / advisory references
+    that anchor a "we follow this" decision in the body."""
+    repo.commit(
+        "build: respect externally managed env",
+        {"a.py": "1"},
+        body="Follows PEP 668 — pip refuses to install into a system env.",
+    )
+    repo.commit(
+        "auth: patch upstream issue",
+        {"b.py": "1"},
+        body="Per CVE-2024-1234 advisory we now reject zero-length tokens.",
+    )
+    a_quotes = gf.extract_invariant_quotes(
+        gf.commits_for_path(repo.root, "a.py")
+    )
+    b_quotes = gf.extract_invariant_quotes(
+        gf.commits_for_path(repo.root, "b.py")
+    )
+    assert any("PEP 668" in line for _, line in a_quotes)
+    assert any("CVE-2024-1234" in line for _, line in b_quotes)
+
+
+def test_extract_invariant_quotes_ignores_unrelated_4_digit_numbers(repo) -> None:  # type: ignore[no-untyped-def]
+    """A body that mentions a year or a ticket number — without a standards
+    prefix — must not fire as a standards cite; the regex is anchored to the
+    prefix and four free-standing digits are not enough."""
+    body = "Fixed in 2024 by user 1234, see meeting notes for context."
+    repo.commit("docs: note who fixed it", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert quotes == []
+
+
+def _synth_pivot_commit(subject: str, body: str) -> gf.Commit:
+    from datetime import UTC, datetime
+    return gf.Commit(
+        sha="a" * 40,
+        author_name="Test",
+        author_email="test@example.com",
+        authored_at=datetime(2026, 5, 1, tzinfo=UTC),
+        subject=subject,
+        body=body,
+    )
+
+
+def test_is_subject_blind_pivot_short_body_fires_with_security_subject() -> None:
+    """A subject naming a security-class concern lowers the body-length floor
+    so terse-but-load-bearing security commits surface as pivots."""
+    body = "x" * 100  # between 80 (security floor) and 200 (default floor)
+    commit = _synth_pivot_commit("fix cookie signing", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is True
+
+
+def test_is_subject_blind_pivot_short_body_silent_without_security_subject() -> None:
+    """The same body length but without a security token in the subject stays
+    silent — the lower floor only applies to security-class subjects."""
+    body = "x" * 100
+    commit = _synth_pivot_commit("tweak internal naming", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is False
+
+
+def test_is_subject_blind_pivot_long_body_fires_regardless_of_subject_tokens() -> None:
+    """Existing behaviour: any non-incident, non-revert subject with a body
+    >= 200 chars fires, with or without security tokens in the subject."""
+    body = "x" * 500
+    commit = _synth_pivot_commit("Reorganize internal layout", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is True
+
+
+def test_is_subject_blind_pivot_security_subject_with_short_body_below_80() -> None:
+    """The security floor is 80, not zero — a sub-80-char body still doesn't
+    pass, so the lowered threshold isn't trivially bypassed."""
+    body = "x" * 50
+    commit = _synth_pivot_commit("fix cookie signing", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is False
+
+
+def test_is_subject_blind_pivot_hotfix_security_does_not_double_fire() -> None:
+    """A "hotfix: cookie signing" subject trips the incident rule and the
+    pivot detector must stay silent — the chapter ladder routes the commit
+    through ``incident`` either way, but suppressing pivot keeps the per-
+    commit classification clean and prevents double-counting."""
+    body = "x" * 100
+    commit = _synth_pivot_commit("hotfix: cookie signing regression", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is False
+
+
 def test_co_changes_excludes_target_file(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.txt": "1", "b.txt": "1", "c.txt": "1"})
     repo.commit("change a and b", {"a.txt": "2", "b.txt": "2"})
