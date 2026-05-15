@@ -317,6 +317,114 @@ def test_to_dict_emits_documented_top_level_keys(
             assert key in first, f"missing per-chapter key {key!r}"
 
 
+def test_build_story_pins_cited_prior_chapter_even_when_role_is_edit(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """A short-body ``edit``-role commit referenced by a later reconciliation
+    body must survive the default edit-drop so the citation resolves to a
+    chapter index rather than dangling as a bare SHA."""
+    sha_a = repo.commit(
+        "tweak: rename helper",
+        {"a.py": "1"},
+        body="No constraint stated.",
+        when=days_ago(40),
+    )
+    repo.commit(
+        "feat: reconcile after benchmarking",
+        {"a.py": "2"},
+        body=f"This rethinks {sha_a[:10]} after profiling.",
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts)
+    surviving_shas = {c.sha for c in story.chapters if c.sha is not None}
+    assert sha_a in surviving_shas, "cited edit commit must be pinned"
+    pinned = next(c for c in story.chapters if c.sha == sha_a)
+    assert pinned.role == "edit", "pinning must not rewrite the role"
+    assert pinned.is_pinned_by_citation is True
+    recon = next(c for c in story.chapters if c.role == "reconciliation")
+    assert recon.cited_prior_indices, "citation must resolve post-pinning"
+    cited_idx = recon.cited_prior_indices[0]
+    assert story.chapters[cited_idx].sha == sha_a
+
+
+def test_build_story_pinned_chapter_survives_top_truncation(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """``limit=N`` caps the count of surfaced real chapters, but pinned
+    chapters are exempt so their citation can still resolve to an index.
+    Effective surface size is ``limit + pin_count`` of real chapters."""
+    # 6 non-edit beats — incidents are easy to manufacture deterministically.
+    for i, n in enumerate([90, 80, 70, 60, 50, 40]):
+        repo.commit(
+            f"hotfix: outage {i}",
+            {"a.py": str(i + 1)},
+            body=f"See #INC-{i + 1}",
+            when=days_ago(n),
+        )
+    # One short-body edit that the reconciliation will cite.
+    sha_edit = repo.commit(
+        "tweak: rename helper",
+        {"a.py": "edit"},
+        body="No constraint stated.",
+        when=days_ago(30),
+    )
+    # Newest beat cites the edit, so it must be pinned.
+    repo.commit(
+        "feat: reconcile dispatch after profiling",
+        {"a.py": "recon"},
+        body=f"This rethinks {sha_edit[:10]} after benchmarking.",
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, limit=3)
+    surviving_shas = {c.sha for c in story.chapters if c.sha is not None}
+    assert sha_edit in surviving_shas, "pinned edit must survive limit=3 truncation"
+    pinned = next(c for c in story.chapters if c.sha == sha_edit)
+    assert pinned.is_pinned_by_citation is True
+
+
+def test_to_dict_chapters_returned_excludes_collapse_markers(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """``chapters_returned`` describes real chapters surfaced to the consumer,
+    not the raw array length. Synthetic collapse markers (folded edit runs)
+    are surfaced separately as ``collapse_markers`` so an allocator gets the
+    right slot count by reading ``chapters_returned`` alone."""
+    repo.commit(
+        "hotfix: prior outage",
+        {"a.py": "0"},
+        body="See #INC-1",
+        when=days_ago(60),
+    )
+    for i, n in enumerate([50, 45, 40, 35]):
+        repo.commit(
+            f"tweak: refactor pass {i}",
+            {"a.py": str(i + 1)},
+            body="No constraint stated.",
+            when=days_ago(n),
+        )
+    repo.commit(
+        "hotfix: newer outage",
+        {"a.py": "5"},
+        body="See #INC-2",
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts)
+    payload = st.to_dict(story)
+    # Guard: this test is only meaningful when a collapse marker actually
+    # appears, so flag a regression in collapse emission rather than letting
+    # the assertion below trivially pass.
+    assert any(c.get("is_collapse") for c in payload["chapters"])
+    real = sum(1 for c in payload["chapters"] if not c.get("is_collapse"))
+    assert payload["chapters_returned"] == real
+    assert payload["chapters_returned"] == payload["chapters_total"]
+    assert payload["collapse_markers"] == sum(
+        1 for c in payload["chapters"] if c.get("is_collapse")
+    )
+
+
 def test_render_markdown_emits_role_headings(
     repo: RepoBuilder, days_ago: Callable[[int], datetime]
 ) -> None:
