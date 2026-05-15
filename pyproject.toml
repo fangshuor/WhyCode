@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whycode-cli"
-version = "0.7.1"
+version = "0.7.2"
 description = "Tells you what to be afraid of before you touch a file."
 readme = "README.md"
 license = "MIT"
