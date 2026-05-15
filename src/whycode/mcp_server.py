@@ -137,11 +137,12 @@ def _build_server(verbose: bool = False) -> Server:
             Tool(
                 name="audit_signal",
                 description=(
-                    "Return the rule trace for one fired signal — for auditing WhyCode's "
-                    "reasoning when you suspect a false positive. Returns the rule "
-                    "identifier, the matching evidence tokens / thresholds, and a "
-                    "source-location pointer into the WhyCode source. Use this RARELY; "
-                    "the default risk profile is the right tool for normal triage."
+                    "Use ONLY when a human user disputes a specific flag or asks "
+                    "'why did this fire'. Do NOT call this speculatively on every "
+                    "signal — the default risk profile already names the rule kind. "
+                    "Returns the rule identifier, the matching evidence tokens / "
+                    "thresholds, and a source-location pointer for one fired signal "
+                    "kind."
                 ),
                 inputSchema={
                     "type": "object",
