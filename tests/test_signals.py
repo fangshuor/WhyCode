@@ -427,6 +427,100 @@ def test_classify_commit_role_pivot_above_invariant() -> None:
     assert classification.chapter_role == "pivot"
 
 
+# ---- pivot_kind extraction --------------------------------------------------
+
+
+def test_commit_pivot_kind_recognises_conventional_commits() -> None:
+    """Conventional Commits style prefixes (``feat:``, ``fix:``, …) map to
+    the normalised pivot kind so downstream Top-N ranking can split the
+    catch-all pivot bucket into discriminative sub-roles."""
+    cases = {
+        "feat: add new endpoint": "feature",
+        "fix: handle empty input": "bugfix",
+        "refactor: split helpers": "refactor",
+        "perf: speed up loader": "perf",
+        "docs: clarify api notes": "doc",
+        "chore: bump deps": "chore",
+    }
+    for subject, expected in cases.items():
+        commit = _synth_commit(subject, "body")
+        assert gf.commit_pivot_kind(commit) == expected, subject
+
+
+def test_commit_pivot_kind_recognises_numpy_style_prefixes() -> None:
+    """ALL-CAPS prefixes (numpy / scipy / cpython style) map alongside the
+    Conventional Commits ones — ``DEP:`` is the dedicated deprecation marker
+    and earns its own chapter role."""
+    cases = {
+        "BUG: nan propagation": "bugfix",
+        "ENH: faster reductions": "feature",
+        "DEP: remove legacy api": "deprecate",
+        "DOC: fix typo": "doc",
+        "STY: align imports": "style",
+        "MAINT: refresh ci config": "chore",
+    }
+    for subject, expected in cases.items():
+        commit = _synth_commit(subject, "body")
+        assert gf.commit_pivot_kind(commit) == expected, subject
+
+
+def test_commit_pivot_kind_returns_none_for_unrecognised_subject() -> None:
+    """Subjects without a recognised prefix (free-form, merges, reverts)
+    return None so the field can be a clean nullable in the classification."""
+    for subject in (
+        "random subject",
+        "Merge branch foo",
+        'Revert "feat: try async"',
+    ):
+        commit = _synth_commit(subject, "body")
+        assert gf.commit_pivot_kind(commit) is None, subject
+
+
+def test_commit_pivot_kind_treats_breaking_marker_as_same_kind() -> None:
+    """The Conventional Commits ``!`` breaking-marker shape (``feat!:``)
+    still maps to the underlying kind for pivot_kind extraction. The
+    breaking semantics are owned by the existing incident detector."""
+    commit = _synth_commit("feat!: drop legacy", "body")
+    assert gf.commit_pivot_kind(commit) == "feature"
+
+
+def test_classify_commit_role_deprecate_for_dep_prefix_long_body() -> None:
+    """A long-body commit whose subject opens with the numpy ``DEP:``
+    prefix earns the dedicated ``deprecate`` chapter role — distinct from
+    plain ``pivot`` so RANK-A can promote deprecation announcements."""
+    long_body = (
+        "Deprecate the legacy iterator interface. The public surface has "
+        "been re-exported via the modern entry point for several releases; "
+        "this change schedules removal in the next major. Callers still on "
+        "the old names will start seeing a DeprecationWarning at import "
+        "time, with a pointer to the documented migration path."
+    )
+    assert len(long_body) >= 200
+    commit = _synth_commit("DEP: remove legacy api", long_body)
+    classification = gf.classify_commit(commit)
+    assert classification.is_pivot is True
+    assert classification.pivot_kind == "deprecate"
+    assert classification.chapter_role == "deprecate"
+
+
+def test_classify_commit_pivot_kind_set_on_non_deprecate_pivots() -> None:
+    """Non-deprecate pivots still get the underlying kind populated so the
+    upcoming Top-N ranking pass can discriminate on the prefix without the
+    chapter role being promoted off ``pivot``."""
+    long_body = (
+        "Introduce the new public entry point. The motivation is to give "
+        "callers a stable surface that is independent of the internal "
+        "dispatch layout. Tests pin the public names; internal callers "
+        "are migrated in a follow-up so this commit stays minimal in scope."
+    )
+    assert len(long_body) >= 200
+    commit = _synth_commit("feat: new api", long_body)
+    classification = gf.classify_commit(commit)
+    assert classification.is_pivot is True
+    assert classification.pivot_kind == "feature"
+    assert classification.chapter_role == "pivot"
+
+
 def test_coupling_filters_ignored_paths(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
     """F10 — co-change candidates that scan would hide must not appear in
     the per-file coupling signal either. ``CHANGELOG.md`` is in the default
