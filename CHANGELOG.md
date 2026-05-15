@@ -5,6 +5,73 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.7.1] — 2026-05-15
+
+### Fixed — five bugs surfaced by 0.7.0 capability audits
+
+A 5-subagent audit pass on 0.7.0 (3 persona re-runs + medium-repo + large-repo
+stress tests) confirmed the mindflow surface works (Sara's verdict flipped
+from "partial / no" to "yes"), but caught five concrete bugs worth shipping
+as a patch.
+
+- **`whycode story <path> --all` now returns every chapter.** The CLI used
+  to pass `limit=None` to ``build_story`` when ``--all`` was set but forgot
+  to thread ``all_chapters=True``, so the default "drop role==edit chapters"
+  rule still fired. On a 915-commit numpy file the user got ~124 chapters
+  back instead of ~915.
+- **`whycode story <path>` exits 2 on a nonexistent path** (matches the
+  contract ``whycode why`` already enforces). CI loops running
+  ``whycode story`` per file no longer silently succeed on typos.
+- **`to_dict`'s `chapters_returned` now counts real chapters only.** A JSON
+  consumer that allocated per ``chapters_returned`` over-allocated by the
+  collapse-marker count. The marker count is now a separate
+  ``collapse_markers`` field; ``chapters_returned`` and ``chapters_total``
+  both count non-collapse entries with consistent semantics. The ``limit``
+  truncation caps real chapters instead of the raw array length.
+- **Reconciliation citations are pinned through the prune ladder.** Before
+  pruning, ``build_story`` scans every chapter's ``cited_prior_shas`` and
+  force-keeps the cited commits, marking them ``is_pinned_by_citation``.
+  The pin survives the role drop, the collapse-run fold, and the
+  ``--top`` truncation. Verified on flask ``src/flask/cli.py``: the
+  reconciliation that cites ``2ae740d`` now resolves to a chapter index
+  (was a bare SHA on 0.7.0). Cross-reference resolution went from 1/2 to
+  2/2 across the sampled flask files. The text and markdown renderers
+  tag pinned chapters so a reader understands why an edit-role chapter
+  survived.
+- **`audit_signal` MCP tool description gates against speculative use.**
+  Sara persona feedback: an over-eager editor LLM will call it on every
+  signal "to be thorough" and turn it into context-budget noise. The
+  description now reads "Use ONLY when a human user disputes a specific
+  flag … Do NOT call this speculatively on every signal …". The input
+  schema is unchanged.
+
+287 tests passing on this branch (was 282 on 0.7.0, +6 new regression
+tests across both halves). ruff + mypy strict clean. One pre-existing
+``test_newborn_explanation_names_window`` failure is a wall-clock-anchored
+fixture drift (the test fixture pins ``now`` to 2026-05-01 but
+``signals._now()`` uses real wall clock); not introduced here, queued
+for the 0.7.2 fixture cleanup.
+
+### Deferred to 0.7.2
+
+The audit pass surfaced additional improvements that need a ranking-system
+overhaul and are queued for 0.7.2:
+
+- Top-N ranking is pure newest-first; on a 915-commit numpy file the
+  default ``--top 12`` returns DOC commits from the last 4 months ahead
+  of pre-2025 architectural decisions. Needs a weighted scoring step
+  combining role rarity, body length, files-changed, and time decay.
+- The ``pivot`` chapter role collapses 86-91% of commits at numpy scale —
+  "pivot" is no longer a signal at that scale. Needs sub-role split using
+  Conventional Commits-style prefix tokens (``BUG:`` / ``ENH:`` / ``DOC:``
+  / ``STY:`` / ``DEP:``).
+- Add ``--oldest-first`` CLI flag (Mei persona: causality reads forward).
+- Add ``cited_by_indices`` reverse pointer to chapter JSON (Sara: the LLM
+  shouldn't have to forward-scan to find which later chapter cites a pivot).
+- Drop ``body_full_chars`` from chapter JSON (Sara: LLMs over-index on
+  long bodies as an importance proxy).
+
+
 ## [0.7.0] — 2026-05-08
 
 ### Added — `whycode story <path>` and the mindflow surface
