@@ -314,6 +314,60 @@ def test_extract_invariant_quotes_ignores_unrelated_4_digit_numbers(repo) -> Non
     assert quotes == []
 
 
+def _synth_pivot_commit(subject: str, body: str) -> gf.Commit:
+    from datetime import UTC, datetime
+    return gf.Commit(
+        sha="a" * 40,
+        author_name="Test",
+        author_email="test@example.com",
+        authored_at=datetime(2026, 5, 1, tzinfo=UTC),
+        subject=subject,
+        body=body,
+    )
+
+
+def test_is_subject_blind_pivot_short_body_fires_with_security_subject() -> None:
+    """A subject naming a security-class concern lowers the body-length floor
+    so terse-but-load-bearing security commits surface as pivots."""
+    body = "x" * 100  # between 80 (security floor) and 200 (default floor)
+    commit = _synth_pivot_commit("fix cookie signing", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is True
+
+
+def test_is_subject_blind_pivot_short_body_silent_without_security_subject() -> None:
+    """The same body length but without a security token in the subject stays
+    silent — the lower floor only applies to security-class subjects."""
+    body = "x" * 100
+    commit = _synth_pivot_commit("tweak internal naming", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is False
+
+
+def test_is_subject_blind_pivot_long_body_fires_regardless_of_subject_tokens() -> None:
+    """Existing behaviour: any non-incident, non-revert subject with a body
+    >= 200 chars fires, with or without security tokens in the subject."""
+    body = "x" * 500
+    commit = _synth_pivot_commit("Reorganize internal layout", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is True
+
+
+def test_is_subject_blind_pivot_security_subject_with_short_body_below_80() -> None:
+    """The security floor is 80, not zero — a sub-80-char body still doesn't
+    pass, so the lowered threshold isn't trivially bypassed."""
+    body = "x" * 50
+    commit = _synth_pivot_commit("fix cookie signing", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is False
+
+
+def test_is_subject_blind_pivot_hotfix_security_does_not_double_fire() -> None:
+    """A "hotfix: cookie signing" subject trips the incident rule and the
+    pivot detector must stay silent — the chapter ladder routes the commit
+    through ``incident`` either way, but suppressing pivot keeps the per-
+    commit classification clean and prevents double-counting."""
+    body = "x" * 100
+    commit = _synth_pivot_commit("hotfix: cookie signing regression", body)
+    assert gf.is_subject_blind_pivot_commit(commit) is False
+
+
 def test_co_changes_excludes_target_file(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.txt": "1", "b.txt": "1", "c.txt": "1"})
     repo.commit("change a and b", {"a.txt": "2", "b.txt": "2"})
