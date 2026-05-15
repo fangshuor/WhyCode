@@ -1710,3 +1710,54 @@ def test_cli_story_command_emits_markdown_with_role_headings(repo, days_ago) -> 
     out = result.output
     assert "# story · a.py" in out
     assert "## [incident]" in out
+
+
+def test_story_all_flag_includes_edit_chapters(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """`whycode story <path> --all --json` must surface every commit as a
+    chapter — including the role==``edit`` beats that the default narrative
+    drops. Regression for the 0.7.0 bug where ``--all`` only lifted the
+    ``--top`` truncation but the CLI forgot to thread ``all_chapters=True``
+    into ``build_story``, so on a 915-commit file the user got ~124 chapters
+    back instead of the full history."""
+    # Five commits whose subjects classify as plain edits — nothing the
+    # detector would call revert / incident / reconciliation / invariant.
+    for i, subj in enumerate(
+        [
+            "feat: initial",
+            "tweak: small rename",
+            "tweak: another rename",
+            "tweak: third rename",
+            "tweak: fourth rename",
+        ]
+    ):
+        repo.commit(subj, {"x.py": str(i)}, when=days_ago(40 - i * 5))
+    # Default: edits are dropped (or collapsed). --all must override.
+    default_res = _invoke(repo.root, "story", "x.py", "--json")
+    assert default_res.exit_code == 0
+    default = json.loads(default_res.output)
+    default_real = [c for c in default["chapters"] if not c["is_collapse"]]
+    assert len(default_real) == 0, "default story drops edit beats"
+
+    all_res = _invoke(repo.root, "story", "x.py", "--all", "--json")
+    assert all_res.exit_code == 0
+    data = json.loads(all_res.output)
+    assert data["commit_count"] == 5
+    # Every commit must become a chapter; no folding under --all.
+    assert data["chapters_returned"] == 5
+    real = [c for c in data["chapters"] if not c["is_collapse"]]
+    assert len(real) == 5
+    edit_roles = [c["role"] for c in real if c["role"] == "edit"]
+    assert len(edit_roles) >= 1, "--all must surface at least one edit chapter"
+
+
+def test_story_nonexistent_path_exits_2(repo) -> None:  # type: ignore[no-untyped-def]
+    """`whycode story <typo>` must exit non-zero so a CI loop running
+    ``whycode story`` per file fails loudly on a missing path instead of
+    silently succeeding. Same contract as ``why`` — they share the
+    ``_require_tracked`` gate."""
+    repo.commit("init", {"a.txt": "1"})
+    result = _invoke(repo.root, "story", "phantom.py")
+    assert result.exit_code == 2
+    assert "phantom.py" in result.output
+    assert "not tracked" in result.output
+    assert "check the path" in result.output
