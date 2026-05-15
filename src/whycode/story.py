@@ -18,8 +18,9 @@ Public surface
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from rich.console import Group
@@ -28,6 +29,75 @@ from rich.text import Text
 from whycode import git_facts as gf
 
 _DEFAULT_BODY_MAX_CHARS = 600
+
+# ---------------------------------------------------------------------------
+# Top-N scoring weights
+# ---------------------------------------------------------------------------
+#
+# The default --top N cap used to be pure newest-first slicing, which surfaced
+# the latest doc-typo fixes ahead of decade-old design pivots on long-lived
+# files (numpy stress test on 0.7.0 produced twelve 2025-Q4 chapters on a
+# 915-commit file). The weights below shift that selection toward decision-
+# grade chapters: reverts/incidents/deprecations beat doc tweaks even when
+# they're years older, but very old commits still lose to recent decision-
+# grade beats via exponential time decay.
+
+_ROLE_WEIGHT: dict[str, float] = {
+    "revert": 100.0,
+    "incident": 90.0,
+    "deprecate": 80.0,
+    "reconciliation": 75.0,
+    "invariant": 60.0,
+    "pivot": 50.0,
+    "silence_break": 40.0,
+    "edit": 5.0,
+}
+
+# Sub-weighting for chapter_role == "pivot" so a "docs: typo" pivot can't
+# outrank a "feat: new dispatch backend" pivot. ``deprecate`` here is
+# unreachable (chapter_role short-circuits to "deprecate"); kept at 0.0 so
+# any future routing change still demotes it instead of double-promoting.
+_PIVOT_KIND_WEIGHT: dict[str, float] = {
+    "feature": 55.0,
+    "bugfix": 45.0,
+    "refactor": 50.0,
+    "perf": 45.0,
+    "deprecate": 0.0,
+    "doc": 15.0,
+    "style": 10.0,
+    "test": 15.0,
+    "chore": 10.0,
+}
+
+# Half-life of ~3.5 years: a 5-year-old chapter weights ~0.4 of a fresh one
+# of the same role, so a 5-year-old revert (100*0.4 = 40) still beats a
+# recent chore (10*1.0 = 10) but loses to a recent revert (100*1.0 = 100).
+_HALF_LIFE_DAYS = 365 * 3.5
+
+# Floor on the time-decay multiplier so a very old revert can never decay
+# all the way to zero — keeps decade-old reverts above recent doc commits.
+_DECAY_FLOOR = 0.1
+
+
+def _time_decay(days_since: int) -> float:
+    """Exponential decay with a 0.1 floor for ancient decision-grade beats."""
+    if days_since <= 0:
+        return 1.0
+    return max(_DECAY_FLOOR, math.pow(0.5, days_since / _HALF_LIFE_DAYS))
+
+
+def _body_boost(body_full_chars: int) -> float:
+    """Modest boost for longer bodies (capped at 1.5x at 1000+ chars)."""
+    if body_full_chars <= 0:
+        return 1.0
+    return min(1.5, 1.0 + body_full_chars / 2000.0)
+
+
+def _files_boost(files_changed: int) -> float:
+    """Modest boost for wide-touching commits (capped at 1.3x)."""
+    if files_changed <= 0:
+        return 1.0
+    return min(1.3, 1.0 + math.log10(files_changed) / 5.0)
 
 # Same role-style mapping ``whycode show`` uses; centralised here so the
 # story renderer and the show renderer can never drift.
@@ -68,6 +138,7 @@ class Chapter:
     body_full_chars: int
     cited_prior_shas: tuple[str, ...] = ()
     cited_prior_indices: tuple[int, ...] = ()
+    cited_by_indices: tuple[int, ...] = ()
     invariant_lines: tuple[str, ...] = ()
     files_changed: int = 0
     is_collapse: bool = False
@@ -113,6 +184,10 @@ class _RawChapter:
     before freezing into immutable :class:`Chapter` instances. Keeping the
     scratch type separate spares the public ``Chapter`` from ever having
     "is this chapter going to be kept?" mutable state.
+
+    ``pivot_kind`` carries the classifier's sub-kind (``feature`` / ``bugfix``
+    / ``doc`` / …) so the Top-N scorer can demote pivot-classed doc/style
+    commits without losing the pivot role itself.
     """
 
     sha: str
@@ -125,6 +200,7 @@ class _RawChapter:
     invariant_lines: tuple[str, ...]
     files_changed: int
     keep: bool
+    pivot_kind: str | None = None
     pinned_by_citation: bool = False
 
 
@@ -225,6 +301,28 @@ def _collapse_runs(raws: list[_RawChapter]) -> list[_RawChapter | tuple[int, str
     return out
 
 
+def _score_raw_chapter(raw: _RawChapter, now: datetime) -> float:
+    """Score a raw chapter for the weighted Top-N keep set.
+
+    The role base weight is the dominant term; pivot chapters substitute the
+    sub-kind weight so a "docs:" pivot scores below a "feat:" pivot. The
+    decay/body/files multipliers are bounded so no one factor dominates.
+    """
+    base = _ROLE_WEIGHT.get(raw.role, 5.0)
+    if raw.role == "pivot" and raw.pivot_kind is not None:
+        base = _PIVOT_KIND_WEIGHT.get(raw.pivot_kind, 50.0)
+    authored = raw.authored_at
+    if authored.tzinfo is None:
+        authored = authored.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    days_since = max(0, (now - authored).days)
+    decay = _time_decay(days_since)
+    body_boost = _body_boost(len(raw.body_full))
+    files_boost = _files_boost(raw.files_changed)
+    return base * decay * body_boost * files_boost
+
+
 def _resolve_cited_indices(
     chapter_shas: list[str | None],
     cited: tuple[str, ...],
@@ -279,11 +377,18 @@ def build_story(
        default edit-drop, the collapse-run fold, and the ``limit`` cutoff.
     4. Unless ``no_collapse`` is set, fold runs of ≥3 same-role same-author
        dropped edits between non-edit beats into one collapse marker.
-    5. Truncate the surfaced real chapters to ``limit`` (None = no
-       truncation), preserving every pinned chapter even if it would
-       otherwise be cut.
+       When ``roles`` is set the collapse markers are suppressed — a
+       restricted-role consumer doesn't need the folded-edit context.
+    5. Weighted Top-N keep: when ``limit`` is set and ``all_chapters`` is
+       False, score each non-pinned real chapter via ``_score_raw_chapter``
+       (role base * time decay * body/files boost) and keep only the
+       highest-scoring ``limit - pinned_count``. Pinned chapters always
+       survive; collapse markers between surviving reals ride along.
+       The final list is re-sorted newest-first for display.
     6. Resolve each reconciliation chapter's cited prior SHAs to chapter
-       indices in the final list (or omit if the cited chapter was pruned).
+       indices in the final list (or omit if the cited chapter was pruned),
+       plus the reverse ``cited_by_indices`` so a referenced chapter knows
+       which later chapter is pointing at it.
 
     The newest-first ordering is the same one ``facts.commits`` already
     uses, so a consumer who threads through ``[chapter for chapter in
@@ -338,6 +443,7 @@ def build_story(
                 invariant_lines=invariants,
                 files_changed=len(commit.files),
                 keep=keep,
+                pivot_kind=classification.pivot_kind,
             )
         )
 
@@ -360,8 +466,13 @@ def build_story(
                 r.keep = True
                 r.pinned_by_citation = True
 
-    if no_collapse:
-        # Filter to kept-only and skip the run-fold pass entirely.
+    # When the caller passes a roles allowlist the consumer is asking for a
+    # narrow filtered view (e.g. just reverts for incident triage); the folded
+    # "…N edits" markers cost ~120 tokens per marker for an LLM consumer and
+    # add no signal once the filter is in place. Suppress them along the same
+    # path as ``no_collapse``.
+    suppress_collapse = no_collapse or role_allowlist is not None
+    if suppress_collapse:
         items: list[_RawChapter | tuple[int, str, str]] = [
             r for r in raws if r.keep
         ]
@@ -412,46 +523,111 @@ def build_story(
     # ``chapters_returned`` can tell whether the cap dropped any chapters.
     chapters_total = sum(1 for ch in materialised if not ch.is_collapse)
 
-    if limit is not None and chapters_total > limit:
+    if (
+        limit is not None
+        and not all_chapters
+        and chapters_total > limit
+    ):
         # ``limit`` caps the count of real (non-collapse) chapters surfaced;
-        # collapse markers between kept reals ride along for free so the
+        # collapse markers between surviving reals ride along for free so the
         # run-fold context isn't dropped just because the caller capped the
         # chapter count. Pinned chapters count against ``limit`` but cannot
-        # be evicted — a ``--top 12`` story with 3 pins surfaces 3 pins + 9
-        # newest non-pinned reals. When the pin count alone exceeds
-        # ``limit``, surface every pin: silently dropping a citation target
-        # would defeat the pinning pass.
+        # be evicted; the remaining slots go to the highest-scoring non-pinned
+        # reals (see ``_score_raw_chapter``). When the pin count alone
+        # exceeds ``limit``, surface every pin: silently dropping a citation
+        # target would defeat the pinning pass.
         pinned_count = sum(1 for ch in materialised if ch.is_pinned_by_citation)
         if pinned_count >= limit:
             materialised = [ch for ch in materialised if ch.is_pinned_by_citation]
         else:
+            # Time-decay reference is the newest commit's timestamp rather
+            # than wall-clock ``now`` so the chosen set is deterministic for a
+            # given repo + arguments — synthetic-repo tests and cached MCP
+            # responses both need stable selection across runs.
+            decay_now = commits_newest_first[0].authored_at
+            if decay_now.tzinfo is None:
+                decay_now = decay_now.replace(tzinfo=UTC)
+
+            # Score every real (non-collapse) raw chapter that survived the
+            # earlier keep / collapse / suppress passes. The mapping back from
+            # materialised Chapter -> raw is by SHA; raws were built before
+            # pruning so every materialised non-collapse SHA is present.
+            raw_by_sha: dict[str, _RawChapter] = {r.sha: r for r in raws}
+            non_pinned_scored: list[tuple[float, int, Chapter]] = []
+            survivors_by_sha: set[str] = set()
+            for chapter_idx, ch in enumerate(materialised):
+                if ch.is_collapse or ch.sha is None:
+                    continue
+                if ch.is_pinned_by_citation:
+                    survivors_by_sha.add(ch.sha)
+                    continue
+                raw = raw_by_sha.get(ch.sha)
+                # Defensive: a materialised chapter with no raw shouldn't
+                # happen, but if it does we treat it as un-scoreable and
+                # let it survive at the newest-first end via index tiebreak.
+                score = 0.0 if raw is None else _score_raw_chapter(raw, decay_now)
+                # Tiebreak: lower chapter_idx is newer (newest-first ordering),
+                # so a negative index favors newer commits when scores tie.
+                non_pinned_scored.append((score, -chapter_idx, ch))
+
             remaining = limit - pinned_count
+            non_pinned_scored.sort(reverse=True)
+            for _score, _tiebreak, ch in non_pinned_scored[:remaining]:
+                if ch.sha is not None:
+                    survivors_by_sha.add(ch.sha)
+
+            # Re-walk the original materialised list to preserve newest-first
+            # order; emit pinned + score-survivor chapters plus the collapse
+            # markers that sit between two survivors. A collapse marker that
+            # would land at the head or tail (no surviving real on one side)
+            # gets dropped — it'd be context-free narration otherwise.
             taken: list[Chapter] = []
-            non_pinned_real_kept = 0
             pending_markers: list[Chapter] = []
+            seen_real_survivor = False
             for ch in materialised:
                 if ch.is_collapse:
                     pending_markers.append(ch)
                     continue
-                if ch.is_pinned_by_citation:
-                    taken.extend(pending_markers)
+                surviving = (
+                    ch.is_pinned_by_citation
+                    or (ch.sha is not None and ch.sha in survivors_by_sha)
+                )
+                if surviving:
+                    if seen_real_survivor:
+                        taken.extend(pending_markers)
                     pending_markers.clear()
                     taken.append(ch)
-                elif non_pinned_real_kept < remaining:
-                    taken.extend(pending_markers)
-                    pending_markers.clear()
-                    taken.append(ch)
-                    non_pinned_real_kept += 1
+                    seen_real_survivor = True
                 else:
                     pending_markers.clear()
             materialised = taken
 
     # Resolve cited prior SHAs to indices in the final, post-truncation list.
     chapter_shas: list[str | None] = [ch.sha for ch in materialised]
-    final_chapters: list[Chapter] = []
+    resolved_indices: list[tuple[int, ...]] = []
     for ch in materialised:
         if ch.cited_prior_shas:
-            indices = _resolve_cited_indices(chapter_shas, ch.cited_prior_shas)
+            resolved_indices.append(
+                _resolve_cited_indices(chapter_shas, ch.cited_prior_shas)
+            )
+        else:
+            resolved_indices.append(())
+
+    # Build the reverse map: for each chapter index, the set of later-chapter
+    # indices that cite it. Reverse pointers are the cheap UX win the LLM
+    # consumer needs to surface "this old beat is still load-bearing".
+    cited_by: dict[int, list[int]] = {i: [] for i in range(len(materialised))}
+    for src_idx, indices in enumerate(resolved_indices):
+        for target_idx in indices:
+            if target_idx == src_idx:
+                continue
+            cited_by[target_idx].append(src_idx)
+
+    final_chapters: list[Chapter] = []
+    for idx, ch in enumerate(materialised):
+        forward = resolved_indices[idx]
+        reverse = tuple(cited_by.get(idx, ()))
+        if forward or reverse:
             final_chapters.append(
                 Chapter(
                     sha=ch.sha,
@@ -463,7 +639,8 @@ def build_story(
                     body_truncated=ch.body_truncated,
                     body_full_chars=ch.body_full_chars,
                     cited_prior_shas=ch.cited_prior_shas,
-                    cited_prior_indices=indices,
+                    cited_prior_indices=forward,
+                    cited_by_indices=reverse,
                     invariant_lines=ch.invariant_lines,
                     files_changed=ch.files_changed,
                     is_collapse=ch.is_collapse,
@@ -581,6 +758,21 @@ def render_text(story: Story) -> Group:
         if ch.cited_prior_shas and not ch.cited_prior_indices:
             for cited in ch.cited_prior_shas:
                 block.append(f"\n  → cites sha {cited[:7]}", style="dim magenta")
+        # Reverse pointer: this chapter is referenced by a later chapter's
+        # body. Surfaced only on decision-grade chapters so a noisy edit run
+        # doesn't earn a "(cited by …)" tag for being incidentally mentioned.
+        if ch.cited_by_indices and ch.role in (
+            "pivot",
+            "reconciliation",
+            "revert",
+            "incident",
+            "deprecate",
+            "invariant",
+        ):
+            cite_str = ", ".join(str(i) for i in ch.cited_by_indices)
+            block.append(
+                f"\n  ← cited by chapter {cite_str}", style="dim magenta"
+            )
         blocks.append(block)
         if idx < len(story.chapters) - 1:
             blocks.append(Text(""))
@@ -602,6 +794,10 @@ def to_dict(
     del body_max_chars  # bodies are already truncated; arg kept for API parity
     chapters_out: list[dict[str, Any]] = []
     for idx, ch in enumerate(story.chapters):
+        # ``body_full_chars`` is dropped from the JSON surface: editor-LLM
+        # consumers were over-indexing on long bodies as a proxy for
+        # importance, defeating the role-weighted scoring. The boolean
+        # ``body_truncated`` keeps the "is there more text upstream?" signal.
         chapters_out.append(
             {
                 "index": idx,
@@ -612,9 +808,9 @@ def to_dict(
                 "role": ch.role,
                 "body_excerpt": ch.body_excerpt,
                 "body_truncated": ch.body_truncated,
-                "body_full_chars": ch.body_full_chars,
                 "cited_prior_shas": list(ch.cited_prior_shas),
                 "cited_prior_indices": list(ch.cited_prior_indices),
+                "cited_by_indices": list(ch.cited_by_indices),
                 "invariant_lines": list(ch.invariant_lines),
                 "files_changed": ch.files_changed,
                 "is_collapse": ch.is_collapse,
@@ -681,6 +877,17 @@ def render_markdown(story: Story) -> str:
             lines.append("")
             for cited in ch.cited_prior_shas:
                 lines.append(f"→ cites sha `{cited[:7]}`")
+        if ch.cited_by_indices and ch.role in (
+            "pivot",
+            "reconciliation",
+            "revert",
+            "incident",
+            "deprecate",
+            "invariant",
+        ):
+            lines.append("")
+            cite_str = ", ".join(str(i) for i in ch.cited_by_indices)
+            lines.append(f"← cited by chapter {cite_str}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 

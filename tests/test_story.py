@@ -294,6 +294,8 @@ def test_to_dict_emits_documented_top_level_keys(
     }
     assert expected.issubset(payload.keys())
     # Per-chapter shape sanity: index, sha, role, body fields all present.
+    # ``body_full_chars`` is intentionally dropped — LLMs over-index on long
+    # bodies as an importance proxy; ``body_truncated`` carries the signal.
     assert isinstance(payload["chapters"], list)
     if payload["chapters"]:
         first = payload["chapters"][0]
@@ -306,9 +308,9 @@ def test_to_dict_emits_documented_top_level_keys(
             "role",
             "body_excerpt",
             "body_truncated",
-            "body_full_chars",
             "cited_prior_shas",
             "cited_prior_indices",
+            "cited_by_indices",
             "invariant_lines",
             "files_changed",
             "is_collapse",
@@ -442,3 +444,283 @@ def test_render_markdown_emits_role_headings(
     assert "# story · a.py" in md
     assert "## [incident]" in md
     assert "hotfix: outage" in md
+
+
+def test_build_story_ranks_revert_above_recent_doc_pivot(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """An older revert must outscore a recent doc-only pivot under --top 1.
+
+    Reverts carry the highest role base weight (100); even with time decay
+    they should beat a docs-prefixed pivot whose sub-kind weight is 15."""
+    long_body = "Body explaining the revert in deliberate detail.\n" * 5
+    repo.commit(
+        "feat: original dispatch",
+        {"a.py": "1"},
+        body="No constraint stated.",
+        when=days_ago(120),
+    )
+    repo.commit(
+        'Revert "feat: original dispatch"',
+        {"a.py": "2"},
+        body=f"This reverts commit deadbeef.\n\n{long_body}",
+        when=days_ago(100),
+    )
+    repo.commit(
+        "docs: typo",
+        {"a.py": "3"},
+        body="Fix typo in comment.\n\n" + ("x" * 800),
+        when=days_ago(2),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, limit=1)
+    real = [c for c in story.chapters if not c.is_collapse]
+    assert len(real) == 1
+    assert real[0].role == "revert", f"expected revert to win, got {real[0].role}"
+
+
+def test_build_story_ranks_incident_above_old_doc_pivot(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """A recent incident always outranks an older docs-classed pivot."""
+    repo.commit(
+        "docs: explain dispatch",
+        {"a.py": "1"},
+        body="No constraint stated.\n\n" + ("x" * 1500),
+        when=days_ago(200),
+    )
+    repo.commit(
+        "hotfix: production pager",
+        {"a.py": "2"},
+        body="See #INC-1\n\nrecover the dispatch",
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, limit=1)
+    real = [c for c in story.chapters if not c.is_collapse]
+    assert len(real) == 1
+    assert real[0].role == "incident"
+
+
+def test_build_story_pivot_kind_modulates_pivot_score(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """When three pivot-class commits compete for one slot, the feature pivot
+    wins over docs/style pivots via the pivot_kind sub-weight."""
+    long_body = "Architectural rationale documented at length.\n" * 6
+    # All three are classed as pivots (long body, no incident, no revert);
+    # the subject prefix sets pivot_kind to feature/doc/style.
+    repo.commit(
+        "feat: introduce dispatcher backbone",
+        {"a.py": "1"},
+        body=long_body,
+        when=days_ago(10),
+    )
+    repo.commit(
+        "docs: rewrite dispatcher overview",
+        {"a.py": "2"},
+        body=long_body,
+        when=days_ago(8),
+    )
+    repo.commit(
+        "style: reformat dispatcher block",
+        {"a.py": "3"},
+        body=long_body,
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, limit=1)
+    real = [c for c in story.chapters if not c.is_collapse]
+    assert len(real) == 1
+    assert real[0].subject == "feat: introduce dispatcher backbone"
+
+
+def test_build_story_time_decay_old_revert_above_recent_chore(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """A 5-year-old revert still outranks a 1-week-old chore — decay floors
+    at 0.1, leaving the revert at >=10 vs the chore's ~10*1.0=10. The body
+    boost on a substantive revert tips it over."""
+    repo.commit(
+        "feat: ancient dispatch",
+        {"a.py": "1"},
+        body="No constraint stated.",
+        when=days_ago(365 * 5 + 10),
+    )
+    repo.commit(
+        'Revert "feat: ancient dispatch"',
+        {"a.py": "2"},
+        body="This reverts commit deadbeef.\n\n" + ("x" * 1000),
+        when=days_ago(365 * 5),
+    )
+    repo.commit(
+        "chore: bump tool config",
+        {"a.py": "3"},
+        body="No constraint stated.",
+        when=days_ago(7),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, limit=1)
+    real = [c for c in story.chapters if not c.is_collapse]
+    assert len(real) == 1
+    assert real[0].role == "revert"
+
+
+def test_build_story_pinned_chapter_survives_score_truncation(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """A pinned edit chapter (cited from another body) must survive even
+    when its score would otherwise drop it from the Top-N keep set."""
+    # Three substantive incidents; the edit's score is far below any of them.
+    for i, n in enumerate([90, 80, 70]):
+        repo.commit(
+            f"hotfix: outage {i}",
+            {"a.py": str(i + 1)},
+            body=f"See #INC-{i + 1}",
+            when=days_ago(n),
+        )
+    sha_edit = repo.commit(
+        "tweak: rename helper",
+        {"a.py": "edit"},
+        body="No constraint stated.",
+        when=days_ago(60),
+    )
+    # Pivot/reconciliation that cites the edit so it gets pinned.
+    repo.commit(
+        "feat: rebuild dispatcher",
+        {"a.py": "recon"},
+        body=f"Reworking {sha_edit[:10]} after profiling identified a gap.",
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, limit=3)
+    surviving_shas = {c.sha for c in story.chapters if c.sha is not None}
+    assert sha_edit in surviving_shas
+    pinned = next(c for c in story.chapters if c.sha == sha_edit)
+    assert pinned.is_pinned_by_citation is True
+
+
+def test_build_story_all_flag_bypasses_scoring(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """``all_chapters=True`` with ``limit=None`` returns every commit in
+    newest-first order, untouched by scoring or truncation."""
+    for i, n in enumerate([100, 80, 60, 40, 20, 5]):
+        repo.commit(
+            f"tweak: pass {i}",
+            {"a.py": str(i + 1)},
+            body="No constraint stated.",
+            when=days_ago(n),
+        )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, all_chapters=True, limit=None)
+    non_collapse = [c for c in story.chapters if not c.is_collapse]
+    assert len(non_collapse) == 6
+    timestamps = [c.authored_at for c in non_collapse if c.authored_at is not None]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+
+def test_roles_filter_drops_collapse_markers(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """A roles allowlist suppresses folded-run collapse markers — a narrowed
+    consumer doesn't need the "…3 edits" stand-ins."""
+    # Bracket runs of edits between reverts so collapse markers would normally
+    # appear; with roles=("revert",) they must not.
+    repo.commit(
+        "feat: A",
+        {"a.py": "0"},
+        body="No constraint stated.",
+        when=days_ago(120),
+    )
+    repo.commit(
+        'Revert "feat: A"',
+        {"a.py": "1"},
+        body="This reverts commit deadbeef.",
+        when=days_ago(115),
+    )
+    for i, n in enumerate([110, 105, 100, 95]):
+        repo.commit(
+            f"tweak: pass {i}",
+            {"a.py": str(i + 2)},
+            body="No constraint stated.",
+            when=days_ago(n),
+        )
+    repo.commit(
+        "feat: B",
+        {"a.py": "6"},
+        body="No constraint stated.",
+        when=days_ago(80),
+    )
+    repo.commit(
+        'Revert "feat: B"',
+        {"a.py": "7"},
+        body="This reverts commit deadbeef.",
+        when=days_ago(75),
+    )
+    for i, n in enumerate([70, 65, 60, 55]):
+        repo.commit(
+            f"tweak: pass2 {i}",
+            {"a.py": str(i + 8)},
+            body="No constraint stated.",
+            when=days_ago(n),
+        )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, roles=("revert",))
+    assert all(not c.is_collapse for c in story.chapters)
+    payload = st.to_dict(story)
+    assert all(not c["is_collapse"] for c in payload["chapters"])
+
+
+def test_to_dict_drops_body_full_chars(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """The JSON surface must not expose ``body_full_chars`` — LLM consumers
+    were treating that count as a relevance proxy and over-weighting verbose
+    commits. ``body_truncated`` remains as the boolean signal."""
+    repo.commit(
+        "hotfix: outage",
+        {"a.py": "1"},
+        body="See #INC-1\n\n" + ("x" * 1500),
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, body_max_chars=200)
+    payload = st.to_dict(story)
+    for chapter_dict in payload["chapters"]:
+        assert "body_full_chars" not in chapter_dict
+        assert "body_truncated" in chapter_dict
+
+
+def test_chapter_cited_by_indices_populated_for_referenced_pivots(
+    repo: RepoBuilder, days_ago: Callable[[int], datetime]
+) -> None:
+    """The cited-target chapter must carry a reverse pointer back to the
+    chapter that cited it — so an LLM reading the older beat sees which later
+    beat picks it up."""
+    sha_a = repo.commit(
+        "feat: initial dispatcher",
+        {"a.py": "1"},
+        body=("Long rationale describing the dispatcher invariants.\n" * 5),
+        when=days_ago(60),
+    )
+    repo.commit(
+        "feat: reconcile dispatcher after profiling",
+        {"a.py": "2"},
+        body=f"This rebuilds {sha_a[:10]} after benchmarking.",
+        when=days_ago(5),
+    )
+    facts = _facts_for(repo, "a.py")
+    story = st.build_story(facts, all_chapters=True)
+    # Find the chapter for A (the cited target) — it must carry a reverse
+    # pointer to B's index.
+    target = next(c for c in story.chapters if c.sha == sha_a)
+    assert target.cited_by_indices, (
+        "cited target chapter must carry a reverse pointer"
+    )
+    src_idx = target.cited_by_indices[0]
+    src = story.chapters[src_idx]
+    assert src.role == "reconciliation"
+    payload = st.to_dict(story)
+    target_dict = next(c for c in payload["chapters"] if c["sha"] == sha_a)
+    assert src_idx in target_dict["cited_by_indices"]
