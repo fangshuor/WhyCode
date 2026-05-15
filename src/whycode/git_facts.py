@@ -1100,6 +1100,59 @@ def is_subject_blind_pivot_commit(commit: Commit) -> bool:
 _SHA_REF_IN_BODY_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.IGNORECASE)
 
 
+# Maps commit-subject prefix token (e.g. "feat", "BUG") to a normalised
+# pivot kind. Covers Conventional Commits (lower-case) and the ALL-CAPS
+# style numpy / scipy / cpython use in subjects. Keys are matched
+# case-sensitively against the captured prefix so "feat" -> feature
+# but "FEAT" wouldn't (numpy uses ENH for that).
+_PIVOT_KIND_MAP: dict[str, str] = {
+    # Conventional Commits
+    "feat": "feature",
+    "fix": "bugfix",
+    "refactor": "refactor",
+    "perf": "perf",
+    "docs": "doc",
+    "style": "style",
+    "test": "test",
+    "chore": "chore",
+    "build": "chore",
+    "ci": "chore",
+    # numpy / scipy / cpython ALL-CAPS style
+    "BUG": "bugfix",
+    "ENH": "feature",
+    "DEP": "deprecate",
+    "DOC": "doc",
+    "STY": "style",
+    "MAINT": "chore",
+    "MNT": "chore",
+    "BLD": "chore",
+    "TST": "test",
+    "REL": "chore",
+}
+
+
+# Anchor at start of subject (post-whitespace), optional ``!`` for breaking,
+# then literal ``:``. The CC ``feat!:`` shape is treated as ``feat`` for
+# pivot_kind purposes; the breaking-marker semantics live in the existing
+# _BREAKING_CC_RE and continue firing as incident-flavoured.
+_PIVOT_KIND_RE = re.compile(
+    r"^\s*(" + "|".join(re.escape(k) for k in _PIVOT_KIND_MAP) + r")\s*!?\s*:",
+)
+
+
+def commit_pivot_kind(commit: Commit) -> str | None:
+    """Return the normalised pivot kind for a commit subject, or None.
+
+    Reads the leading Conventional Commits / numpy-style prefix token; maps
+    via the ``_PIVOT_KIND_MAP``. Returns ``None`` when the subject does not
+    open with a recognised prefix.
+    """
+    m = _PIVOT_KIND_RE.match(commit.subject)
+    if not m:
+        return None
+    return _PIVOT_KIND_MAP.get(m.group(1))
+
+
 _SILENCE_BREAK_DAYS = 180
 
 
@@ -1124,24 +1177,35 @@ class CommitClassification:
     cites_prior_sha: bool = False
     breaks_silence: bool = False
     is_pivot: bool = False
+    pivot_kind: str | None = None
+    """Normalised commit-subject prefix kind: one of ``feature`` / ``bugfix``
+    / ``refactor`` / ``perf`` / ``doc`` / ``style`` / ``test`` / ``chore`` /
+    ``deprecate`` / None. Only meaningful when ``is_pivot`` is True; ``None``
+    means the commit subject didn't carry a recognised prefix."""
 
     @property
     def chapter_role(self) -> str:
         """Single-word narrative-role label used by ``whycode show`` and the
         upcoming ``whycode story``. Priority ladder (first match wins):
-        ``revert`` > ``incident`` > ``reconciliation`` > ``pivot`` >
-        ``invariant`` > ``silence_break`` > ``edit``. ``pivot`` is the
-        "long body explains a structural change the subject does not"
-        chapter — the architectural decisions other detectors miss because
-        the subject reads generic. ``silence_break`` is the "the file
-        slept for half a year, then someone re-touched it" chapter — a
-        narratively distinct beat the other roles do not capture.
-        Reconciliation requires a body cross-reference to a prior known SHA.
+        ``revert`` > ``incident`` > ``deprecate`` > ``reconciliation`` >
+        ``pivot`` > ``invariant`` > ``silence_break`` > ``edit``.
+        Deprecation announcements are decision-grade — they signal a future
+        breakage deliberately — and earn their own chapter role. They sit
+        above ``reconciliation`` because deprecations often precede the
+        refactors that resolve them. ``pivot`` is the "long body explains
+        a structural change the subject does not" chapter — the
+        architectural decisions other detectors miss because the subject
+        reads generic. ``silence_break`` is the "the file slept for half
+        a year, then someone re-touched it" chapter — a narratively
+        distinct beat the other roles do not capture. Reconciliation
+        requires a body cross-reference to a prior known SHA.
         """
         if self.is_revert:
             return "revert"
         if self.incident_flavoured:
             return "incident"
+        if self.is_pivot and self.pivot_kind == "deprecate":
+            return "deprecate"
         if self.cites_prior_sha:
             return "reconciliation"
         if self.is_pivot:
@@ -1198,13 +1262,16 @@ def classify_commit(
         gap_days = (current - prior).days
         if gap_days >= _SILENCE_BREAK_DAYS:
             breaks_silence = True
+    is_pivot = is_subject_blind_pivot_commit(commit)
+    pivot_kind = commit_pivot_kind(commit) if is_pivot else None
     return CommitClassification(
         incident_flavoured=bool(find_incidents([commit])),
         invariant_count=len(extract_invariant_quotes([commit])),
         is_revert=is_revert,
         cites_prior_sha=cites_prior,
         breaks_silence=breaks_silence,
-        is_pivot=is_subject_blind_pivot_commit(commit),
+        is_pivot=is_pivot,
+        pivot_kind=pivot_kind,
     )
 
 
