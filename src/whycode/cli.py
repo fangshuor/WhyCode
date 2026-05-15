@@ -1072,6 +1072,15 @@ def story(
         "--oldest-first",
         help="Render chapters oldest first (causality reads forward).",
     ),
+    decisions_only: bool = typer.Option(
+        False,
+        "--decisions",
+        help=(
+            "Show only decision-grade chapters: revert, incident, deprecate, "
+            "reconciliation, pivot, invariant. Equivalent to "
+            "--roles revert,incident,deprecate,reconciliation,pivot,invariant."
+        ),
+    ),
 ) -> None:
     """Render the file's mindflow — chapters in chronological order."""
     repo_root, rel = _require_tracked(path)
@@ -1085,6 +1094,11 @@ def story(
         role_tuple = tuple(r.strip() for r in roles.split(",") if r.strip())
         if not role_tuple:
             role_tuple = None
+    # ``--decisions`` is a shortcut for the canonical decision-grade
+    # allowlist; explicit ``--roles`` always wins so a user can narrow the
+    # set further (e.g. ``--decisions --roles invariant``).
+    if decisions_only and role_tuple is None:
+        role_tuple = ("revert", "incident", "deprecate", "reconciliation", "pivot", "invariant")
 
     cache = _open_cache(repo_root, no_cache)
     try:

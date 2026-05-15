@@ -1827,3 +1827,88 @@ def test_story_oldest_first_reverses_chapter_order(repo, days_ago) -> None:  # t
     assert timestamps == sorted(timestamps), (
         "with --oldest-first the chapter array must be sorted ascending by authored_at"
     )
+
+
+def test_story_decisions_shortcut_filters_to_decision_roles(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """``--decisions`` is the convenience shortcut for the canonical
+    decision-grade role allowlist. Every kept chapter's ``role`` must be
+    in the decision set; routine ``edit`` chapters must be filtered out.
+
+    Note: the ``revert`` chapter naturally pins its target via the
+    ``This reverts commit <sha>`` body — that pinned target is still kept
+    because pin-by-citation is a hard guarantee on chapter retention; we
+    pick an incident-role target so the pinned chapter is itself
+    decision-grade.
+    """
+    sha_a = repo.commit(
+        "hotfix: original bug",
+        {"a.py": "1"},
+        body="See #INC-0",
+        when=days_ago(60),
+    )
+    repo.revert(sha_a, when=days_ago(55))
+    repo.commit(
+        "tweak: rename helper",
+        {"a.py": "2"},
+        body="No constraint stated; routine refactor.",
+        when=days_ago(40),
+    )
+    repo.commit(
+        "hotfix: pager went off",
+        {"a.py": "3"},
+        body="See #INC-1",
+        when=days_ago(30),
+    )
+    repo.commit(
+        "compat: keep sync path",
+        {"a.py": "4"},
+        body="Do not switch to async — v1 clients break.",
+        when=days_ago(20),
+    )
+    repo.commit(
+        "docs: comment cleanup",
+        {"a.py": "5"},
+        body="No constraint stated.",
+        when=days_ago(5),
+    )
+    result = _invoke(repo.root, "story", "a.py", "--decisions", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    real = [c for c in data["chapters"] if not c["is_collapse"]]
+    assert real, "decisions shortcut must keep at least one chapter"
+    allowed = {"revert", "incident", "deprecate", "reconciliation", "pivot", "invariant"}
+    for c in real:
+        assert c["role"] in allowed, f"unexpected role {c['role']!r} under --decisions"
+    assert not any(c["role"] == "edit" for c in real)
+
+
+def test_story_explicit_roles_overrides_decisions_shortcut(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """``--decisions --roles invariant`` must honour the explicit ``--roles``
+    value: the shortcut is a default, not a floor. With ``--roles invariant``
+    the only non-pinned chapters kept must be ``invariant``. The pin-by-
+    citation pass can still surface a cited target regardless of role, so
+    we use commits whose bodies do not cross-reference each other."""
+    repo.commit(
+        "hotfix: outage",
+        {"a.py": "1"},
+        body="See #INC-1",
+        when=days_ago(60),
+    )
+    repo.commit(
+        "compat: keep sync path",
+        {"a.py": "2"},
+        body="Do not switch to async — v1 clients break.",
+        when=days_ago(20),
+    )
+    result = _invoke(
+        repo.root, "story", "a.py", "--decisions", "--roles", "invariant", "--json"
+    )
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    real = [c for c in data["chapters"] if not c["is_collapse"]]
+    assert real, "expected at least one invariant chapter"
+    # No commit cross-references another — none should be pin-promoted.
+    for c in real:
+        assert c["role"] == "invariant", (
+            f"explicit --roles invariant must override --decisions, got {c['role']!r}"
+        )
