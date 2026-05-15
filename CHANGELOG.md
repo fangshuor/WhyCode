@@ -5,6 +5,77 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.7.3] — 2026-05-15
+
+### Added — three detector / rendering improvements from the deferred backlog
+
+#### Invariant detector recognises standards citations
+
+`extract_invariant_quotes` now treats a body line citing a standards
+document — ``RFC ####``, ``PEP ####``, ``ISO ####``, ``IEEE ####``,
+``W3C ####``, ``GHSA-…``, ``CVE-…`` — as an invariant in its own
+right, even when no free-form invariant token appears alongside.
+
+A standards cite is the explicit "we honour this spec" decision, and
+deviating from it is almost always a real bug. Until 0.7.3 this
+intent slipped through unless the author also happened to write
+``Important:`` / ``Don't`` next to it.
+
+Verified on requests `3331e2a` ("Strip Authorization header whenever
+root URL changes per RFC 7235"): `invariants_stated` went from 0 to 1.
+
+#### Pivot detector: lower body floor when subject signals security
+
+Flask `src/flask/sessions.py` audit on 0.7.2: 82% of chapters were
+`silence_break` despite being a security-critical file with real
+reconciliation history. Reason: most security commits have short
+bodies and don't clear the 200-char `_PIVOT_BODY_MIN_CHARS` floor, so
+they fell through to silence_break/edit.
+
+Fix: when the commit subject contains a security-relevant token
+(``security``, ``auth``, ``crypto``, ``cookie``, ``signed``, ``cert``,
+``tls``, ``ssl``, ``proxy``, ``redirect``, ``header``, ``CVE-``,
+``GHSA-``), the body floor for the subject_blind_pivot detector drops
+from 200 to **80** chars. A commit with subject "fix cookie signing"
+and body length 100 now fires as a pivot; chapter_role becomes
+``pivot`` (which overrides silence_break per the ladder).
+
+Verified on flask sessions.py at `--all` scope (91 chapters):
+silence_break ratio dropped from **82% to 9.9%**.
+
+#### `whycode diff --markdown` collapses sibling-file rows
+
+Jordan persona feedback (0.6.5 deferred): "4 docs/_templates/* share
+the same 'Primary author last active 701 days ago' signal — repetitive
+noise that'll make the junior defensive without telling them anything
+actionable."
+
+The markdown bucket tables now group within each band when ≥2 rows
+share the **exact top-signal headline** AND share at least one
+path-component prefix:
+
+```markdown
+### READ HISTORY FIRST (1 group, 4 files)
+
+| File | Top signal |
+| ---- | ---------- |
+| `docs/_templates/* (4 files)` | Primary author last active 701 days ago |
+```
+
+The JSON output (``--json``) is unchanged — per-file granularity
+preserved for programmatic consumers. Single-row groups, cross-band
+overlaps, and paths without a shared prefix never merge.
+
+Verified on a flask PR-like scenario with 11 sibling ``.rst`` edits
+under ``docs/deploying/``: 3 collapse groups instead of 11 separate
+rows.
+
+### Tests
+
+321 tests passing (was 307 on 0.7.2, +14 new across both PRs). ruff
++ mypy strict clean. No new outbound calls, no new dependency.
+
+
 ## [0.7.2] — 2026-05-15
 
 ### Changed — Top-N ranking is no longer pure newest-first
