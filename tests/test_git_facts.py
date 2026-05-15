@@ -269,6 +269,51 @@ def test_extract_invariant_quotes_caps_at_two_real_invariants(repo) -> None:  # 
     assert "Do not switch to async" in quotes[1][1]
 
 
+def test_extract_invariant_quotes_recognises_rfc_cite_in_body(repo) -> None:  # type: ignore[no-untyped-def]
+    """A body that cites an RFC is an explicit "honour this spec" decision
+    even when no free-form invariant token appears alongside."""
+    body = "Strip Authorization header per RFC 7235 scheme+authority rule."
+    repo.commit("auth: drop header on redirect", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert len(quotes) == 1
+    assert "RFC 7235" in quotes[0][1]
+
+
+def test_extract_invariant_quotes_recognises_pep_and_cve_cites(repo) -> None:  # type: ignore[no-untyped-def]
+    """PEP and CVE cites also fire — both are standards / advisory references
+    that anchor a "we follow this" decision in the body."""
+    repo.commit(
+        "build: respect externally managed env",
+        {"a.py": "1"},
+        body="Follows PEP 668 — pip refuses to install into a system env.",
+    )
+    repo.commit(
+        "auth: patch upstream issue",
+        {"b.py": "1"},
+        body="Per CVE-2024-1234 advisory we now reject zero-length tokens.",
+    )
+    a_quotes = gf.extract_invariant_quotes(
+        gf.commits_for_path(repo.root, "a.py")
+    )
+    b_quotes = gf.extract_invariant_quotes(
+        gf.commits_for_path(repo.root, "b.py")
+    )
+    assert any("PEP 668" in line for _, line in a_quotes)
+    assert any("CVE-2024-1234" in line for _, line in b_quotes)
+
+
+def test_extract_invariant_quotes_ignores_unrelated_4_digit_numbers(repo) -> None:  # type: ignore[no-untyped-def]
+    """A body that mentions a year or a ticket number — without a standards
+    prefix — must not fire as a standards cite; the regex is anchored to the
+    prefix and four free-standing digits are not enough."""
+    body = "Fixed in 2024 by user 1234, see meeting notes for context."
+    repo.commit("docs: note who fixed it", {"x.py": "1"}, body=body)
+    commits = gf.commits_for_path(repo.root, "x.py")
+    quotes = gf.extract_invariant_quotes(commits)
+    assert quotes == []
+
+
 def test_co_changes_excludes_target_file(repo) -> None:  # type: ignore[no-untyped-def]
     repo.commit("init", {"a.txt": "1", "b.txt": "1", "c.txt": "1"})
     repo.commit("change a and b", {"a.txt": "2", "b.txt": "2"})

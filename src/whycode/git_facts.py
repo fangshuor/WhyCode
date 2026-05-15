@@ -134,6 +134,14 @@ _INVARIANT_RE = re.compile(
     ),
     re.IGNORECASE,
 )
+# A commit body line citing an RFC, PEP, or other standards document is
+# strong evidence of an "honour this spec" constraint — even when no
+# free-form invariant token appears alongside. These cites are the explicit
+# "we follow standard X" decisions whose deviation would be a real bug.
+_STANDARDS_CITE_RE = re.compile(
+    r"\b(?:RFC|PEP|ISO|IEEE|W3C|GHSA|CVE)[\s\-]?\d{2,6}\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -1342,6 +1350,11 @@ def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]
     eliminates the meta-mention failure mode where a commit *about* an
     invariant token (e.g. "fix invariant matcher") would self-flag.
 
+    A line also qualifies when it cites a standards document (RFC, PEP, ISO,
+    IEEE, W3C, GHSA, CVE). These cites are the explicit "we honour spec X"
+    decisions whose deviation would be a real bug; firing on them catches
+    the constraints that the free-form token list misses.
+
     Two filters keep pasted tool output out of the "stated invariants"
     surface:
 
@@ -1371,9 +1384,17 @@ def extract_invariant_quotes(commits: Sequence[Commit]) -> list[tuple[str, str]]
                 prev_line = raw_line
                 continue
             prev_line = raw_line
-            if not _INVARIANT_RE.search(line):
+            invariant_hit = _INVARIANT_RE.search(line)
+            standards_hit = _STANDARDS_CITE_RE.search(line)
+            if not invariant_hit and not standards_hit:
                 continue
-            if _all_matches_are_quoted(line, _INVARIANT_RE):
+            # If the only signal is a free-form invariant token AND every
+            # such token is wrapped in quotes, treat it as a meta-mention.
+            # A standards cite alone is never a quote-only reference: it
+            # is unambiguous evidence by itself.
+            if invariant_hit and not standards_hit and _all_matches_are_quoted(
+                line, _INVARIANT_RE
+            ):
                 continue
             if per_commit >= _PER_COMMIT_INVARIANT_CAP:
                 continue
