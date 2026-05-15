@@ -1912,3 +1912,193 @@ def test_story_explicit_roles_overrides_decisions_shortcut(repo, days_ago) -> No
         assert c["role"] == "invariant", (
             f"explicit --roles invariant must override --decisions, got {c['role']!r}"
         )
+
+
+def _seed_three_sibling_templates(repo, days_ago):  # type: ignore[no-untyped-def]
+    """Set up three sibling files under ``docs/_templates/`` whose history
+    fires identical signals (so the markdown collapser has a real cluster
+    to fold). Used by several tests below."""
+    repo.commit(
+        "init",
+        {
+            "docs/_templates/about.html": "a",
+            "docs/_templates/footer.html": "b",
+            "docs/_templates/header.html": "c",
+        },
+        when=days_ago(600),
+    )
+    sha = repo.commit(
+        "feat: rewrite templates",
+        {
+            "docs/_templates/about.html": "a1",
+            "docs/_templates/footer.html": "b1",
+            "docs/_templates/header.html": "c1",
+        },
+        when=days_ago(220),
+    )
+    repo.revert(sha, when=days_ago(210))
+    repo.commit(
+        "hotfix: regression in templates",
+        {
+            "docs/_templates/about.html": "a2",
+            "docs/_templates/footer.html": "b2",
+            "docs/_templates/header.html": "c2",
+        },
+        body="incident #INC-9",
+        when=days_ago(10),
+    )
+
+
+def test_diff_markdown_collapses_siblings_with_same_headline_and_shared_prefix(  # type: ignore[no-untyped-def]
+    repo, days_ago
+) -> None:
+    """Three sibling files under one directory with identical top-signal
+    headlines collapse to a single ``dir/* (N files)`` row."""
+    _seed_three_sibling_templates(repo, days_ago)
+    result = _invoke(repo.root, "diff", "--base", "HEAD~1", "--markdown")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # Collapsed row appears.
+    assert "docs/_templates/* (3 files)" in out, out
+    # The individual paths must NOT appear as bare-path rows of their own.
+    for leaf in ("about.html", "footer.html", "header.html"):
+        bare_row = f"| `docs/_templates/{leaf}` |"
+        assert bare_row not in out, f"individual row leaked: {leaf}\n{out}"
+
+
+def test_diff_markdown_keeps_single_rows_unchanged(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A band with only one file renders the bare path — no ``(N files)``
+    suffix attaches to lone rows."""
+    repo.commit("init", {"refund.py": "0"}, when=days_ago(180))
+    sha = repo.commit("feat: A", {"refund.py": "1"}, when=days_ago(60))
+    repo.revert(sha, when=days_ago(50))
+    repo.commit(
+        "hotfix: regression",
+        {"refund.py": "2"},
+        body="incident #INC-1",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "diff", "--base", "HEAD~3", "--markdown")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # The single-file row is rendered without the count suffix.
+    assert "| `refund.py` |" in out, out
+    assert "refund.py (1 files)" not in out
+    assert "refund.py (1 file)" not in out
+
+
+def test_diff_markdown_does_not_collapse_when_headlines_differ(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """Two files that share a directory but fire different top signals must
+    appear as two separate rows — the collapse key requires headline
+    equality, not just path proximity."""
+    repo.commit(
+        "init",
+        {"pkg/alpha.py": "0", "pkg/beta.py": "0"},
+        when=days_ago(220),
+    )
+    # ``alpha.py``: revert + incident → strong signals from history.
+    sha = repo.commit(
+        "feat: alpha",
+        {"pkg/alpha.py": "1"},
+        when=days_ago(180),
+    )
+    repo.revert(sha, when=days_ago(170))
+    repo.commit(
+        "hotfix: alpha edge case",
+        {"pkg/alpha.py": "2"},
+        body="incident #INC-7",
+        when=days_ago(8),
+    )
+    # ``beta.py``: a single benign edit — different (or no) headline.
+    repo.commit("docs: tweak beta", {"pkg/beta.py": "1"}, when=days_ago(6))
+    result = _invoke(repo.root, "diff", "--base", "HEAD~4", "--markdown")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # The collapsed ``pkg/* (2 files)`` row must not appear — headlines differ.
+    assert "pkg/* (2 files)" not in out, out
+
+
+def test_diff_markdown_does_not_collapse_across_bands(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """Two files in different bands must keep separate rows even if some
+    surface text overlaps — bucket boundaries are walls the collapser will
+    not cross."""
+    repo.commit(
+        "init",
+        {"pkg/alpha.py": "0", "pkg/beta.py": "0"},
+        when=days_ago(220),
+    )
+    # alpha: history-laden → READ HISTORY FIRST band.
+    sha = repo.commit(
+        "feat: alpha",
+        {"pkg/alpha.py": "1"},
+        when=days_ago(180),
+    )
+    repo.revert(sha, when=days_ago(170))
+    repo.commit(
+        "hotfix: regression",
+        {"pkg/alpha.py": "2"},
+        body="incident #INC-7",
+        when=days_ago(8),
+    )
+    # beta: NEWBORN-only → CLEAR band.
+    repo.commit("docs: tweak beta", {"pkg/beta.py": "1"}, when=days_ago(6))
+    result = _invoke(
+        repo.root, "diff", "--base", "HEAD~4", "--markdown", "--show-clear"
+    )
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # No row collapses both into one — they live in different sections.
+    assert "pkg/* (2 files)" not in out, out
+
+
+def test_diff_markdown_does_not_collapse_top_level_files_with_no_common_prefix(  # type: ignore[no-untyped-def]
+    repo, days_ago
+) -> None:
+    """Two top-level files (no directory in their path) must never group —
+    folding them under a synthetic ``*/`` prefix would invent a directory
+    that does not exist on disk."""
+    # Both files share the same history shape (revert + hotfix with incident
+    # body) so their top-signal headlines would otherwise match.
+    repo.commit(
+        "init",
+        {"a.py": "0", "b.py": "0"},
+        when=days_ago(220),
+    )
+    sha = repo.commit(
+        "feat: edits",
+        {"a.py": "1", "b.py": "1"},
+        when=days_ago(180),
+    )
+    repo.revert(sha, when=days_ago(170))
+    repo.commit(
+        "hotfix: regression",
+        {"a.py": "2", "b.py": "2"},
+        body="incident #INC-3",
+        when=days_ago(10),
+    )
+    result = _invoke(repo.root, "diff", "--base", "HEAD~3", "--markdown")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # No synthetic top-level grouping.
+    assert "* (2 files)" not in out, out
+    assert "/* (2 files)" not in out, out
+    # Both files appear as their own rows.
+    assert "| `a.py` |" in out, out
+    assert "| `b.py` |" in out, out
+
+
+def test_diff_json_output_still_contains_every_individual_file(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The collapse is markdown-only — JSON consumers keep full per-file
+    granularity, since downstream tooling parses individual entries."""
+    _seed_three_sibling_templates(repo, days_ago)
+    result = _invoke(repo.root, "diff", "--base", "HEAD~1", "--json")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    all_paths: list[str] = []
+    for _band, rows in data["buckets"].items():
+        for row in rows:
+            all_paths.append(row["path"])
+    for leaf in ("about.html", "footer.html", "header.html"):
+        assert f"docs/_templates/{leaf}" in all_paths, all_paths
+    # And no synthetic group key leaked into JSON.
+    assert not any("*" in p for p in all_paths), all_paths

@@ -328,6 +328,71 @@ def _bucket_header_style(bucket: str) -> str:
     return rc.BAND_STYLE[Band(bucket)]
 
 
+def _card_top_headline(card: rc.RiskCard) -> str:
+    """Return the headline string used in the markdown ``Top signal`` column."""
+    if card.signals:
+        return card.signals[0].headline
+    return "no flags"
+
+
+def _group_sibling_rows(
+    cards: list[rc.RiskCard],
+) -> list[tuple[str, str, int, list[str]]]:
+    """Collapse adjacent cards in one band that share a headline + path prefix.
+
+    Returns a list of (display_path, headline, file_count, paths) tuples. A
+    group with file_count==1 is rendered as a normal single-file row; groups
+    with file_count>=2 produce the ``dir/* (N files)`` collapsed display.
+
+    Two cards group only when:
+    1. Their top-signal headline is exactly equal.
+    2. They share at least one leading path component (so unrelated top-level
+       files never get folded under a synthetic ``*/`` prefix).
+
+    Grouping walks adjacent cards in the supplied order — the caller has
+    already sorted by ``(-score, path)`` so siblings under the same directory
+    sit next to each other and the linear pass catches them.
+    """
+    groups: list[tuple[str, str, int, list[str]]] = []
+    i = 0
+    while i < len(cards):
+        head = _card_top_headline(cards[i])
+        base_parts = cards[i].path.split("/")
+        # A top-level file (no '/') has no directory to share — never start a
+        # group with one; it would otherwise pair with another top-level file
+        # under a non-existent common prefix.
+        if len(base_parts) == 1:
+            groups.append((cards[i].path, head, 1, [cards[i].path]))
+            i += 1
+            continue
+        # Walk forward while the next card shares the headline and at least
+        # one leading path component.
+        j = i + 1
+        common = base_parts[:-1]
+        while j < len(cards) and _card_top_headline(cards[j]) == head:
+            other_parts = cards[j].path.split("/")
+            if len(other_parts) == 1:
+                break
+            new_common: list[str] = []
+            for a, b in zip(common, other_parts[:-1], strict=False):
+                if a == b:
+                    new_common.append(a)
+                else:
+                    break
+            if not new_common:
+                break
+            common = new_common
+            j += 1
+        members = cards[i:j]
+        if len(members) >= 2:
+            prefix = "/".join(common) + "/*"
+            groups.append((prefix, head, len(members), [c.path for c in members]))
+        else:
+            groups.append((cards[i].path, head, 1, [cards[i].path]))
+        i = j if len(members) >= 2 else i + 1
+    return groups
+
+
 @app.command()
 def why(
     path: str = typer.Argument(..., help="File path to inspect."),
@@ -704,16 +769,29 @@ def diff(
                     continue
                 if band == "CLEAR" and not show_clear:
                     continue
-                print(f"### {band} ({len(rows)})")
+                groups = _group_sibling_rows(rows)
+                collapsed_any = any(n >= 2 for _, _, n, _ in groups)
+                if collapsed_any:
+                    # Heading shows both the group count and the file count so
+                    # a reader sees the collapsed shape without losing the
+                    # original "N risky files in this band" anchor.
+                    grp_word = "group" if len(groups) == 1 else "groups"
+                    file_word = "file" if len(rows) == 1 else "files"
+                    print(
+                        f"### {band} "
+                        f"({len(groups)} {grp_word}, {len(rows)} {file_word})"
+                    )
+                else:
+                    print(f"### {band} ({len(rows)})")
                 print()
                 print("| File | Top signal |")
                 print("| ---- | ---------- |")
-                for c in rows:
-                    if c.signals:
-                        top_signal = c.signals[0].headline.replace("|", "\\|")
+                for display, headline, n, _paths in groups:
+                    cell_signal = headline.replace("|", "\\|")
+                    if n >= 2:
+                        print(f"| `{display} ({n} files)` | {cell_signal} |")
                     else:
-                        top_signal = "no flags"
-                    print(f"| `{c.path}` | {top_signal} |")
+                        print(f"| `{display}` | {cell_signal} |")
                 print()
             if clear_n and not show_clear:
                 print(
