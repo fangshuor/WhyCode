@@ -72,6 +72,7 @@ class Chapter:
     files_changed: int = 0
     is_collapse: bool = False
     collapse_count: int = 0
+    is_pinned_by_citation: bool = False
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,7 @@ class _RawChapter:
     invariant_lines: tuple[str, ...]
     files_changed: int
     keep: bool
+    pinned_by_citation: bool = False
 
 
 def _truncate_body(body: str, max_chars: int) -> tuple[str | None, bool, int]:
@@ -271,10 +273,16 @@ def build_story(
          - If ``roles`` is set, only keep chapters whose role is in the
            allowlist (overrides default-drop-edit behavior).
          - Else if ``all_chapters`` is False, drop role==``edit`` chapters.
-    3. Unless ``no_collapse`` is set, fold runs of ≥3 same-role same-author
+    3. Pin-by-citation pass: scan all chapters' ``cited_prior_shas`` and
+       force-keep any chapter whose SHA is referenced from another body.
+       A pinned chapter keeps its original role but is exempt from the
+       default edit-drop, the collapse-run fold, and the ``limit`` cutoff.
+    4. Unless ``no_collapse`` is set, fold runs of ≥3 same-role same-author
        dropped edits between non-edit beats into one collapse marker.
-    4. Truncate the resulting list to ``limit`` (None = no truncation).
-    5. Resolve each reconciliation chapter's cited prior SHAs to chapter
+    5. Truncate the surfaced real chapters to ``limit`` (None = no
+       truncation), preserving every pinned chapter even if it would
+       otherwise be cut.
+    6. Resolve each reconciliation chapter's cited prior SHAs to chapter
        indices in the final list (or omit if the cited chapter was pruned).
 
     The newest-first ordering is the same one ``facts.commits`` already
@@ -333,6 +341,25 @@ def build_story(
             )
         )
 
+    # Pin-by-citation pass: build the set of SHAs referenced by any chapter
+    # body, then force-keep raws whose SHA matches a citation. Without this,
+    # a short-body edit-role commit cited from a reconciliation body would
+    # be pruned and the citation would fall back to a bare SHA instead of
+    # resolving to a chapter index in the final list.
+    cited_shas: set[str] = set()
+    for r in raws:
+        for cited in r.cited_prior_shas:
+            cited_shas.add(cited.lower())
+    if cited_shas:
+        for r in raws:
+            sha_lower = r.sha.lower()
+            if any(
+                sha_lower.startswith(c) or c.startswith(sha_lower)
+                for c in cited_shas
+            ):
+                r.keep = True
+                r.pinned_by_citation = True
+
     if no_collapse:
         # Filter to kept-only and skip the run-fold pass entirely.
         items: list[_RawChapter | tuple[int, str, str]] = [
@@ -376,6 +403,7 @@ def build_story(
                 cited_prior_shas=item.cited_prior_shas,
                 invariant_lines=item.invariant_lines,
                 files_changed=item.files_changed,
+                is_pinned_by_citation=item.pinned_by_citation,
             )
         )
 
@@ -388,22 +416,35 @@ def build_story(
         # ``limit`` caps the count of real (non-collapse) chapters surfaced;
         # collapse markers between kept reals ride along for free so the
         # run-fold context isn't dropped just because the caller capped the
-        # chapter count.
-        taken: list[Chapter] = []
-        non_collapse_kept = 0
-        pending_markers: list[Chapter] = []
-        for ch in materialised:
-            if ch.is_collapse:
-                pending_markers.append(ch)
-                continue
-            if non_collapse_kept < limit:
-                taken.extend(pending_markers)
-                pending_markers.clear()
-                taken.append(ch)
-                non_collapse_kept += 1
-            else:
-                pending_markers.clear()
-        materialised = taken
+        # chapter count. Pinned chapters count against ``limit`` but cannot
+        # be evicted — a ``--top 12`` story with 3 pins surfaces 3 pins + 9
+        # newest non-pinned reals. When the pin count alone exceeds
+        # ``limit``, surface every pin: silently dropping a citation target
+        # would defeat the pinning pass.
+        pinned_count = sum(1 for ch in materialised if ch.is_pinned_by_citation)
+        if pinned_count >= limit:
+            materialised = [ch for ch in materialised if ch.is_pinned_by_citation]
+        else:
+            remaining = limit - pinned_count
+            taken: list[Chapter] = []
+            non_pinned_real_kept = 0
+            pending_markers: list[Chapter] = []
+            for ch in materialised:
+                if ch.is_collapse:
+                    pending_markers.append(ch)
+                    continue
+                if ch.is_pinned_by_citation:
+                    taken.extend(pending_markers)
+                    pending_markers.clear()
+                    taken.append(ch)
+                elif non_pinned_real_kept < remaining:
+                    taken.extend(pending_markers)
+                    pending_markers.clear()
+                    taken.append(ch)
+                    non_pinned_real_kept += 1
+                else:
+                    pending_markers.clear()
+            materialised = taken
 
     # Resolve cited prior SHAs to indices in the final, post-truncation list.
     chapter_shas: list[str | None] = [ch.sha for ch in materialised]
@@ -427,6 +468,7 @@ def build_story(
                     files_changed=ch.files_changed,
                     is_collapse=ch.is_collapse,
                     collapse_count=ch.collapse_count,
+                    is_pinned_by_citation=ch.is_pinned_by_citation,
                 )
             )
         else:
@@ -521,6 +563,8 @@ def render_text(story: Story) -> Group:
         block.append(_format_authored_at(ch.authored_at), style="dim")
         if ch.author:
             block.append(f"  ·  {ch.author}", style="dim")
+        if ch.is_pinned_by_citation:
+            block.append("  ·  (pinned)", style="dim")
         block.append("\n")
         block.append(f'"{ch.subject}"', style="italic")
         if ch.body_excerpt:
@@ -575,6 +619,7 @@ def to_dict(
                 "files_changed": ch.files_changed,
                 "is_collapse": ch.is_collapse,
                 "collapse_count": ch.collapse_count,
+                "is_pinned_by_citation": ch.is_pinned_by_citation,
             }
         )
     # ``chapters_returned`` counts real (non-collapse) chapters present in
@@ -620,7 +665,8 @@ def render_markdown(story: Story) -> str:
         sha = _short_sha(ch.sha)
         date = _format_authored_at(ch.authored_at)
         author = f" · {ch.author}" if ch.author else ""
-        lines.append(f"## [{ch.role}] {sha} · {date}{author}")
+        pinned = " · _(pinned)_" if ch.is_pinned_by_citation else ""
+        lines.append(f"## [{ch.role}] {sha} · {date}{author}{pinned}")
         lines.append("")
         lines.append(f'"{ch.subject}"')
         if ch.body_excerpt:
