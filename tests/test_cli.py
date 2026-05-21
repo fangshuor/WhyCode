@@ -2110,3 +2110,107 @@ def test_diff_json_output_still_contains_every_individual_file(repo, days_ago) -
         assert f"docs/_templates/{leaf}" in all_paths, all_paths
     # And no synthetic group key leaked into JSON.
     assert not any("*" in p for p in all_paths), all_paths
+
+
+# ---- hotspots command (sub-file drill-down) -------------------------------
+
+
+def _seed_hotspot_repo(repo, days_ago) -> str:  # type: ignore[no-untyped-def]
+    """Build a small repo where a recognisable region absorbs reverts +
+    an incident-tagged hotfix. Returns the relative file path."""
+    lines = [f"line {i}" for i in range(1, 201)]
+    lines[99] = "def prepare_body(self, data, files, json):"
+    lines[100] = "    # critical region"
+    repo.commit(
+        "init refund flow",
+        {"refund.py": "\n".join(lines) + "\n"},
+        when=days_ago(120),
+    )
+    for i, day in enumerate((100, 80, 60), start=1):
+        lines[99] = f"def prepare_body(self, data{i}, files, json):"
+        lines[100] = f"    # critical region rev{i}"
+        repo.commit(
+            f"refactor prepare_body pass {i}",
+            {"refund.py": "\n".join(lines) + "\n"},
+            when=days_ago(day),
+        )
+    lines[99] = "def prepare_body(self, data_v4, files, json, headers):"
+    bad_sha = repo.commit(
+        "tweak prepare_body signature",
+        {"refund.py": "\n".join(lines) + "\n"},
+        when=days_ago(40),
+    )
+    repo.revert(bad_sha, when=days_ago(35))
+    lines[99] = "def prepare_body(self, data_v5, files, json):"
+    lines[100] = "    # critical region after hotfix #401"
+    repo.commit(
+        "hotfix: refund regression in prepare_body",
+        {"refund.py": "\n".join(lines) + "\n"},
+        body="incident #401",
+        when=days_ago(10),
+    )
+    return "refund.py"
+
+
+def test_hotspots_command_renders_text_table(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    rel = _seed_hotspot_repo(repo, days_ago)
+    result = _invoke(repo.root, "hotspots", rel)
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "Hotspots inside" in out
+    assert rel in out
+    # The table headers must surface.
+    for column in ("rank", "lines", "touches", "reverts", "incidents", "anchor"):
+        assert column in out, out
+    # The seeded region's anchor — ``prepare_body`` — must appear.
+    assert "prepare_body" in out, out
+
+
+def test_hotspots_command_emits_json_with_expected_keys(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    rel = _seed_hotspot_repo(repo, days_ago)
+    result = _invoke(repo.root, "hotspots", rel, "--json")
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["path"] == rel
+    assert isinstance(payload["hotspots"], list)
+    assert payload["hotspots"], payload
+    first = payload["hotspots"][0]
+    for key in (
+        "rank",
+        "line_start",
+        "line_end",
+        "touch_count",
+        "revert_count",
+        "incident_count",
+        "score",
+        "sample_shas",
+        "anchor",
+    ):
+        assert key in first, (key, first)
+    # head_sha is a string (or None when git failed; not the case here).
+    assert isinstance(payload["head_sha"], str)
+
+
+def test_why_card_appends_hotspot_subblock_when_qualifying_band_exists(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """The Risk Card text rendering must append the new 'Hotspots — read
+    these line ranges first' sub-block when at least one band carries a
+    revert or incident overlap."""
+    rel = _seed_hotspot_repo(repo, days_ago)
+    result = _invoke(repo.root, "why", rel)
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "Hotspots" in out, out
+    assert "read these line ranges first" in out, out
+    # The anchor for the seeded region appears in the sub-block.
+    assert "prepare_body" in out, out
+
+
+def test_why_card_no_hotspots_subblock_when_no_signals(repo, days_ago) -> None:  # type: ignore[no-untyped-def]
+    """A clean file should not grow a Hotspots sub-block: the spec says
+    suppress when there are zero signals on the card."""
+    repo.commit("init", {"calm.py": "1\n"}, when=days_ago(500))
+    repo.commit("typo", {"calm.py": "2\n"}, when=days_ago(400))
+    result = _invoke(repo.root, "why", "calm.py")
+    assert result.exit_code == 0, result.output
+    # No flagged signals → no Hotspots tail.
+    assert "Hotspots — read" not in result.output, result.output

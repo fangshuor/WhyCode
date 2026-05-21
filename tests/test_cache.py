@@ -388,3 +388,65 @@ def test_open_creates_nested_dirs(tmp_path: Path, missing_path: str) -> None:
         assert target.exists()
     finally:
         store.close()
+
+
+# ---- commit_hunks table (sub-file hotspots) -------------------------------
+
+
+def test_commit_hunks_table_persists_across_runs(tmp_path: Path) -> None:
+    """The commit_hunks table must survive a close/reopen and a sentinel
+    row must distinguish 'we ran the parse, no hunks' from 'never ran'."""
+    rows = [
+        ("a" * 40, 100, 5, 90, 4),
+        ("a" * 40, 200, 2, 180, 1),
+        ("b" * 40, 100, 1, 95, 1),
+    ]
+    head = "f" * 40
+    with ch.open_for(tmp_path) as store:
+        store.store_hunks("refund.py", head, rows)
+    # Reopen the same on-disk database and confirm rows survive.
+    with ch.open_for(tmp_path) as store2:
+        fetched = store2.fetch_hunks("refund.py", head)
+        assert fetched is not None
+        assert len(fetched) == 3
+        assert fetched[0] == ("a" * 40, 100, 5, 90, 4)
+        # A never-stored (path, head) returns None, NOT an empty list.
+        assert store2.fetch_hunks("other.py", head) is None
+        # An explicitly stored empty list returns ``[]``, distinguishing
+        # "we know there are no hunks" from "we never ran the parse".
+        store2.store_hunks("binary.bin", head, [])
+        assert store2.fetch_hunks("binary.bin", head) == []
+
+
+def test_schema_bump_drops_and_recreates(tmp_path: Path) -> None:
+    """When SCHEMA_VERSION advances past what's on disk, the loader must
+    drop the existing schema and rebuild — including the new tables."""
+    # Build a v1-style cache by hand: only the v1 tables, pinned to v1.
+    db_path = ch.cache_path_for(tmp_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "CREATE TABLE commits (sha TEXT PRIMARY KEY, author_name TEXT, "
+            "author_email TEXT, authored_at TEXT, subject TEXT, body TEXT);"
+            "CREATE TABLE commit_files (sha TEXT, path TEXT, insertions INTEGER, "
+            "deletions INTEGER, PRIMARY KEY (sha, path));"
+            "INSERT INTO meta(key, value) VALUES('schema_version', '1');"
+            "INSERT INTO commits(sha, author_name, author_email, authored_at, "
+            "subject, body) VALUES('old', 'x', 'x@y', '2026-05-01T00:00:00+00:00', "
+            "'old commit', '');"
+        )
+    # Reopen via CacheStore; the schema bump should drop and rebuild.
+    with ch.open_for(tmp_path) as store:
+        assert store.schema_version == ch.SCHEMA_VERSION
+        # The old commit must not survive a drop-and-recreate rebuild.
+        assert not store.has_commit("old")
+        # The new commit_hunks table must exist after the rebuild.
+        with sqlite3.connect(db_path) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        assert "commit_hunks" in tables

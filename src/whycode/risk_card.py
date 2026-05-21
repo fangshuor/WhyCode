@@ -18,6 +18,7 @@ from rich.table import Table
 from rich.text import Text
 
 from whycode import git_facts as gf
+from whycode import hotspots as hs
 from whycode import signals as sig
 from whycode import suppressions as supp
 from whycode.scorer import Band, Score, score
@@ -48,11 +49,22 @@ class RiskCard:
     decisions: tuple[Decision, ...] = ()
     """L3 — LLM-extracted structured decisions. Empty unless ``--llm`` was on."""
 
+    hotspots: tuple[hs.Hotspot, ...] = ()
+    """Sub-file hotspots, top-3 only when at least one band qualifies. Empty
+    in JSON output and on cards with zero signals; populated on the render
+    path so the terminal sub-block has data without re-walking git."""
+
     def with_decisions(self, decisions: tuple[Decision, ...]) -> RiskCard:
         """Return a copy with the L3 ``decisions`` field populated."""
         from dataclasses import replace
 
         return replace(self, decisions=decisions)
+
+    def with_hotspots(self, hotspots: tuple[hs.Hotspot, ...]) -> RiskCard:
+        """Return a copy with the ``hotspots`` field populated."""
+        from dataclasses import replace
+
+        return replace(self, hotspots=hotspots)
 
     def to_dict(self, *, explain: bool = False) -> dict[str, Any]:
         """Render the card as a JSON-friendly dict.
@@ -126,13 +138,27 @@ def build(
     the same repo (e.g. inside ``scan`` or ``diff``) share a warm cache.
     """
     facts = gf.gather(repo_root, path, max_commits=max_commits, ref=ref, cache=cache)
-    return _from_facts(
+    card = _from_facts(
         path=path,
         facts=facts,
         repo_root=repo_root,
         ref=ref,
         apply_suppressions=apply_suppressions,
     )
+    # Historical views (``ref`` set) and signal-less cards skip the
+    # sub-file roll-up — the audit gates hotspots on at-least-one-signal
+    # and at-current-HEAD. ``scan`` paths that build via
+    # :func:`build_from_diff_facts` also skip, by design: surfacing per-file
+    # bands across a thousand-file scan would balloon git output.
+    if ref is None and card.signals:
+        try:
+            bands = hs.build_hotspots(repo_root, path, top=3, cache=cache)
+        except gf.GitError:
+            bands = []
+        qualifying = tuple(b for b in bands if (b.revert_count + b.incident_count) > 0)
+        if qualifying:
+            card = card.with_hotspots(qualifying[:3])
+    return card
 
 
 def build_from_diff_facts(
@@ -369,6 +395,34 @@ def _narrative_summary(card: RiskCard) -> Text:
     return summary
 
 
+def _hotspots_block(hotspots: tuple[hs.Hotspot, ...]) -> Padding:
+    """Render the sub-file hotspots tail of a Risk Card.
+
+    Three lines cap. Each line names a line range, the count of touches
+    plus the dominant evidence (reverts or incidents, whichever is larger),
+    and the anchor source line so a reader knows which function to open.
+    """
+    body = Text()
+    body.append("Hotspots — read these line ranges first:", style="bold")
+    for h in hotspots:
+        body.append("\n  · ")
+        body.append(f"lines {h.line_start}-{h.line_end}", style="bold")
+        # Pick the dominant evidence to surface inline: reverts outrank
+        # incidents when tied because a revert is unambiguous rollback.
+        if h.revert_count >= h.incident_count and h.revert_count > 0:
+            evidence = f"{h.revert_count} revert{'s' if h.revert_count != 1 else ''}"
+        else:
+            evidence = f"{h.incident_count} incident{'s' if h.incident_count != 1 else ''}"
+        body.append(
+            f"  ({h.touch_count} touches, {evidence})",
+            style="dim",
+        )
+        if h.anchor:
+            body.append("  ")
+            body.append(h.anchor, style="italic")
+    return Padding(body, (1, 1, 0, 1))
+
+
 def render_text(card: RiskCard, *, explain: bool = False) -> Group:
     extra_context = card.most_recent_sha or ""
     pieces: list[Any] = [
@@ -379,6 +433,8 @@ def render_text(card: RiskCard, *, explain: bool = False) -> Group:
             (0, 1, 0, 1),
         ),
     ]
+    if card.hotspots:
+        pieces.append(_hotspots_block(card.hotspots))
     if card.decisions:
         pieces.append(_decisions_block(card.decisions))
     return Group(*pieces)
