@@ -1031,3 +1031,86 @@ def test_newborn_has_no_next_step(repo, now) -> None:  # type: ignore[no-untyped
     assert signal is not None
     # Brief: not enough history to recommend anything.
     assert signal.next_step is None
+
+
+# ---- cross-file rename normalisation in detect_coupling -------------------
+
+
+def test_detect_coupling_merges_pre_and_post_rename_counts(
+    repo, days_ago, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """When the same physical file shows up under both its old and new
+    name in the co-change index, the merged counter must add the counts
+    and surface a single row under the post-rename name — otherwise the
+    file's true co-change rank stays buried split between two rows.
+    """
+    for i in range(4):
+        repo.commit(
+            f"step {i}",
+            {"src/x/core.py": str(i), "src/x/types.py": str(i)},
+            when=days_ago(60 - i * 5),
+        )
+    facts = _facts_for(repo, "src/x/core.py")
+    # Inject a co-change map where ``utils/helpers.py`` (old path) and
+    # ``src/x/helpers.py`` (new path) both refer to the same physical file.
+    facts = gf.RepoFacts(
+        path=facts.path,
+        repo_root=facts.repo_root,
+        commits=facts.commits,
+        co_changed_files={
+            "utils/helpers.py": 4,
+            "src/x/helpers.py": 5,
+            "src/x/types.py": facts.co_changed_files.get("src/x/types.py", 3),
+        },
+        revert_pairs=facts.revert_pairs,
+        incident_commits=facts.incident_commits,
+        invariant_quotes=facts.invariant_quotes,
+        cache=facts.cache,
+    )
+    # Pretend the rename log resolved utils/helpers.py → src/x/helpers.py.
+    # Also feed src/x/helpers.py into the tracked-paths set so it is not
+    # filtered as a path that no longer exists at HEAD.
+    monkeypatch.setattr(
+        gf,
+        "build_rename_map",
+        lambda repo_root, cache=None: {"utils/helpers.py": "src/x/helpers.py"},
+    )
+    monkeypatch.setattr(
+        sig,
+        "_tracked_paths_at_head",
+        lambda repo_root: frozenset(
+            {"src/x/core.py", "src/x/types.py", "src/x/helpers.py"}
+        ),
+    )
+    signal = sig.detect_coupling(facts)
+    assert signal is not None
+    # Two entries (utils/helpers.py 4 + src/x/helpers.py 5) collapsed to
+    # one row at 9; the old name itself must not appear.
+    assert "utils/helpers.py" not in signal.detail
+    assert "src/x/helpers.py" in signal.detail
+    assert "(x9)" in signal.detail
+    # Exactly two distinct file rows in the output (helpers + types).
+    assert signal.detail.count("(x") == 2
+
+
+def test_detect_coupling_falls_back_gracefully_on_git_error(
+    repo, days_ago, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """An empty rename map means coupling behaves exactly as today —
+    no folding, no merging, no surprises."""
+    for i in range(4):
+        repo.commit(
+            f"step {i}",
+            {"src/x/core.py": str(i), "src/x/types.py": str(i)},
+            when=days_ago(60 - i * 5),
+        )
+    facts = _facts_for(repo, "src/x/core.py")
+    # Force the rename map to be empty (simulating a git error inside
+    # build_rename_map). The detector must still produce the same coupling
+    # signal as before the fold was wired in.
+    monkeypatch.setattr(
+        gf, "build_rename_map", lambda repo_root, cache=None: {}
+    )
+    signal = sig.detect_coupling(facts)
+    assert signal is not None
+    assert "src/x/types.py" in signal.detail
