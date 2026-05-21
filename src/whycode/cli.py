@@ -38,6 +38,7 @@ from rich.table import Table
 from whycode import __version__
 from whycode import cache as ch
 from whycode import git_facts as gf
+from whycode import hotspots as hs
 from whycode import ignore as ign
 from whycode import risk_card as rc
 from whycode import signals as sig
@@ -1223,6 +1224,95 @@ def story(
         print(st.render_markdown(s), end="")
         return
     console.print(st.render_text(s))
+
+
+@app.command()
+def hotspots(
+    path: str = typer.Argument(
+        ...,
+        help="File path to analyse for sub-file risk concentrations.",
+    ),
+    top: int = typer.Option(5, "--top", help="Show at most this many bands."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table."
+    ),
+    min_touches: int = typer.Option(
+        2,
+        "--min-touches",
+        help="Drop bands touched by fewer commits than this (default 2).",
+    ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="ISO date (2024-01-01) or git ref; only consider commits after.",
+    ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Bypass the local SQLite cache at .whycode/cache.db.",
+    ),
+) -> None:
+    """List the riskiest line bands inside a single file.
+
+    Drill-down companion to ``whycode why``: same evidence (commits, reverts,
+    incident commits), but projected onto hunk-clustered line bands so a
+    reader can ask "which functions inside this 2000-line file absorbed
+    the risk?". Use after the file-level card flags HANDLE WITH CARE or
+    READ HISTORY FIRST.
+    """
+    repo_root, rel = _require_tracked(path)
+    since_dt: datetime | None = None
+    if since is not None:
+        since_dt = _resolve_since(repo_root, since)
+    cache = _open_cache(repo_root, no_cache)
+    try:
+        bands = hs.build_hotspots(
+            repo_root,
+            rel,
+            top=top,
+            min_touches=min_touches,
+            since=since_dt,
+            cache=cache,
+        )
+        try:
+            head_sha = gf.run_git(repo_root, "rev-parse", "HEAD").strip()[:12]
+        except gf.GitError:
+            head_sha = None
+    finally:
+        if cache is not None:
+            cache.close()
+
+    if json_out:
+        payload = hs.to_json_payload(path=rel, head_sha=head_sha, hotspots=bands)
+        console.print_json(json.dumps(payload))
+        return
+
+    if not bands:
+        console.print(
+            f"[green]No qualifying hotspots in {rel}.[/green] "
+            f"[dim]Either every region was touched fewer than {min_touches} "
+            f"time(s), or the file has no recorded hunks.[/dim]"
+        )
+        return
+
+    table = Table(title=f"Hotspots inside {rel}")
+    table.add_column("rank", justify="right")
+    table.add_column("lines")
+    table.add_column("touches", justify="right")
+    table.add_column("reverts", justify="right")
+    table.add_column("incidents", justify="right")
+    table.add_column("anchor")
+    for rank, band in enumerate(bands, start=1):
+        anchor = band.anchor or "[dim](no source line at HEAD)[/dim]"
+        table.add_row(
+            str(rank),
+            f"{band.line_start}-{band.line_end}",
+            str(band.touch_count),
+            str(band.revert_count),
+            str(band.incident_count),
+            anchor,
+        )
+    console.print(table)
 
 
 @app.command()
