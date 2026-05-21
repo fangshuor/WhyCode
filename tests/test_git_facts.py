@@ -2,7 +2,56 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+
 from whycode import git_facts as gf
+
+
+def _git_mv(repo_root, old: str, new: str) -> None:
+    """Helper: ``git mv`` then commit the rename so it shows as ``R<score>``."""
+    subprocess.run(
+        ["git", "-C", str(repo_root), "mv", old, new],
+        check=True,
+        capture_output=True,
+    )
+    env = os.environ.copy()
+    env.update({
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    })
+    subprocess.run(
+        ["git", "-C", str(repo_root), "commit", "--no-gpg-sign", "-q", "-m",
+         f"rename {old} to {new}"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def _git_rm(repo_root, path: str) -> None:
+    """Helper: ``git rm`` then commit the deletion."""
+    subprocess.run(
+        ["git", "-C", str(repo_root), "rm", path],
+        check=True,
+        capture_output=True,
+    )
+    env = os.environ.copy()
+    env.update({
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    })
+    subprocess.run(
+        ["git", "-C", str(repo_root), "commit", "--no-gpg-sign", "-q", "-m",
+         f"remove {path}"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
 
 
 def test_discover_repo_root(repo) -> None:  # type: ignore[no-untyped-def]
@@ -580,3 +629,97 @@ def test_load_diff_facts_max_commits_caps_per_path(repo) -> None:  # type: ignor
 
     facts = gf.load_diff_facts(repo.root, max_commits=2)
     assert len(facts.commits_by_path["a.py"]) == 2
+
+
+# ---- build_rename_map ------------------------------------------------------
+
+
+def test_build_rename_map_resolves_simple_rename(repo) -> None:  # type: ignore[no-untyped-def]
+    """A single ``git mv a.py b.py`` registers an ``a.py → b.py`` mapping
+    while ``b.py`` (already at its terminal name) is absent from the map."""
+    # Clear any process-local lru memoisation between repos.
+    gf._build_rename_map_at_head.cache_clear()
+    repo.commit("init", {"a.py": "x = 1\n"})
+    _git_mv(repo.root, "a.py", "b.py")
+    rmap = gf.build_rename_map(repo.root)
+    assert rmap.get("a.py") == "b.py"
+    assert "b.py" not in rmap
+
+
+def test_build_rename_map_chains_terminal_name(repo) -> None:  # type: ignore[no-untyped-def]
+    """A chain ``a.py → b.py → c.py`` collapses to terminal ``c.py``
+    under both pre-rename keys."""
+    gf._build_rename_map_at_head.cache_clear()
+    repo.commit("init", {"a.py": "x = 1\n"})
+    _git_mv(repo.root, "a.py", "b.py")
+    _git_mv(repo.root, "b.py", "c.py")
+    rmap = gf.build_rename_map(repo.root)
+    assert rmap.get("a.py") == "c.py"
+    assert rmap.get("b.py") == "c.py"
+    assert "c.py" not in rmap
+
+
+def test_build_rename_map_drops_renames_to_deleted_files(repo) -> None:  # type: ignore[no-untyped-def]
+    """When the terminal new name has since been deleted, the mapping is
+    dropped: following it would point a reader at a non-existent file."""
+    gf._build_rename_map_at_head.cache_clear()
+    repo.commit("init", {"a.py": "x = 1\n"})
+    _git_mv(repo.root, "a.py", "b.py")
+    _git_rm(repo.root, "b.py")
+    rmap = gf.build_rename_map(repo.root)
+    # Both pre- and post-rename names are gone from HEAD, so neither
+    # should surface as a resolvable target.
+    assert rmap == {}
+
+
+def test_build_rename_map_handles_rename_back_and_forth(repo) -> None:  # type: ignore[no-untyped-def]
+    """A ``a.py → b.py → a.py`` round-trip leaves a sensible terminal map:
+    ``b.py → a.py`` (b.py was an interim state, a.py is the terminal name).
+    """
+    gf._build_rename_map_at_head.cache_clear()
+    repo.commit("init", {"a.py": "x = 1\n"})
+    _git_mv(repo.root, "a.py", "b.py")
+    _git_mv(repo.root, "b.py", "a.py")
+    rmap = gf.build_rename_map(repo.root)
+    assert rmap.get("b.py") == "a.py"
+    # The a.py entry depends on chain compression — newest record wins,
+    # but since a.py is the terminal name itself, the map's contract is
+    # "a.py is at HEAD" rather than "a.py needs resolving". Either no
+    # entry for a.py at all, or a.py → a.py, is acceptable. We document
+    # the current behaviour (newest record overrides a self-loop):
+    if "a.py" in rmap:
+        assert rmap["a.py"] == "a.py"
+
+
+def test_build_rename_map_uses_cache_when_present(repo) -> None:  # type: ignore[no-untyped-def]
+    """A second invocation under the same HEAD must serve from the cache
+    rather than re-shelling-out to git log."""
+    from whycode import cache as ch
+    gf._build_rename_map_at_head.cache_clear()
+    repo.commit("init", {"a.py": "x = 1\n"})
+    _git_mv(repo.root, "a.py", "b.py")
+    with ch.open_for(repo.root) as store:
+        first = gf.build_rename_map(repo.root, cache=store)
+        # Plant a sentinel in the cache that would corrupt a real git walk
+        # but is invisible to the in-process lru_cache. The second read
+        # must come from the SQLite layer.
+        gf._build_rename_map_at_head.cache_clear()
+        store._conn.execute(
+            "INSERT OR REPLACE INTO rename_map(head_sha, old_path, new_path) "
+            "VALUES (?, ?, ?)",
+            (store.head_sha or gf.run_git(repo.root, "rev-parse", "HEAD").strip(),
+             "sentinel.py", "marker.py"),
+        )
+        store._conn.commit()
+        second = gf.build_rename_map(repo.root, cache=store)
+    assert first.get("a.py") == "b.py"
+    assert second.get("sentinel.py") == "marker.py"
+
+
+def test_build_rename_map_empty_on_repo_with_no_renames(repo) -> None:  # type: ignore[no-untyped-def]
+    """A repo with zero rename history yields an empty map (not an error)."""
+    gf._build_rename_map_at_head.cache_clear()
+    repo.commit("init", {"a.py": "1"})
+    repo.commit("tweak", {"a.py": "2"})
+    rmap = gf.build_rename_map(repo.root)
+    assert rmap == {}

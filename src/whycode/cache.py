@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CACHE_DIRNAME = ".whycode"
 CACHE_FILENAME = "cache.db"
 
@@ -105,11 +105,23 @@ CREATE TABLE IF NOT EXISTS commit_hunks (
     old_count INTEGER NOT NULL
 );
 
+-- Whole-repo rename map keyed on HEAD: every historically-known path
+-- mapping to its terminal (current-HEAD) name. Built once per HEAD by
+-- ``git_facts.build_rename_map`` and reused across every coupling
+-- query that runs against the same snapshot.
+CREATE TABLE IF NOT EXISTS rename_map (
+    head_sha  TEXT NOT NULL,
+    old_path  TEXT NOT NULL,
+    new_path  TEXT NOT NULL,
+    PRIMARY KEY (head_sha, old_path)
+);
+
 CREATE INDEX IF NOT EXISTS idx_commit_files_path ON commit_files(path);
 CREATE INDEX IF NOT EXISTS idx_commits_authored_at ON commits(authored_at);
 CREATE INDEX IF NOT EXISTS idx_path_log_path_head ON path_log(path, head_sha);
 CREATE INDEX IF NOT EXISTS idx_commit_hunks_path_head
     ON commit_hunks(path, head_sha);
+CREATE INDEX IF NOT EXISTS idx_rename_map_head ON rename_map(head_sha);
 """
 
 
@@ -190,6 +202,7 @@ class CacheStore:
             # per-version migration ladder would have to stay correct across
             # every future bump.
             self._conn.executescript(
+                "DROP TABLE IF EXISTS rename_map;"
                 "DROP TABLE IF EXISTS commit_hunks;"
                 "DROP TABLE IF EXISTS line_ownership;"
                 "DROP TABLE IF EXISTS path_log;"
@@ -288,6 +301,7 @@ class CacheStore:
             self._conn.execute("DELETE FROM path_log")
             self._conn.execute("DELETE FROM line_ownership")
             self._conn.execute("DELETE FROM commit_hunks")
+            self._conn.execute("DELETE FROM rename_map")
             self._conn.execute("DELETE FROM meta WHERE key != 'schema_version'")
 
     # ---- path log (rename-resolved per-path SHA list) --------------------
@@ -432,6 +446,46 @@ class CacheStore:
                 ],
             )
         self._set_meta(f"hunks_known:{head_sha}:{path}", "1")
+
+    # ---- rename map (whole-repo, keyed on HEAD) ---------------------------
+
+    def fetch_rename_map(self, head_sha: str) -> dict[str, str] | None:
+        """Return the cached rename map for ``head_sha``, or ``None`` on miss.
+
+        ``None`` means we have never resolved a map at this HEAD; an empty
+        dict means the resolution ran and produced no entries (a repo with
+        no rename history). The sentinel meta marker distinguishes the two
+        so we never re-walk just to discover the absence of renames.
+        """
+        cur = self._conn.execute(
+            "SELECT old_path, new_path FROM rename_map WHERE head_sha = ?",
+            (head_sha,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            sentinel = self._get_meta(f"rename_map_known:{head_sha}")
+            if sentinel == "1":
+                return {}
+            return None
+        return {str(r["old_path"]): str(r["new_path"]) for r in rows}
+
+    def store_rename_map(self, head_sha: str, mapping: dict[str, str]) -> None:
+        """Persist the resolved rename map keyed on ``head_sha``.
+
+        Replaces any existing rows for that HEAD so a re-resolution after a
+        history rewrite never leaves stale entries behind.
+        """
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM rename_map WHERE head_sha = ?", (head_sha,)
+            )
+            if mapping:
+                self._conn.executemany(
+                    "INSERT INTO rename_map(head_sha, old_path, new_path) "
+                    "VALUES(?, ?, ?)",
+                    [(head_sha, old, new) for old, new in mapping.items()],
+                )
+        self._set_meta(f"rename_map_known:{head_sha}", "1")
 
     # ---- reads ------------------------------------------------------------
 

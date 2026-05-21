@@ -450,3 +450,92 @@ def test_schema_bump_drops_and_recreates(tmp_path: Path) -> None:
                 )
             }
         assert "commit_hunks" in tables
+
+
+# ---- rename_map table (cross-file rename normalisation) ------------------
+
+
+def test_rename_map_round_trips_through_cache_store(tmp_path: Path) -> None:
+    """Stored maps come back out under the same HEAD; identity is preserved."""
+    head_sha = "f" * 40
+    mapping = {
+        "flask/helpers.py": "src/flask/helpers.py",
+        "flask/app.py": "src/flask/app.py",
+    }
+    with ch.open_for(tmp_path) as store:
+        # Before store: cache miss returns None (never resolved at this HEAD).
+        assert store.fetch_rename_map(head_sha) is None
+        store.store_rename_map(head_sha, mapping)
+        fetched = store.fetch_rename_map(head_sha)
+        assert fetched == mapping
+        # A different HEAD has no entry yet.
+        assert store.fetch_rename_map("0" * 40) is None
+
+
+def test_rename_map_empty_store_returns_empty_dict_not_none(tmp_path: Path) -> None:
+    """Storing an empty mapping must return ``{}`` (we resolved, found nothing)
+    rather than ``None`` (which means we never resolved) — otherwise every
+    repo with no renames re-walks the rename log on every invocation."""
+    head_sha = "f" * 40
+    with ch.open_for(tmp_path) as store:
+        store.store_rename_map(head_sha, {})
+        assert store.fetch_rename_map(head_sha) == {}
+
+
+def test_rename_map_replaces_existing_rows_for_same_head(tmp_path: Path) -> None:
+    """Re-storing under the same HEAD wholly replaces any prior rows."""
+    head_sha = "f" * 40
+    with ch.open_for(tmp_path) as store:
+        store.store_rename_map(head_sha, {"old.py": "new.py", "x.py": "y.py"})
+        store.store_rename_map(head_sha, {"old.py": "newer.py"})
+        fetched = store.fetch_rename_map(head_sha)
+        assert fetched == {"old.py": "newer.py"}
+
+
+def test_schema_bump_2_to_3_drops_and_rebuilds(tmp_path: Path) -> None:
+    """A v2 cache on disk must be dropped and rebuilt as v3 when reopened;
+    the new rename_map table must exist after the rebuild."""
+    db_path = ch.cache_path_for(tmp_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "CREATE TABLE commits (sha TEXT PRIMARY KEY, author_name TEXT, "
+            "author_email TEXT, authored_at TEXT, subject TEXT, body TEXT);"
+            "CREATE TABLE commit_files (sha TEXT, path TEXT, insertions INTEGER, "
+            "deletions INTEGER, PRIMARY KEY (sha, path));"
+            "CREATE TABLE path_log (path TEXT, head_sha TEXT, position INTEGER, "
+            "sha TEXT, PRIMARY KEY (path, head_sha, position));"
+            "CREATE TABLE line_ownership (path TEXT, head_sha TEXT, "
+            "author_email TEXT, line_count INTEGER, "
+            "PRIMARY KEY (path, head_sha, author_email));"
+            "CREATE TABLE commit_hunks (path TEXT, head_sha TEXT, sha TEXT, "
+            "new_start INTEGER, new_count INTEGER, old_start INTEGER, "
+            "old_count INTEGER);"
+            "INSERT INTO meta(key, value) VALUES('schema_version', '2');"
+            "INSERT INTO commits(sha, author_name, author_email, authored_at, "
+            "subject, body) VALUES('legacy', 'x', 'x@y', "
+            "'2026-05-01T00:00:00+00:00', 'old commit', '');"
+        )
+    with ch.open_for(tmp_path) as store:
+        assert store.schema_version == 3
+        # The pre-bump commit must not survive a drop-and-recreate rebuild.
+        assert not store.has_commit("legacy")
+        # Every cache table — including the new rename_map — must be present.
+        with sqlite3.connect(db_path) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        for name in (
+            "meta",
+            "commits",
+            "commit_files",
+            "path_log",
+            "line_ownership",
+            "commit_hunks",
+            "rename_map",
+        ):
+            assert name in tables, f"expected table {name!r} after v3 rebuild"
