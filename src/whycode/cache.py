@@ -20,6 +20,14 @@ Design notes
 - The cache is local-only: never uploaded, never queried by the network.
   ``.whycode/`` is gitignored by default, the same as every other on-disk
   state this project keeps.
+
+Schema versioning
+-----------------
+When ``SCHEMA_VERSION`` is bumped, ``_initialise`` drops every cache table
+and rebuilds the schema from scratch. The cache is a derived artefact —
+re-deriving it on the next run is never destructive, so a one-shot
+drop-and-recreate is preferable to per-version migration code that has
+to stay correct across every bump.
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CACHE_DIRNAME = ".whycode"
 CACHE_FILENAME = "cache.db"
 
@@ -83,9 +91,25 @@ CREATE TABLE IF NOT EXISTS line_ownership (
     PRIMARY KEY (path, head_sha, author_email)
 );
 
+-- Per-(path, head_sha) hunk records, parsed from ``git log --follow -p
+-- --unified=0``. Same validity key as ``path_log``: a row is only valid
+-- when its head_sha matches the cache's recorded HEAD. ``rowid`` order
+-- preserves the newest-first commit order the parser emits.
+CREATE TABLE IF NOT EXISTS commit_hunks (
+    path      TEXT NOT NULL,
+    head_sha  TEXT NOT NULL,
+    sha       TEXT NOT NULL,
+    new_start INTEGER NOT NULL,
+    new_count INTEGER NOT NULL,
+    old_start INTEGER NOT NULL,
+    old_count INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_commit_files_path ON commit_files(path);
 CREATE INDEX IF NOT EXISTS idx_commits_authored_at ON commits(authored_at);
 CREATE INDEX IF NOT EXISTS idx_path_log_path_head ON path_log(path, head_sha);
+CREATE INDEX IF NOT EXISTS idx_commit_hunks_path_head
+    ON commit_hunks(path, head_sha);
 """
 
 
@@ -145,21 +169,37 @@ class CacheStore:
     # ---- schema -----------------------------------------------------------
 
     def _initialise(self) -> None:
+        # Probe the meta marker before creating any tables. On a stale cache
+        # (older SCHEMA_VERSION) we drop the whole schema first so a newly
+        # added column on an existing table is not silently skipped by
+        # ``CREATE TABLE IF NOT EXISTS``.
+        existing: str | None = None
+        try:
+            cur = self._conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            )
+            row = cur.fetchone()
+            if row is not None:
+                existing = str(row["value"])
+        except sqlite3.OperationalError:
+            # ``meta`` doesn't exist yet — fresh database, normal install path.
+            existing = None
+        if existing is not None and int(existing) != SCHEMA_VERSION:
+            # Drop every cache table and rebuild from scratch. The cache is
+            # a derived artefact — losing it is never destructive, and a
+            # per-version migration ladder would have to stay correct across
+            # every future bump.
+            self._conn.executescript(
+                "DROP TABLE IF EXISTS commit_hunks;"
+                "DROP TABLE IF EXISTS line_ownership;"
+                "DROP TABLE IF EXISTS path_log;"
+                "DROP TABLE IF EXISTS commit_files;"
+                "DROP TABLE IF EXISTS commits;"
+                "DROP TABLE IF EXISTS meta;"
+            )
         with self._conn:
             self._conn.executescript(_SCHEMA_SQL)
-            existing = self._get_meta("schema_version")
-            if existing is None:
-                self._set_meta("schema_version", str(SCHEMA_VERSION))
-            elif int(existing) != SCHEMA_VERSION:
-                # Future-proofing: when we bump the schema, drop tables and
-                # rebuild rather than try to migrate. The cache is a derived
-                # artefact — losing it is never destructive.
-                self._conn.executescript(
-                    "DROP TABLE IF EXISTS commit_files;"
-                    "DROP TABLE IF EXISTS commits;"
-                    "DROP TABLE IF EXISTS meta;"
-                )
-                self._conn.executescript(_SCHEMA_SQL)
+            if self._get_meta("schema_version") is None:
                 self._set_meta("schema_version", str(SCHEMA_VERSION))
 
     # ---- meta -------------------------------------------------------------
@@ -247,6 +287,7 @@ class CacheStore:
             self._conn.execute("DELETE FROM commits")
             self._conn.execute("DELETE FROM path_log")
             self._conn.execute("DELETE FROM line_ownership")
+            self._conn.execute("DELETE FROM commit_hunks")
             self._conn.execute("DELETE FROM meta WHERE key != 'schema_version'")
 
     # ---- path log (rename-resolved per-path SHA list) --------------------
@@ -318,6 +359,79 @@ class CacheStore:
                 [(path, head_sha, email, count) for email, count in counts.items()],
             )
         self._set_meta(f"blame_known:{head_sha}:{path}", "1")
+
+    # ---- per-path hunk records (sub-file hotspots) ------------------------
+
+    def fetch_hunks(
+        self, path: str, head_sha: str
+    ) -> list[tuple[str, int, int, int, int]] | None:
+        """Return the cached hunk rows for ``path`` at ``head_sha``.
+
+        Each row is ``(sha, new_start, new_count, old_start, old_count)`` in
+        the order originally stored (newest-first commits, hunks within a
+        commit in git's emission order). Returns ``None`` when no row has
+        been stored for that ``(path, head_sha)`` pair; an empty list means
+        the parse ran and produced no hunks (e.g. binary file).
+        """
+        cur = self._conn.execute(
+            "SELECT sha, new_start, new_count, old_start, old_count "
+            "FROM commit_hunks WHERE path = ? AND head_sha = ? "
+            "ORDER BY rowid ASC",
+            (path, head_sha),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            sentinel = self._get_meta(f"hunks_known:{head_sha}:{path}")
+            if sentinel == "1":
+                return []
+            return None
+        return [
+            (
+                str(r["sha"]),
+                int(r["new_start"]),
+                int(r["new_count"]),
+                int(r["old_start"]),
+                int(r["old_count"]),
+            )
+            for r in rows
+        ]
+
+    def store_hunks(
+        self,
+        path: str,
+        head_sha: str,
+        hunks: Sequence[tuple[str, int, int, int, int]],
+    ) -> None:
+        """Persist hunk rows for ``path`` at ``head_sha``.
+
+        Each ``hunks`` entry is ``(sha, new_start, new_count, old_start,
+        old_count)``. Stored as-is so the caller controls ordering — a
+        replay of the fetch must hand back commits newest-first to keep
+        the band-clustering decay arithmetic stable.
+        """
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM commit_hunks WHERE path = ? AND head_sha = ?",
+                (path, head_sha),
+            )
+            self._conn.executemany(
+                "INSERT INTO commit_hunks"
+                "(path, head_sha, sha, new_start, new_count, old_start, old_count) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        path,
+                        head_sha,
+                        sha,
+                        new_start,
+                        new_count,
+                        old_start,
+                        old_count,
+                    )
+                    for (sha, new_start, new_count, old_start, old_count) in hunks
+                ],
+            )
+        self._set_meta(f"hunks_known:{head_sha}:{path}", "1")
 
     # ---- reads ------------------------------------------------------------
 
