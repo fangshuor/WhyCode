@@ -57,6 +57,7 @@ from mcp.types import (
 )
 
 from whycode import git_facts as gf
+from whycode import hotspots as hs
 from whycode import risk_card as rc
 from whycode.signals import SignalKind
 
@@ -188,6 +189,35 @@ def _build_server(verbose: bool = False) -> Server:
                     "required": ["path"],
                 },
             ),
+            Tool(
+                name="get_file_hotspots",
+                description=(
+                    "Return the top-N risky line bands inside a single file: "
+                    "hunk-aggregated touch count, revert density, incident "
+                    "overlap, and a short source-line anchor. Use AFTER "
+                    "``get_risk_profile`` returns HANDLE WITH CARE or READ "
+                    "HISTORY FIRST to drill into the specific lines that "
+                    "absorbed the risk. The default risk profile is "
+                    "file-level; this is sub-file."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Path to the file (absolute or repo-relative)."
+                            ),
+                        },
+                        "top": {
+                            "type": "integer",
+                            "default": 5,
+                            "description": "Maximum number of bands to return.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            ),
         ]
 
     @server.call_tool()  # type: ignore[untyped-decorator]
@@ -202,6 +232,8 @@ def _build_server(verbose: bool = False) -> Server:
             return _handle_audit_signal(arguments)
         if name == "get_file_story":
             return _handle_file_story(arguments)
+        if name == "get_file_hotspots":
+            return _handle_file_hotspots(arguments)
         raise ValueError(f"Unknown tool: {name}")
 
     @server.list_prompts()  # type: ignore[no-untyped-call,untyped-decorator]
@@ -339,6 +371,22 @@ def _handle_file_story(arguments: dict[str, Any]) -> list[TextContent]:
             text=json.dumps(story_mod.to_dict(s, body_max_chars=body_max), indent=2),
         )
     ]
+
+
+def _handle_file_hotspots(arguments: dict[str, Any]) -> list[TextContent]:
+    path = str(arguments["path"])
+    top = int(arguments.get("top", 5))
+    try:
+        repo_root, rel = _resolve(path)
+        bands = hs.build_hotspots(repo_root, rel, top=top)
+        try:
+            head_sha = gf.run_git(repo_root, "rev-parse", "HEAD").strip()[:12]
+        except gf.GitError:
+            head_sha = None
+    except gf.GitError as exc:
+        return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
+    payload = hs.to_json_payload(path=rel, head_sha=head_sha, hotspots=bands)
+    return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
 
 # ---------------------------------------------------------------------------
