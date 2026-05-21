@@ -5,6 +5,61 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.8.1] — 2026-05-21
+
+### Fixed — coupling counts merge across cross-file renames
+
+0.7.3 dropped dead pre-rename paths from `detect_coupling` (silenced the
+LLM-chases-ghosts symptom), but didn't merge the counts. On every repo
+that moved its source under ``src/``, a renamed file's co-change count
+stayed split between its old and new names, artificially lowering its
+true rank.
+
+0.8.1 adds a whole-repo rename map and folds the co-change counter
+through it before ranking.
+
+#### Implementation
+
+- ``cache.py`` SCHEMA 2 → 3: new ``rename_map(head_sha, old_path,
+  new_path)`` table + ``fetch_rename_map`` / ``store_rename_map``
+  helpers. Drop-and-rebuild on stale schema (existing pattern).
+- ``git_facts.build_rename_map(repo_root, cache=...)``: one
+  ``git log --all --diff-filter=R --name-status -M50%`` walk per HEAD.
+  Chained renames (``a → b → c``) collapse to terminal name; entries
+  whose terminal name is missing from ``git ls-files`` are dropped.
+  Process-local ``lru_cache`` + SQLite persistence for cross-invocation
+  reuse.
+- ``signals.detect_coupling`` folds surviving co-change entries through
+  the rename map and sums counts under the post-rename canonical name.
+
+#### Verified on flask
+
+```
+rename map size: 97
+flask/helpers.py     → src/flask/helpers.py
+flask/app.py         → src/flask/sansio/app.py
+flask/blueprints.py  → src/flask/sansio/blueprints.py
+```
+
+Coupling for ``src/flask/app.py`` before / after the fold:
+
+```
+BEFORE: tests/test_basic.py x59; docs/config.rst x50;
+        src/flask/helpers.py x44; src/flask/blueprints.py x37; …
+AFTER : src/flask/helpers.py x103; tests/test_basic.py x83;
+        src/flask/sansio/blueprints.py x60; src/flask/ctx.py x56; …
+```
+
+``src/flask/helpers.py`` more than doubles (x44 → x103). The
+pre-``src/`` history that previously surfaced as a dead row is now
+merged in.
+
+### Tests
+
+352 tests passing (was 340 on 0.8.0, +12 new). ruff + mypy strict
+clean. No new outbound calls, no new dependency.
+
+
 ## [0.8.0] — 2026-05-21
 
 ### Added — sub-file hotspots: drill into the lines that absorbed the risk
