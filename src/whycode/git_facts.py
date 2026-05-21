@@ -167,6 +167,24 @@ class FileChange:
     deletions: int
 
 
+@dataclass(frozen=True)
+class HunkRecord:
+    """One ``@@ -OLD,COUNT +NEW,COUNT @@`` block from ``git log -p``.
+
+    The ``new_*`` fields are 1-based line positions in the *new* file
+    produced by the commit, and the ``old_*`` fields point at the parent.
+    ``commits_with_hunks`` emits one record per hunk header it sees, in
+    git's newest-first commit order.
+    """
+
+    sha: str
+    path: str
+    new_start: int
+    new_count: int
+    old_start: int
+    old_count: int
+
+
 @dataclass
 class RepoFacts:
     """Snapshot of facts relevant to a single file."""
@@ -1586,3 +1604,125 @@ def gather(
         invariant_quotes=extract_invariant_quotes(commits),
         cache=use_cache,
     )
+
+
+# ---- hunk extraction (sub-file hotspots) ----------------------------------
+
+
+# Header form: ``@@ -OLD[,COUNT] +NEW[,COUNT] @@`` (count defaults to 1 when
+# omitted). With ``--unified=0`` the headers carry every changed region.
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
+)
+# Diff "+++ b/<path>" preamble emitted once per commit. ``--follow`` rewrites
+# the right-hand path to the requested name even across renames, so we lean
+# on the commit boundary marker rather than parsing per-file headers. The
+# ``\x1e`` byte is a record-separator that ``splitlines`` treats as its own
+# break — see ``_iter_hunk_lines`` for the stitching that recombines them.
+_COMMIT_BOUNDARY_PREFIX = "commit "
+
+
+def commits_with_hunks(
+    repo_root: Path,
+    path: str,
+    *,
+    cache: CacheStore | None = None,
+) -> list[HunkRecord]:
+    """Parse ``git log --follow -p --unified=0`` into a flat list of hunks.
+
+    Each ``@@`` header becomes one :class:`HunkRecord`. Newest commits come
+    first; within a commit, hunks appear in git's emitted order (typically
+    top-of-file to bottom).
+
+    With ``cache`` set, the (path, head_sha) row pair seals the parse so a
+    subsequent call hits SQLite. The cache key matches ``path_log`` — when
+    HEAD advances, the seal is invalidated and we re-walk; when ``path_log``
+    is fresh, the hunks usually are too.
+    """
+    head_sha: str | None = None
+    if cache is not None:
+        try:
+            head_sha = run_git(repo_root, "rev-parse", "HEAD").strip()
+        except GitError:
+            head_sha = None
+        if head_sha:
+            cached = cache.fetch_hunks(path, head_sha)
+            if cached is not None:
+                return [
+                    HunkRecord(
+                        sha=sha,
+                        path=path,
+                        new_start=new_start,
+                        new_count=new_count,
+                        old_start=old_start,
+                        old_count=old_count,
+                    )
+                    for (sha, new_start, new_count, old_start, old_count) in cached
+                ]
+    try:
+        # ``\x1e`` is a stable record separator that ``git`` round-trips
+        # verbatim and that ``splitlines`` is happy to treat as a break,
+        # so the parser can split the whole raw blob on it without worrying
+        # about embedded newlines in commit hashes or in the diff body.
+        raw = run_git(
+            repo_root,
+            "log",
+            "--follow",
+            "--no-merges",
+            "--no-color",
+            "--unified=0",
+            f"--pretty=format:{RECORD_SEP}{_COMMIT_BOUNDARY_PREFIX}%H",
+            "-p",
+            "--",
+            path,
+        )
+    except GitError:
+        if cache is not None and head_sha:
+            cache.store_hunks(path, head_sha, [])
+        return []
+
+    hunks: list[HunkRecord] = []
+    for record in raw.split(RECORD_SEP):
+        record = record.strip("\n")
+        if not record.startswith(_COMMIT_BOUNDARY_PREFIX):
+            continue
+        # First line is ``commit <sha>``; subsequent lines are the diff body.
+        first_nl = record.find("\n")
+        if first_nl < 0:
+            continue
+        sha_header = record[: first_nl]
+        body = record[first_nl + 1 :]
+        current_sha = sha_header[len(_COMMIT_BOUNDARY_PREFIX) :].strip()
+        if not current_sha:
+            continue
+        for line in body.splitlines():
+            if not line.startswith("@@"):
+                continue
+            m = _HUNK_HEADER_RE.match(line)
+            if m is None:
+                continue
+            old_start = int(m.group(1))
+            old_count = 1 if m.group(2) is None else int(m.group(2))
+            new_start = int(m.group(3))
+            new_count = 1 if m.group(4) is None else int(m.group(4))
+            hunks.append(
+                HunkRecord(
+                    sha=current_sha,
+                    path=path,
+                    new_start=new_start,
+                    new_count=new_count,
+                    old_start=old_start,
+                    old_count=old_count,
+                )
+            )
+
+    if cache is not None and head_sha:
+        cache.store_hunks(
+            path,
+            head_sha,
+            [
+                (h.sha, h.new_start, h.new_count, h.old_start, h.old_count)
+                for h in hunks
+            ],
+        )
+    return hunks
