@@ -16,6 +16,7 @@ Design notes
 
 from __future__ import annotations
 
+import functools
 import re
 import subprocess
 import sys
@@ -1569,6 +1570,110 @@ def line_ownership(
     if cache is not None and head_sha:
         cache.store_line_ownership(path, head_sha, counts)
     return counts
+
+
+# Matches ``R<score>\tOLD\tNEW`` from ``git log --diff-filter=R --name-status``.
+# The score percentage is variable (R50, R85, R100), so the digits are captured
+# loosely; the actual value doesn't drive anything we do — only OLD and NEW.
+_RENAME_NAME_STATUS_RE = re.compile(r"^R\d+\t(.+?)\t(.+)$")
+
+
+@functools.lru_cache(maxsize=8)
+def _build_rename_map_at_head(repo_root: Path, head_sha: str) -> dict[str, str]:
+    """Walk the rename history and return ``{old_path: terminal_new_path}``.
+
+    Process-local memoisation only — the ``(repo_root, head_sha)`` key is
+    used so a HEAD advance naturally invalidates the cached map. The
+    persistent SQLite cache layer is handled by :func:`build_rename_map`.
+
+    Empty dict on git error: coupling falls back to today's
+    no-rename-resolution behaviour rather than crashing the run.
+    """
+    del head_sha  # only present to participate in the lru_cache key.
+    try:
+        raw = run_git(
+            repo_root,
+            "log",
+            "--all",
+            "--diff-filter=R",
+            "--name-status",
+            "-M50%",
+            "--pretty=format:",
+        )
+    except GitError:
+        return {}
+    mapping: dict[str, str] = {}
+    # Newest-first walk: each ``R<score>\tOLD\tNEW`` line yields one
+    # (OLD, NEW) mapping. If NEW appears later as the OLD of an even-newer
+    # rename, the already-stored value is already terminal — natural chain
+    # compression without an extra pass.
+    for line in raw.splitlines():
+        m = _RENAME_NAME_STATUS_RE.match(line)
+        if m is None:
+            continue
+        old_path = m.group(1)
+        new_path = m.group(2)
+        if old_path == new_path:
+            continue
+        if old_path in mapping:
+            continue
+        # Resolve through any rename we have already recorded so chained
+        # renames (a → b → c) collapse to ``a -> c`` rather than ``a -> b``.
+        mapping[old_path] = mapping.get(new_path, new_path)
+    if not mapping:
+        return {}
+    # Drop entries whose terminal NEW is no longer present at HEAD — those
+    # were renamed to a name that was later deleted, and following them
+    # would point an editor at a non-existent file. A git error talking to
+    # ls-files (vs. an empty index) is the only reason to skip the filter:
+    # we'd rather keep the map as-is than discard it on a transient failure.
+    try:
+        tracked_out = run_git(repo_root, "ls-files")
+    except GitError:
+        return mapping
+    tracked = {line for line in tracked_out.splitlines() if line.strip()}
+    return {old: new for old, new in mapping.items() if new in tracked}
+
+
+def build_rename_map(
+    repo_root: Path, *, cache: CacheStore | None = None
+) -> dict[str, str]:
+    """Map every historically-known path to its terminal (current-HEAD) name.
+
+    One ``git log --all --diff-filter=R --name-status -M50%`` walk per repo,
+    parsed once into an ``{old_path: terminal_new_path}`` dict. Walking
+    newest-first means the dict value is always the terminal current name;
+    chained renames (a → b → c) collapse naturally because if NEW later
+    appears as OLD in an even-newer record, the stored value already
+    points at the terminal name.
+
+    Any entry whose terminal NEW is not in ``git ls-files`` at the current
+    HEAD is dropped: those were renamed to a name that was later deleted,
+    and following them would point a reader at a non-existent file.
+
+    The persistent ``CacheStore`` (when supplied) is consulted first: a
+    HEAD-keyed hit returns immediately; otherwise the git walk runs once,
+    the result is stored, and subsequent invocations under the same HEAD
+    hit the SQLite layer. Without a cache, an in-process ``lru_cache``
+    keyed on ``(repo_root, head_sha)`` still amortises repeat calls.
+
+    Empty dict on git error — coupling falls back to today's
+    no-rename-resolution behaviour rather than crashing the run.
+    """
+    try:
+        head_sha = run_git(repo_root, "rev-parse", "HEAD").strip()
+    except GitError:
+        return {}
+    if not head_sha:
+        return {}
+    if cache is not None:
+        cached = cache.fetch_rename_map(head_sha)
+        if cached is not None:
+            return cached
+    mapping = _build_rename_map_at_head(repo_root, head_sha)
+    if cache is not None:
+        cache.store_rename_map(head_sha, mapping)
+    return mapping
 
 
 def gather(
