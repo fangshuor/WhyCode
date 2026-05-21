@@ -5,6 +5,102 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.8.0] — 2026-05-21
+
+### Added — sub-file hotspots: drill into the lines that absorbed the risk
+
+The biggest deferred backlog item across the entire 0.6.x / 0.7.x cycle:
+David persona on two consecutive rounds said "I know `models.py` had 14
+reverts; I still cannot ask 'did they all touch `prepare_body` or
+`iter_content`?'". 0.7.x answered "this file has 14 reverts"; 0.8.0
+answers "lines 412-460 absorbed 4 of them".
+
+#### `whycode hotspots <path>` (new command)
+
+Walks `git log --follow -p --unified=0` once per file, parses every
+`@@ -OLD,COUNT +NEW,COUNT @@` header into a per-commit hunk record,
+clusters adjacent touched line ranges into bands (gap ≤ 3 untouched
+lines merges; larger gaps break), and scores each band:
+
+```
+score = w1 · log(1+touch_count)
+      + w2 · 100 · revert_density
+      + w3 · 70  · incident_density
+```
+
+decayed against most-recent touch. The Rich table surfaces the top-N
+bands with line range, touch count, revert / incident tallies, and an
+anchor extracted from the band's first non-blank source line:
+
+```
+        Hotspots inside src/requests/models.py
+┏━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ rank ┃ lines      ┃ touches ┃ reverts ┃ incidents┃ anchor                  ┃
+┡━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│   1  │ 412-460    │ 14     │ 4       │ 1        │ def prepare_body(self,  │
+│   2  │ 678-712    │ 8      │ 0       │ 2        │ def iter_content(...    │
+└──────┴────────────┴────────┴────────┴──────────┴─────────────────────────┘
+```
+
+Flags: ``--top N`` / ``--json`` / ``--min-touches`` / ``--since
+<date|ref>`` / ``--no-cache``.
+
+#### `whycode why` extension
+
+When a Risk Card has ≥1 fired signal AND ≥1 band qualifies
+(``touches ≥ 3 AND revert+incident overlap > 0``), the card's tail
+gains a small sub-block:
+
+```
+Hotspots — read these line ranges first:
+  · lines 412-460  (14 touches, 4 reverts)  def prepare_body(self, ...
+  · lines 678-712  (8 touches, 2 incidents) def iter_content(self, ...
+```
+
+Capped at 3 lines. Not rendered on NO FLAGS files or in the JSON
+output of ``whycode why`` (JSON shape stable).
+
+#### MCP: `get_file_hotspots(path, top=5)`
+
+New tool returning the same JSON shape as the CLI ``--json`` output.
+Description guides the editor LLM to call it AFTER ``get_risk_profile``
+returns HANDLE WITH CARE or READ HISTORY FIRST — sub-file drill-down
+is a follow-up to "this file is risky", not a triage replacement.
+
+### Internal
+
+- New module ``src/whycode/hotspots.py`` (HunkRecord + Hotspot
+  dataclasses + ``build_hotspots`` clustering / scoring).
+- ``git_facts.py`` gains ``commits_with_hunks(repo_root, path)`` —
+  walks ``git log --follow -p --unified=0 --no-color`` and parses
+  ``@@`` headers into HunkRecord rows.
+- ``cache.py`` SCHEMA_VERSION 1 → 2; new ``commit_hunks`` table
+  (drop-and-rebuild on stale schema, matching existing pattern).
+- ``risk_card.py`` ``RiskCard.hotspots`` field (empty in JSON; rendered
+  in text only when qualifying).
+- 19 new tests (hotspot clustering, scoring, anchor extraction,
+  cache persistence, CLI text/JSON, Risk Card extension, MCP tool).
+
+340 tests passing (was 321 on 0.7.4); ruff + mypy strict clean.
+
+### Known limitation
+
+Without a per-language symbol parser, when a file's touches are scattered
+through nearly every line, the top band can span most of the file (e.g.
+``requests/models.py`` band #1 is ``lines 1-861``). This is an honest
+signal — the file IS broadly active — but it's not as drill-down-y as a
+function-level view would be. Adding ``ast``-based symbol detection (for
+Python) and ``--function-context`` (``git log -L :<func>:<file>``) is
+queued for 0.8.x once the band UX is validated.
+
+### Why 0.8.0 (minor bump, not patch)
+
+First release that answers a fundamentally new question at a different
+granularity than the rest of the tool. 0.7.x answered "should I be
+careful about this file?"; 0.8.0 adds "where INSIDE the file should I be
+most careful?". New public command + new MCP tool + new module = minor.
+
+
 ## [0.7.4] — 2026-05-15
 
 ### Changed — `whycode story --decisions` widens to include `silence_break`
