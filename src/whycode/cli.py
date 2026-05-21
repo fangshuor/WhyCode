@@ -1155,8 +1155,10 @@ def story(
         "--decisions",
         help=(
             "Show only decision-grade chapters: revert, incident, deprecate, "
-            "reconciliation, pivot, invariant. Equivalent to "
-            "--roles revert,incident,deprecate,reconciliation,pivot,invariant."
+            "reconciliation, pivot, invariant, silence_break. Equivalent to "
+            "--roles revert,incident,deprecate,reconciliation,pivot,invariant,silence_break. "
+            "silence_break is included because a long-silent file waking up is "
+            "itself a decision-shaped beat (someone chose to touch this again)."
         ),
     ),
 ) -> None:
@@ -1176,7 +1178,15 @@ def story(
     # allowlist; explicit ``--roles`` always wins so a user can narrow the
     # set further (e.g. ``--decisions --roles invariant``).
     if decisions_only and role_tuple is None:
-        role_tuple = ("revert", "incident", "deprecate", "reconciliation", "pivot", "invariant")
+        role_tuple = (
+            "revert",
+            "incident",
+            "deprecate",
+            "reconciliation",
+            "pivot",
+            "invariant",
+            "silence_break",
+        )
 
     cache = _open_cache(repo_root, no_cache)
     try:

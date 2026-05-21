@@ -1876,7 +1876,15 @@ def test_story_decisions_shortcut_filters_to_decision_roles(repo, days_ago) -> N
     data = json.loads(result.output)
     real = [c for c in data["chapters"] if not c["is_collapse"]]
     assert real, "decisions shortcut must keep at least one chapter"
-    allowed = {"revert", "incident", "deprecate", "reconciliation", "pivot", "invariant"}
+    allowed = {
+        "revert",
+        "incident",
+        "deprecate",
+        "reconciliation",
+        "pivot",
+        "invariant",
+        "silence_break",
+    }
     for c in real:
         assert c["role"] in allowed, f"unexpected role {c['role']!r} under --decisions"
     assert not any(c["role"] == "edit" for c in real)
