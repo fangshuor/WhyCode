@@ -5,6 +5,25 @@ All notable changes to WhyCode are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.7.4] — 2026-05-15
+
+### Changed — `whycode story --decisions` widens to include `silence_break`
+
+A file that was silent for half a year then got touched again is itself a
+decision-shaped beat — someone deliberately chose to revisit it. Until
+0.7.4 the ``--decisions`` shortcut excluded ``silence_break`` chapters,
+so a contributor reading ``story --decisions`` lost the "this file just
+woke up" signal even though it routinely names the moment a refactor or
+fix campaign restarted on a quiet file.
+
+Updated ``--decisions`` to include ``silence_break`` in its role
+allowlist. ``--roles`` overrides still wins for users who want a
+narrower slice.
+
+321 tests passing (unchanged from 0.7.3; existing decisions tests
+updated to assert the new allowlist).
+
+
 ## [0.7.3] — 2026-05-15
 
 ### Added — three detector / rendering improvements from the deferred backlog
