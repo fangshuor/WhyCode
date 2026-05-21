@@ -377,20 +377,46 @@ def detect_coupling(facts: RepoFacts) -> Signal | None:
     historical path, e.g. ``click/core.py`` for current ``src/click/core.py``)
     are dropped so a renamed file doesn't appear as its own loudest coupler.
     Co-change paths that no longer exist on HEAD are also dropped, so an
-    LLM editor reading the signal doesn't burn turns trying to open paths
-    that disappeared in a long-ago ``src/`` move (``flask/helpers.py`` for
-    a project whose source now lives at ``src/flask/helpers.py``).
+    LLM-paired editor reading the signal doesn't burn turns trying to open
+    paths that disappeared in a long-ago ``src/`` move (``flask/helpers.py``
+    for a project whose source now lives at ``src/flask/helpers.py``).
+
+    Surviving paths are also folded through the repo's rename map so that
+    a file whose history straddled a rename — where some co-change events
+    were attributed to the old name and some to the new — has its counts
+    summed under the post-rename name. Without this fold the file's true
+    co-change rank stays buried split between two rows, even when both
+    pre- and post-rename names belong to the same physical file.
     """
     patterns = ign.effective_patterns(facts.repo_root)
     tracked = _tracked_paths_at_head(facts.repo_root)
-    paired = [
+    rename_map = gf.build_rename_map(facts.repo_root, cache=facts.cache)
+    survivors: list[tuple[str, int]] = [
         (p, n)
         for p, n in facts.co_changed_files.items()
         if n >= COUPLING_MIN_COCHANGES
         and not ign.is_ignored(p, patterns)
         and not _is_likely_self_reference(facts.path, p)
-        and (not tracked or p in tracked)
+        and (not tracked or p in tracked or rename_map.get(p) in tracked)
     ]
+    if rename_map:
+        # Sum counts across every historical alias of the same physical file
+        # under its terminal (current-HEAD) name. Without this fold, a file
+        # renamed mid-history shows up twice in the coupling output (once
+        # under the old name with N co-changes, once under the new name with
+        # M co-changes) and ranks artificially low against its true total.
+        canonical_self = rename_map.get(facts.path, facts.path)
+        merged: dict[str, int] = {}
+        for path, count in survivors:
+            canonical = rename_map.get(path, path)
+            if canonical == canonical_self:
+                # Folding pulled this entry onto the target itself — drop.
+                continue
+            if _is_likely_self_reference(facts.path, canonical):
+                continue
+            merged[canonical] = merged.get(canonical, 0) + count
+        survivors = list(merged.items())
+    paired = survivors
     if not paired:
         return None
     paired.sort(key=lambda x: (-x[1], x[0]))
